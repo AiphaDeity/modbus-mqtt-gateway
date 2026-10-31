@@ -1,0 +1,27 @@
+# Local assistant context and temporary files
+/AGENTS.md
+/.local/
+/tmp/
+
+# Build output and local credentials
+/build/
+/out/
+/artifacts/
+/secrets/
+.env
+.env.*
+__pycache__/
+*.pyc
+.venv/
+
+# Local tool paths and generated compiler output
+CMakeUserPresets.json
+*.o
+*.obj
+*.d
+*.su
+*.elf
+*.axf
+*.map
+*.bin
+*.hex
