@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "gateway_id": "mb2mqtt_001",
+  "batch_id": "event_0001",
+  "records": [
+    {
+      "record_id": "mb2mqtt_001:evt:0001",
+      "seq": "3001",
+      "command_id": "cmd_0001",
+      "status": "SUCCESS",
+      "error_reason": null,
+      "captured_at_ms": 1793318600000,
+      "time_valid": true,
+      "boot_id": "boot_002",
+      "uptime_ms": 7000
+    }
+  ]
+}

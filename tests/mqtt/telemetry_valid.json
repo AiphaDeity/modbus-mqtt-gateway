@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "gateway_id": "mb2mqtt_001",
+  "batch_id": "batch_0001",
+  "records": [
+    {
+      "record_id": "mb2mqtt_001:seq:1001",
+      "seq": "1001",
+      "device_id": "dev01",
+      "point_id": "temperature",
+      "value": 25.3,
+      "quality": "GOOD",
+      "captured_at_ms": 1793318400000,
+      "time_valid": true,
+      "boot_id": "boot_002",
+      "uptime_ms": 5000
+    }
+  ]
+}
