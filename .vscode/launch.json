@@ -1,0 +1,61 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "STM32F407 OpenOCD",
+      "type": "cortex-debug",
+      "request": "launch",
+      "cwd": "${workspaceFolder}",
+      "executable": "${workspaceFolder}/build/Debug/firmware/app/modbus-mqtt-gateway.elf",
+      "servertype": "openocd",
+      "serverpath": "${input:openocdExecutable}",
+      "armToolchainPath": "${input:armToolchainBin}",
+      "searchDir": [
+        "${input:openocdScripts}"
+      ],
+      "configFiles": [
+        "${input:probeConfig}",
+        "target/stm32f4x.cfg"
+      ],
+      "openOCDLaunchCommands": [
+        "adapter speed 1000",
+        "reset_config none"
+      ],
+      "runToEntryPoint": "main"
+    }
+  ],
+  "inputs": [
+    {
+      "id": "openocdExecutable",
+      "type": "promptString",
+      "description": "本机 openocd.exe 的完整路径；若已在 PATH 中可填 openocd",
+      "default": "openocd"
+    },
+    {
+      "id": "armToolchainBin",
+      "type": "promptString",
+      "description": "固定版本 ST GCC 工具包的 bin 目录，内含 arm-none-eabi-gdb.exe"
+    },
+    {
+      "id": "openocdScripts",
+      "type": "promptString",
+      "description": "与 OpenOCD 配套的脚本目录，内含 interface/ 和 target/"
+    },
+    {
+      "id": "probeConfig",
+      "type": "pickString",
+      "description": "选择本次使用的 SWD 调试探针",
+      "options": [
+        {
+          "label": "DAPLink / CMSIS-DAP",
+          "value": "interface/cmsis-dap.cfg"
+        },
+        {
+            "label": "ST-LINK（ST OpenOCD 原生 DAP）",
+            "value": "interface/stlink-dap.cfg"
+        }
+      ],
+      "default": "interface/cmsis-dap.cfg"
+    }
+  ]
+}
