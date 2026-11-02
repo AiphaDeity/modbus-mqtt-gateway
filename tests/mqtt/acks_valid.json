@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "gateway_id": "mb2mqtt_001",
+  "ack_id": "a001",
+  "record_ids": ["mb2mqtt_001:seq:1001", "mb2mqtt_001:seq:1002"]
+}
