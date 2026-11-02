@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "gateway_id": "mb2mqtt_001",
+  "firmware_version": "0.1.0",
+  "online": true,
+  "time_valid": true,
+  "slave_status": [
+    { "slave": 1, "enabled": true, "last_error": "NONE" }
+  ],
+  "cache_stats": { "pending": 3, "dropped": 0 },
+  "reset_reason": "POWER_ON",
+  "alarms": []
+}
