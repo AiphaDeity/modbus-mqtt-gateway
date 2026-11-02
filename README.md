@@ -13,6 +13,8 @@
 
 STM32F407VET6，配备 RS-485、LAN8720A 以太网、SDIO TF 卡、W25Q128JV SPI Flash 和 SD3078 RTC。
 
+引脚、DMA、中断、任务优先级与初始栈分配见[公共硬件与任务资源](docs/hardware-resources.md)。
+
 ## 开发环境
 
 软件方案采用 HAL、FreeRTOS、LwIP 和 FatFs，使用 GCC + CMake + Ninja 构建。
@@ -26,14 +28,6 @@ STM32F407VET6，配备 RS-485、LAN8720A 以太网、SDIO TF 卡、W25Q128JV SPI
 
 工具包由 ST 官方工具管理器安装，编辑器可自行选择。
 
-Windows 下检查工具环境：
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\check-environment.ps1
-```
-
-自定义工具包目录时，使用脚本参数 `-BundlesRoot <目录>`。
-
 ## 目录结构
 
 ```text
@@ -41,13 +35,15 @@ modbus-mqtt-gateway/
 ├─ firmware/app/                  应用工程
 │  ├─ Core/                      应用入口、中断及初始化代码
 │  ├─ Drivers/                   HAL 与 CMSIS，含组件许可证
+│  ├─ Middlewares/               当前使用的 FreeRTOS 源码
 │  ├─ cmake/                     应用构建配置及工具链文件
+│  ├─ integration/               启动、任务装配及资源就绪协调
 │  ├─ CMakeLists.txt
 │  ├─ CMakePresets.json           应用工程预设
 │  ├─ modbus-mqtt-gateway.ioc     CubeMX 配置
 │  ├─ startup_stm32f407xx.s       启动文件
 │  └─ STM32F407xx_FLASH.ld        链接脚本
-├─ tools/                        主机侧工具与环境检查脚本
+├─ docs/                         公共资源与基线验证说明
 ├─ .settings/                    ST 工程及工具包配置
 ├─ .vscode/                      VS Code 工程配置
 ├─ CMakeLists.txt                顶层构建入口
@@ -75,7 +71,24 @@ build/Debug/firmware/app/modbus-mqtt-gateway.elf
 
 使用 CubeMX 编辑 `firmware/app/modbus-mqtt-gateway.ioc`，代码生成位置保持在 `firmware/app/`。重新生成后检查构建配置差异，再从仓库根目录构建。
 
-当前最小应用已通过迁移后的构建验证，板卡下载和运行尚待验证。
+当前应用使用 `STM32F407xx_FLASH.ld`，从 `0x08000000` 直接启动；任务栈和堆位于普通 SRAM，CCM 保留。
+
+模块接入时，在实际模块目录维护源码列表，并在 `firmware/app/CMakeLists.txt` 添加对应 `add_subdirectory(...)`。在 `integration/app_modules.c` 同时绑定模块的初始化函数和任务入口；任务由装配层统一创建。未接入模块保持两个入口均为 `NULL`，不提供返回成功的空实现。引脚、DMA 和中断配置以 `.ioc` 为准。
+
+## 下载与调试
+
+安装 Cortex-Debug 扩展和支持 STM32F4 的 OpenOCD，本配置按 ST OpenOCD 配套脚本检查。先按上文选择并生成 `Debug`，再按 F5 选择 `STM32F407 OpenOCD`；该调试配置使用 Debug ELF，不自动构建。
+
+调试时按输入框填写本机路径（不加外层引号），无需把个人安装路径写入仓库：
+
+| 输入 | 填写内容 |
+| --- | --- |
+| OpenOCD 程序 | `openocd.exe` 完整路径，或 PATH 中的 `openocd` |
+| ST GCC bin | `gnu-tools-for-stm32/14.3.1+st.2/bin` 的实际目录，含 GDB、objdump、nm |
+| OpenOCD 脚本目录 | 配套的 `scripts` 或 ST `st_scripts` 目录，内含 `interface/`、`target/`；它不一定和程序在同一目录 |
+| SWD 探针 | DAPLink/CMSIS-DAP 或 ST-LINK；后者使用 ST 包中的 `interface/stlink-dap.cfg` |
+
+当前速度为 1000kHz，`reset_config none` 使用软件复位。连接成功后停在 `main`；构建、实板启动及成员复现步骤见[公共基础验证](docs/baseline-check.md)。
 
 ## 项目文档
 
