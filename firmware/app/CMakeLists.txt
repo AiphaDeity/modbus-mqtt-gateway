@@ -39,6 +39,7 @@ add_subdirectory(cmake/stm32cubemx)
 add_subdirectory(integration)
 add_subdirectory(bsp)
 add_subdirectory(services/modbus)
+add_subdirectory(services/storage)
 
 # Link directories setup
 target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
@@ -53,6 +54,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined include paths
+    ${CMAKE_CURRENT_LIST_DIR}/common
 )
 
 # Add project symbols (macros)
