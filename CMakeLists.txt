@@ -5,3 +5,4 @@ project(modbus-mqtt-gateway LANGUAGES C ASM)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 add_subdirectory(firmware/app)
+
