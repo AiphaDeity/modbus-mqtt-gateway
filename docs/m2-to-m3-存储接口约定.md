@@ -56,11 +56,12 @@ typedef struct {
 record_id = "{gateway_id}:{kind}:{seq_decimal_string}"
 
 例： mb2mqtt_001:seq:1001   （telemetry 采集记录）
-     mb2mqtt_001:evt:0001   （event 事件记录）
+     mb2mqtt_001:evt:1002   （event 事件记录，全局 seq 递增）
 ```
 
 - `kind`：`seq`=telemetry，`evt`=event。
-- `seq`：**uint64 单调递增序号**，从 1001 开始，**跨重启连续**（存在 TF 卡记录区，不依赖 RTC）；JSON 里按**十进制字符串**传输（正反例已明确：数字类型会被平台 REJECT）。
+- `seq`：**uint64 全局单调递增计数器，telemetry/event 共用，从 1001 开始，跨重启连续**（存在 TF 卡记录区，不依赖 RTC）；JSON 里按**十进制字符串**传输（正反例已明确：数字类型会被平台 REJECT）。
+  - ⚠️ 早期草案里写过"每 kind 各自计数、evt 从 1 起"（示例 `evt:0001`），**已废弃**——M3 实现的是全局单计数器，事件只是 kind 不同，序号接着 telemetry 往下走。
 - M3 侧内部存储**只用 (kind, seq) 定位**，不必存 record_id 字符串——补传时 M2 按记录内容自己拼字符串。
 - `boot_id`：每次启动生成（如 `boot_%u`，写 RTC/RAM，不持久化）；`uptime_ms` 辅助。
 
@@ -129,6 +130,9 @@ typedef struct {
    M2 从 pending 查询接口感知，不阻塞采集任务。 */
 ```
 
+> ⚠️ **指针所有权（M3 已实现，M2 必须遵守）**：写队列传的是 `storage_write_req_t *` 指针，M2 分配缓冲，**M3 出队后立即把 payload 拷进自己的槽位缓冲**，M2 的指针在 M3 出队后即可复用。M2 不要假设 M3 还持有这块内存。
+```
+
 ### 4.2 M2 → M3：补传拉取请求（联网后）
 
 ```c
@@ -137,6 +141,8 @@ typedef struct {
   uint16_t max_count;   /* 一次最多取几条，建议 ≤ 8（配合 M2 栈 4KB） */
 } storage_fetch_req_t;
 ```
+
+> ⚠️ **在途请求只有一个**：M3 不同时处理多个 fetch，M2 发下一个 fetch 前必须等上一个应答回来。M2 收到应答后**立即把 records 里的 payload 全部拷进自己的发送缓冲**，才能发下一个 `storage_fetch_req_t`——M3 的应答缓冲在下一个请求来时就会被覆盖。
 
 ### 4.3 M3 → M2：补传数据应答
 
@@ -154,15 +160,17 @@ typedef struct {
 } storage_fetch_resp_t;
 ```
 
+> `req_id` 由 M2 在发请求时填入，M3 原样带回；M2 靠它匹配应答和请求（单在途下其实不会错配，留作未来扩展）。
+
 ### 4.4 M2 → M3：上传成功回执（CacheAck，让 M3 删除）
 
 ```c
 typedef struct {
-  uint64_t ack_upto_seq;   /* kind 维度：kind+seq ≤ 此值的连续段已上传成功，可删 */
+  uint64_t ack_upto_seq;   /* 全局水位线：seq ≤ 此值的连续段已上传成功，可删 */
 } storage_ack_t;
 ```
 
-> 因为 `seq` 单调递增，回执只需要一个水位线，不用传 record_id 列表（云端 ack 报文里的 `record_ids: ["gw:seq:1001", ...]` 是给平台看的，内部不重复一份）。
+> 因为 `seq` 是全局单调递增的单计数器，回执只需要一个全局水位线，不用按 kind 分别给（早期文档写过"kind 维度水位"，已随全局计数器方案废弃）。云端 ack 报文里的 `record_ids: ["gw:seq:1001", ...]` 是给平台看的，内部不重复一份。
 
 ### 4.5 M2 ↔ M3：状态查询（可选，M3 主动报或 M2 轮询）
 
