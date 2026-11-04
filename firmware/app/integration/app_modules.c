@@ -7,6 +7,7 @@
 #include "task.h"
 #include "cmsis_os2.h"
 #include "main.h"
+#include "mqtt_client.h"
 
 
 
@@ -125,7 +126,7 @@ static AppModuleSlot module_slots[APP_MODULE_COUNT] =
   },
   [APP_MODULE_MQTT] =
   {
-    .init = NULL, .task = NULL, .attributes = &mqtt_attributes,
+    .init = MqttClient_Init, .task = MqttClient_Task, .attributes = &mqtt_attributes,
     .result = APP_MODULE_INIT_NOT_READY, .task_state = APP_MODULE_TASK_NOT_STARTED
   },
   [APP_MODULE_MONITOR] =
