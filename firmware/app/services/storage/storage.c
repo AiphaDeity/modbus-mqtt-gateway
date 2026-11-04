@@ -10,6 +10,7 @@
 #include "storage_seq.h"
 #include "storage_identity.h"
 #include "storage_timefloor.h"
+#include "storage_ctrllog.h"
 
 #include "cmsis_os2.h"
 
@@ -18,6 +19,7 @@ osMutexId_t g_m3_i2c1_mutex = NULL;
 /* 底层介质初始化结果，供 Task 上报就绪位使用 */
 static bool s_flash_ok = false;
 static bool s_floor_ok = false;
+static bool s_log_ok = false;
 
 AppModuleInitResult Storage_Init(void)
 {
@@ -59,6 +61,9 @@ AppModuleInitResult Storage_Init(void)
     // 持久时间下界 — 读取双份，取较大的有效值
     s_floor_ok = s_flash_ok && (storage_timefloor_init() == HAL_OK);
 
+    // 控制日志 — 扫描双区，恢复写入位置与去重键
+    s_log_ok = s_flash_ok && (storage_ctrllog_init() == HAL_OK);
+
     /*
      * 注意：不在 Init 里加载配置。
      * 配置加载放到 Task 里做，因为配置加载可能需要等待 SPI Flash ready，
@@ -94,9 +99,8 @@ void Storage_Task(void *argument)
     // 时间服务就绪（RTC 在走，且时间不早于持久下界）
     App_SetResourceReady(APP_RESOURCE_TIME, storage_time_is_valid());
 
-    // 控制状态恢复：持久时间下界已恢复。
-    // TODO: 控制日志与去重恢复后并入此判据
-    App_SetResourceReady(APP_RESOURCE_CONTROL_STATE, s_floor_ok);
+    // 控制状态恢复：持久时间下界 + 控制日志（去重表）均已恢复
+    App_SetResourceReady(APP_RESOURCE_CONTROL_STATE, s_floor_ok && s_log_ok);
 
     /* 3. 业务循环 */
     uint32_t last_floor_tick = HAL_GetTick();
@@ -111,6 +115,9 @@ void Storage_Task(void *argument)
             if (t != 0)
                 (void)storage_timefloor_update(t);
         }
+
+        // 推进控制日志整区回收（无回收任务时立即返回）
+        (void)storage_ctrllog_maintenance();
 
         // TODO: 后续在这里处理：
         //   - 配置保存请求队列

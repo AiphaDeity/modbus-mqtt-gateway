@@ -165,6 +165,32 @@ HAL_StatusTypeDef spi_flash_w25q128_sector_erase(uint32_t addr)
     return st;
 }
 
+HAL_StatusTypeDef spi_flash_w25q128_block64_erase(uint32_t addr)
+{
+    HAL_StatusTypeDef st;
+
+    flash_lock();
+
+    flash_cs_low();
+    flash_send_cmd(0x06);                    // 写使能
+    flash_cs_high();
+
+    flash_cs_low();
+    flash_send_cmd(0xD8);                    // 64KB 块擦除
+    flash_send_addr(addr);
+    st = HAL_SPI_Transmit(&hspi2, NULL, 0, 100);
+    flash_cs_high();
+
+    if (st != HAL_OK) {
+        flash_unlock();
+        return st;
+    }
+
+    st = spi_flash_w25q128_wait_ready(2000);  // 块擦除约 150~500 ms
+    flash_unlock();
+    return st;
+}
+
 HAL_StatusTypeDef spi_flash_w25q128_write(uint32_t addr, const uint8_t *buf, uint32_t len)
 {
     if (buf == NULL || len == 0)

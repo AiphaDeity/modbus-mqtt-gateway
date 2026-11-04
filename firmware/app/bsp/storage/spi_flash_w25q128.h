@@ -40,6 +40,9 @@ HAL_StatusTypeDef spi_flash_w25q128_read(uint32_t addr, uint8_t *buf, uint32_t l
 // 擦除一个扇区（4KB）
 HAL_StatusTypeDef spi_flash_w25q128_sector_erase(uint32_t addr);
 
+// 块擦除（64KB，地址需 64KB 对齐；用于控制日志整区回收，比扇区擦除快）
+HAL_StatusTypeDef spi_flash_w25q128_block64_erase(uint32_t addr);
+
 // 写数据（自动跨页；目标区域必须先擦除）
 HAL_StatusTypeDef spi_flash_w25q128_write(uint32_t addr, const uint8_t *buf, uint32_t len);
 
