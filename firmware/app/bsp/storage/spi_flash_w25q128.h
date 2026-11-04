@@ -2,6 +2,7 @@
 #define SPI_FLASH_W25Q128_H
 
 #include "stm32f4xx_hal.h"
+#include "cmsis_os2.h"
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -18,6 +19,14 @@
 #define W25Q128_FLASH_SIZE_BYTES  (16UL * 1024UL * 1024UL)
 #define W25Q128_SECTOR_SIZE_BYTES (4UL * 1024UL)
 #define W25Q128_PAGE_SIZE_BYTES   (256U)
+
+/*
+ * SPI2 总线互斥锁（W25Q128 独占 SPI2）。
+ * 由 spi_flash_w25q128_init() 创建；下方所有 Flash API 内部已自动加锁，
+ * 因此外部（services 层、其他任务）直接调用即可，无需自己加锁。
+ * 锁为递归锁，允许在同一线程内嵌套调用（如 write → wait_ready）。
+ */
+extern osMutexId_t g_m3_spi2_mutex;
 
 // 初始化：读 JEDEC ID，确认芯片在线
 HAL_StatusTypeDef spi_flash_w25q128_init(void);

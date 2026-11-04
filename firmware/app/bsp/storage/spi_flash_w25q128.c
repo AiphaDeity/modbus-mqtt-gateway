@@ -20,6 +20,32 @@
 
 extern SPI_HandleTypeDef hspi2;
 
+/* ---------- SPI2 总线互斥锁 ---------- */
+
+osMutexId_t g_m3_spi2_mutex = NULL;
+
+static const osMutexAttr_t spi2_mutex_attr = {
+    .name      = "m3_spi2",
+    .attr_bits = osMutexRecursive | osMutexPrioInherit,
+    .cb_mem    = NULL,
+    .cb_size   = 0,
+};
+
+// 锁创建前（如初始化早期）允许直接访问，避免空指针
+static void flash_lock(void)
+{
+    if (g_m3_spi2_mutex != NULL) {
+        (void)osMutexAcquire(g_m3_spi2_mutex, osWaitForever);
+    }
+}
+
+static void flash_unlock(void)
+{
+    if (g_m3_spi2_mutex != NULL) {
+        (void)osMutexRelease(g_m3_spi2_mutex);
+    }
+}
+
 /* ---------- 内部工具 ---------- */
 
 static void flash_cs_low(void)  { HAL_GPIO_WritePin(SPI_FLASH_CS_GPIO_Port, SPI_FLASH_CS_Pin, GPIO_PIN_RESET); }
@@ -46,14 +72,20 @@ HAL_StatusTypeDef spi_flash_w25q128_wait_ready(uint32_t timeout_ms)
 {
     uint8_t status;
     uint32_t start = HAL_GetTick();
+
+    flash_lock();
     do {
         flash_cs_low();
         flash_send_cmd(0x05);                 // 读状态寄存器
         HAL_SPI_Receive(&hspi2, &status, 1, 100);
         flash_cs_high();
-        if ((status & 0x01) == 0)             // bit0 = 0 表示空闲
+        if ((status & 0x01) == 0) {           // bit0 = 0 表示空闲
+            flash_unlock();
             return HAL_OK;
+        }
     } while ((HAL_GetTick() - start) < timeout_ms);
+
+    flash_unlock();
     return HAL_TIMEOUT;
 }
 
@@ -61,6 +93,12 @@ HAL_StatusTypeDef spi_flash_w25q128_wait_ready(uint32_t timeout_ms)
 
 HAL_StatusTypeDef spi_flash_w25q128_init(void)
 {
+    // 首次初始化时创建 SPI2 总线锁
+    if (g_m3_spi2_mutex == NULL) {
+        g_m3_spi2_mutex = osMutexNew(&spi2_mutex_attr);
+        if (g_m3_spi2_mutex == NULL) return HAL_ERROR;
+    }
+
     // 读 JEDEC ID，确认芯片在线且型号正确
     uint32_t id = spi_flash_w25q128_read_id();
     // W25Q128 的 JEDEC ID = 0xEF4018，只判断厂家字节 0xEF 即可
@@ -72,10 +110,14 @@ HAL_StatusTypeDef spi_flash_w25q128_init(void)
 uint32_t spi_flash_w25q128_read_id(void)
 {
     uint8_t buf[3] = {0, 0, 0};
+
+    flash_lock();
     flash_cs_low();
     flash_send_cmd(0x9F);                    // JEDEC ID 命令
     HAL_SPI_Receive(&hspi2, buf, 3, 100);   // 读 3 字节
     flash_cs_high();
+    flash_unlock();
+
     return ((uint32_t)buf[0] << 16) | ((uint32_t)buf[1] << 8) | buf[2];
 }
 
@@ -85,17 +127,23 @@ HAL_StatusTypeDef spi_flash_w25q128_read(uint32_t addr, uint8_t *buf, uint32_t l
         return HAL_ERROR;
 
     HAL_StatusTypeDef st;
+
+    flash_lock();
     flash_cs_low();
     flash_send_cmd(0x03);                    // 读数据命令
     flash_send_addr(addr);
     st = HAL_SPI_Receive(&hspi2, buf, len, 1000);
     flash_cs_high();
+    flash_unlock();
+
     return st;
 }
 
 HAL_StatusTypeDef spi_flash_w25q128_sector_erase(uint32_t addr)
 {
     HAL_StatusTypeDef st;
+
+    flash_lock();
 
     flash_cs_low();
     flash_send_cmd(0x06);                    // 写使能
@@ -107,8 +155,14 @@ HAL_StatusTypeDef spi_flash_w25q128_sector_erase(uint32_t addr)
     st = HAL_SPI_Transmit(&hspi2, NULL, 0, 100);  // 命令已发完
     flash_cs_high();
 
-    if (st != HAL_OK) return st;
-    return spi_flash_w25q128_wait_ready(1000);   // 扇区擦除约几十~几百 ms
+    if (st != HAL_OK) {
+        flash_unlock();
+        return st;
+    }
+
+    st = spi_flash_w25q128_wait_ready(1000);  // 扇区擦除约几十~几百 ms
+    flash_unlock();
+    return st;
 }
 
 HAL_StatusTypeDef spi_flash_w25q128_write(uint32_t addr, const uint8_t *buf, uint32_t len)
@@ -117,6 +171,8 @@ HAL_StatusTypeDef spi_flash_w25q128_write(uint32_t addr, const uint8_t *buf, uin
         return HAL_ERROR;
 
     uint32_t written = 0;
+
+    flash_lock();
     while (written < len) {
         // 计算当前页剩余空间（每页 256B，不能跨页写）
         uint32_t page_offset = (addr + written) % W25Q128_PAGE_SIZE_BYTES;
@@ -136,9 +192,14 @@ HAL_StatusTypeDef spi_flash_w25q128_write(uint32_t addr, const uint8_t *buf, uin
         flash_cs_high();
 
         HAL_StatusTypeDef st = spi_flash_w25q128_wait_ready(100);
-        if (st != HAL_OK) return st;
+        if (st != HAL_OK) {
+            flash_unlock();
+            return st;
+        }
 
         written += chunk;
     }
+    flash_unlock();
+
     return HAL_OK;
 }

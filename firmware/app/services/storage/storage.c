@@ -9,6 +9,7 @@
 #include "storage_time.h"
 #include "storage_seq.h"
 #include "storage_identity.h"
+#include "storage_timefloor.h"
 
 #include "cmsis_os2.h"
 
@@ -16,6 +17,7 @@ osMutexId_t g_m3_i2c1_mutex = NULL;
 
 /* 底层介质初始化结果，供 Task 上报就绪位使用 */
 static bool s_flash_ok = false;
+static bool s_floor_ok = false;
 
 AppModuleInitResult Storage_Init(void)
 {
@@ -54,6 +56,9 @@ AppModuleInitResult Storage_Init(void)
     // 设备身份 — 读取双份 gateway_id，取有效且最新的一份
     (void)storage_identity_init();
 
+    // 持久时间下界 — 读取双份，取较大的有效值
+    s_floor_ok = s_flash_ok && (storage_timefloor_init() == HAL_OK);
+
     /*
      * 注意：不在 Init 里加载配置。
      * 配置加载放到 Task 里做，因为配置加载可能需要等待 SPI Flash ready，
@@ -76,20 +81,37 @@ void Storage_Task(void *argument)
     storage_config_reader_t cfg_rd;
     (void)storage_config_open(&cfg_rd);
 
+    // 启动时用当前 RTC 时间推进持久下界（不足阈值时内部自动跳过）
+    uint32_t now = storage_get_unix_time();
+    if (now != 0)
+        (void)storage_timefloor_update(now);
+
     /* 2. 上报就绪位 */
 
     // 配置存储服务就绪：判据是 SPI Flash 可读写，空设备也算就绪
     App_SetResourceReady(APP_RESOURCE_STORAGE, s_flash_ok);
 
-    // 时间服务就绪（RTC 在走就行，时间准不准由上层校时）
+    // 时间服务就绪（RTC 在走，且时间不早于持久下界）
     App_SetResourceReady(APP_RESOURCE_TIME, storage_time_is_valid());
 
-    // 控制状态恢复（日志开关、去重等，暂时直接就绪）
-    App_SetResourceReady(APP_RESOURCE_CONTROL_STATE, true);
+    // 控制状态恢复：持久时间下界已恢复。
+    // TODO: 控制日志与去重恢复后并入此判据
+    App_SetResourceReady(APP_RESOURCE_CONTROL_STATE, s_floor_ok);
 
     /* 3. 业务循环 */
+    uint32_t last_floor_tick = HAL_GetTick();
+
     for (;;)
     {
+        // 每小时推进一次持久时间下界，保证长期运行也能检测到时间回拨
+        if ((HAL_GetTick() - last_floor_tick) >= (STORAGE_TIMEFLOOR_STEP_SEC * 1000U))
+        {
+            last_floor_tick = HAL_GetTick();
+            uint32_t t = storage_get_unix_time();
+            if (t != 0)
+                (void)storage_timefloor_update(t);
+        }
+
         // TODO: 后续在这里处理：
         //   - 配置保存请求队列
         //   - RTC 校时同步

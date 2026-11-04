@@ -9,6 +9,7 @@
 #include "storage_time.h"
 #include "storage.h"        // g_m3_i2c1_mutex
 #include "rtc_sd3078.h"     // BSP RTC 驱动
+#include "storage_timefloor.h"
 #include "cmsis_os2.h"
 
 uint32_t storage_get_unix_time(void)
@@ -41,16 +42,30 @@ HAL_StatusTypeDef storage_set_unix_time(uint32_t unix_s)
     HAL_StatusTypeDef st = rtc_sd3078_set_time(&dt);
 
     osMutexRelease(g_m3_i2c1_mutex);
-    return st;
+
+    if (st != HAL_OK)
+        return st;
+
+    // 校时成功后推进持久时间下界（未达阈值时内部自动跳过）
+    (void)storage_timefloor_update(unix_s);
+    return HAL_OK;
 }
 
 bool storage_time_is_valid(void)
 {
+    rtc_datetime_t dt;
+    uint32_t now = 0;
+    bool running = false;
+
     if (osMutexAcquire(g_m3_i2c1_mutex, osWaitForever) != osOK)
         return false;
 
-    bool running = rtc_sd3078_is_running();
+    running = rtc_sd3078_is_running();
+    if (running && rtc_sd3078_get_time(&dt) == HAL_OK)
+        now = rtc_sd3078_to_unix(&dt);
 
     osMutexRelease(g_m3_i2c1_mutex);
-    return running;
+
+    // RTC 在走 + 时间不早于持久下界，才算可信
+    return running && storage_timefloor_trusted(now);
 }
