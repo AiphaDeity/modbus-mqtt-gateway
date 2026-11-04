@@ -3,6 +3,7 @@
 #include "app_readiness.h"
 #include "cmsis_os2.h"
 #include "main.h"
+#include "ethernet.h"   /* m2_ethernet_init()：以太网/LwIP 初始化入口 */
 
 
 /*
@@ -13,6 +14,18 @@
 void App_Entry(void *argument)
 {
   (void)argument;
+
+  /* ★网卡初始化必须在【任务上下文】里做，不能放回 main.c 的 osKernelStart 之前：
+     m2_ethernet_init 内部的 taskENTER_CRITICAL()/taskEXIT_CRITICAL() 在调度器启动前
+     会因 uxCriticalNesting 哨兵值(0xAAAAAAAA)配不平，把 BASEPRI 永久锁在 0x50，
+     导致 TIM6 时基中断和 ETH 接收中断全被屏蔽（PING 不通的根因）。
+     此时调度器已在跑，uxCriticalNesting=0，临界区能正确恢复 BASEPRI。 */
+  if (m2_ethernet_init() != ETH_OK)
+  {
+    /* PHY 不通 / 协议栈内存不足：进错误处理（串口前面已有打印可定位是哪一类） */
+    Error_Handler();
+    return;
+  }
 
   if (!App_ReadinessInit())
   {
