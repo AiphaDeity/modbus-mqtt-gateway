@@ -28,6 +28,11 @@
 #include "lwip/init.h"       /* lwip_init（tcpip_init 内部会调，不用直接调） */
 #include "lwip/timeouts.h"   /* lwip 超时管理（tcpip 线程内部用） */
 #include "lwip/netif.h"      /* ★netif 结构体：netif_add/netif_set_default/netif_is_link_up 等 */
+#include "lwip/netifapi.h"   /* ★线程安全封装：netifapi_netif_set_up/down/link_up/down、
+                                netifapi_dhcp_start/stop、netifapi_netif_set_addr。
+                                带 OS 且 LWIP_TCPIP_CORE_LOCKING=0 时，凡修改 netif 状态的 API
+                                都必须经它投递到 tcpip_thread 执行，不能在别的任务里直接调
+                                netif_set 或 dhcp_start 系列函数（否则和内核线程竞争 netif 结构）。 */
 
 #include "FreeRTOS.h"        /* ★FreeRTOS 主头：taskENTER_CRITICAL 等 */
 #include "task.h"            /* ★vTaskDelay（线程延时） */
@@ -103,9 +108,16 @@ static void lwip_link_status_updated(struct netif *netif);  /* 链接变化回�
 /* ================= 四、默认静态 IP（DHCP 超时回落用） ================= */
 static void lwip_comm_default_ip_set(__lwip_dev *lwipx)
 {
-  /* 电脑直连时的经典网段：板子 192.168.2.30，电脑在 192.168.2.x 同网段就能互 ping */
+  /* 电脑直连时的经典网段：板子在 192.168.2.x 同网段，电脑在 192.168.2.45 就能互 ping。
+     ★静态回落 IP 的末字节从芯片 UID 派生（评审要求）：以前固定 .30，
+     多块板同时 DHCP 失败回落时会互相撞地址。UID 96 位取低 2 字节异或，映射到 2~254。 */
+  uint32_t u = *(volatile uint32_t *)0x1FFF7A10 ^ *(volatile uint32_t *)0x1FFF7A14 ^ *(volatile uint32_t *)0x1FFF7A18;
+  uint8_t host = (uint8_t)((u & 0xFFU) ^ ((u >> 8) & 0xFFU));
+  if (host < 2)   host = 2;
+  if (host > 254) host = 254;
+
   lwipx->remoteip[0] = 192; lwipx->remoteip[1] = 168; lwipx->remoteip[2] = 0;   lwipx->remoteip[3] = 120;
-  lwipx->ip[0]       = 192; lwipx->ip[1]       = 168; lwipx->ip[2]       = 2;   lwipx->ip[3]       = 30;
+  lwipx->ip[0]       = 192; lwipx->ip[1]       = 168; lwipx->ip[2]       = 2;    lwipx->ip[3]       = host;
   lwipx->netmask[0]  = 255; lwipx->netmask[1]  = 255; lwipx->netmask[2]  = 255; lwipx->netmask[3]  = 0;
   lwipx->gateway[0]  = 192; lwipx->gateway[1]  = 168; lwipx->gateway[2]  = 2;   lwipx->gateway[3]  = 1;
   lwipx->dhcpstatus  = 0;   /* 初始没开 DHCP */
@@ -183,8 +195,9 @@ int32_t m2_ethernet_init(void)
     return ETH_ERR_CONFIG;
   }
 
-  /* 4. 设为默认网口：系统只有一个网卡，默认路由/ARP 都走它 */
-  netif_set_default(&g_lwip_netif);
+  /* 4. 设为默认网口：系统只有一个网卡，默认路由/ARP 都走它。
+     netifapi 版本：投递到 tcpip_thread 执行（本函数跑在 App_Entry 任务上下文） */
+  netifapi_netif_set_default(&g_lwip_netif);
 
   /* 5. 链接回调 + 起链接线程
      先手动调一次 lwip_link_status_updated 初始化状态，
@@ -292,11 +305,13 @@ static void lwip_link_thread(void *argument)
       {
 #if LWIP_DHCP
         g_lwip_dhcp_state = LWIP_DHCP_LINK_DOWN;  /* 通知 DHCP 线程停止申请 */
-        dhcp_stop(netif);                         /* 停掉 DHCP（释放租约） */
 #endif
-        HAL_ETH_Stop(&heth);        /* ★停掉 ETH 硬件：DMA 停止，不再接收新帧 */
-        netif_set_down(netif);      /* 网口标记 down（lwip 不对外提供服务） */
-        netif_set_link_down(netif); /* 链路标记 down（触发上面注册的链接回调） */
+        HAL_ETH_Stop(&heth);        /* ★停掉 ETH 硬件：DMA 停止，不再接收新帧（HAL 寄存器操作，本线程可做） */
+        /* 下面 3 个都是改 netif 状态的 API，必须经 netifapi 投递到 tcpip_thread 执行，
+           不能在链接线程里直接 netif_set_down/netif_set_link_down（评审指出的线程安全问题） */
+        netifapi_netif_set_down(netif);
+        netifapi_netif_set_link_down(netif);
+        netifapi_dhcp_stop(netif);
       }
     }
     else  /* 网线插入（或恢复链接） */
@@ -306,8 +321,8 @@ static void lwip_link_thread(void *argument)
       {
         g_lwipdev.link_status = LWIP_LINK_ON;   /* 记录已链接 */
         HAL_ETH_Start_IT(&heth);    /* ★重启 ETH：DMA + 接收中断都开，恢复收包 */
-        netif_set_up(netif);        /* 网口标记 up */
-        netif_set_link_up(netif);   /* 链路标记 up（触发回调 → DHCP 重新申请） */
+        netifapi_netif_set_up(netif);        /* 同样走 tcpip_thread */
+        netifapi_netif_set_link_up(netif);
       }
       /* 若本来就连着，什么都不做 */
     }
@@ -337,12 +352,14 @@ static void lwip_dhcp_process(void *pvParameters)
     {
       case LWIP_DHCP_START:
       {
-        /* 清零网卡上的地址（回到 0.0.0.0），这是 DHCP 申请的前置条件 */
-        ip_addr_set_zero_ip4(&netif->ip_addr);
-        ip_addr_set_zero_ip4(&netif->netmask);
-        ip_addr_set_zero_ip4(&netif->gw);
+        /* 清零网卡上的地址（回到 0.0.0.0），这是 DHCP 申请的前置条件。
+           ★不能再像旧版那样直接 ip_addr_set_zero_ip4(&netif->ip_addr) 写内核结构——
+           必须走 netifapi，由 tcpip_thread 执行 */
+        ip_addr_t zero;
+        ip_addr_set_zero_ip4(&zero);
+        netifapi_netif_set_addr(netif, &zero, &zero, &zero);
         g_lwip_dhcp_state = LWIP_DHCP_WAIT_ADDRESS;   /* 进入"等分配"状态 */
-        dhcp_start(netif);        /* ★真正发起 DHCP 请求（发广播包） */
+        netifapi_dhcp_start(netif);   /* ★真正发起 DHCP 请求（发广播包），在 tcpip 线程执行 */
         printf("Looking for DHCP server, please wait...\r\n");
       }
       break;
@@ -392,14 +409,17 @@ static void lwip_dhcp_process(void *pvParameters)
             /* ★DHCP 超时：放弃动态分配，回落静态 IP */
             printf("DHCP timeout, fallback to static IP...\r\n");
             g_lwip_dhcp_state = LWIP_DHCP_TIMEOUT;  /* 进入超时态（不再重复尝试） */
-            dhcp_stop(netif);                        /* 停掉 DHCP */
+            netifapi_dhcp_stop(netif);                /* 停掉 DHCP（走 tcpip 线程） */
             g_lwipdev.dhcpstatus = 0xFF;             /* 0xFF=正在用静态 */
 
-            /* 把默认静态 IP 直接写进网卡 */
-            IP4_ADDR(&(g_lwip_netif.ip_addr),  g_lwipdev.ip[0], g_lwipdev.ip[1], g_lwipdev.ip[2], g_lwipdev.ip[3]);
-            IP4_ADDR(&(g_lwip_netif.netmask), g_lwipdev.netmask[0], g_lwipdev.netmask[1], g_lwipdev.netmask[2], g_lwipdev.netmask[3]);
-            IP4_ADDR(&(g_lwip_netif.gw),      g_lwipdev.gateway[0], g_lwipdev.gateway[1], g_lwipdev.gateway[2], g_lwipdev.gateway[3]);
-            netif_set_addr(netif, &g_lwip_netif.ip_addr, &g_lwip_netif.netmask, &g_lwip_netif.gw);
+            /* 把默认静态 IP 经 netifapi 写进网卡（不能再直接写 g_lwip_netif.ip_addr 字段） */
+            {
+              ip_addr_t sip, snm, sgw;
+              IP4_ADDR(&sip, g_lwipdev.ip[0], g_lwipdev.ip[1], g_lwipdev.ip[2], g_lwipdev.ip[3]);
+              IP4_ADDR(&snm, g_lwipdev.netmask[0], g_lwipdev.netmask[1], g_lwipdev.netmask[2], g_lwipdev.netmask[3]);
+              IP4_ADDR(&sgw, g_lwipdev.gateway[0], g_lwipdev.gateway[1], g_lwipdev.gateway[2], g_lwipdev.gateway[3]);
+              netifapi_netif_set_addr(netif, &sip, &snm, &sgw);
+            }
             printf("Static IP: %d.%d.%d.%d / %d.%d.%d.%d / gw %d.%d.%d.%d\r\n",
                    g_lwipdev.ip[0], g_lwipdev.ip[1], g_lwipdev.ip[2], g_lwipdev.ip[3],
                    g_lwipdev.netmask[0], g_lwipdev.netmask[1], g_lwipdev.netmask[2], g_lwipdev.netmask[3],
@@ -412,7 +432,7 @@ static void lwip_dhcp_process(void *pvParameters)
       case LWIP_DHCP_LINK_DOWN:
       {
         /* 网线断了：停掉 DHCP，回到 OFF；下次插线回调会置 START 重新申请 */
-        dhcp_stop(netif);
+        netifapi_dhcp_stop(netif);
         g_lwip_dhcp_state = LWIP_DHCP_OFF;
       }
       break;

@@ -126,6 +126,10 @@
    两个都开：以后 Day3 MQTT 移植时不挑库 */
 #define LWIP_NETCONN                1
 #define LWIP_SOCKET                 1
+/* LWIP_NETIF_API=1：开 netifapi_* 系列（netif_set_up/down/link/set_addr、dhcp_start/stop 的
+   线程安全封装）。带 OS 且 LWIP_TCPIP_CORE_LOCKING=0 时，别的任务要改 netif 状态必须走它，
+   函数体才会编进 lwip 库（评审要求：链路/DHCP 线程不能直接动 netif）。 */
+#define LWIP_NETIF_API              1
 
 /* ---------- 操作系统选项（线程配置，例程原值） ---------- */
 /* 默认邮箱大小（netconn/socket 层的收包邮箱容量，10 条消息缓存） */

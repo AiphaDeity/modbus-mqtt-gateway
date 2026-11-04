@@ -286,6 +286,11 @@ static void get_stm32_mac(uint8_t *mac)
   mac[3] = (uint8_t)(uid[0] & 0x000000FF);
   mac[4] = (uint8_t)(sum & 0xFF);   /* 校验和 */
   mac[5] = (uint8_t)(xor & 0xFF);   /* 异或和 */
+
+  /* IEEE 802 MAC 首字节规则：bit0=I/G（0=单播，1=组播）；bit1=U/L（0=全局管理OUI，1=本地管理）。
+     UID 截出来的前 3 字节不对应任何注册 OUI，绝不能当全局地址用——必须置成本地管理位，
+     同时清 bit0 保证是单播地址。实测板子 MAC 由此从 00:2D:.. 变为 02:2D:.. */
+  mac[0] = (uint8_t)((mac[0] & 0xFCU) | 0x02U);
 }
 
 /* ============================================================================
@@ -321,13 +326,14 @@ static void low_level_init(struct netif *netif)
      保证 ARP 报文里的源 MAC 与实际发帧的源 MAC 完全一致（两处不一致会直接断网）。
      注意：必须在 HAL_ETH_Init（MX_ETH_Init）之后执行才有效（ETH 时钟已使能）。
      MACA0LR = mac[0..3]（低 4 字节，mac[0] 在最低字节）
-     MACA0HR = mac[4..5]（高 2 字节）+ bit31 SA（源地址有效位，必须置 1） */
+     MACA0HR = mac[4..5]（高 2 字节）；bit31 = AE（Address Enable，本表项有效），
+     F4 参考手册要求写 1，这不是"源地址有效位"的通用规则，只针对本寄存器。 */
   ETH->MACA0LR = (uint32_t)((uint32_t)macaddress[0] |
                 ((uint32_t)macaddress[1] << 8) |
                 ((uint32_t)macaddress[2] << 16) |
                 ((uint32_t)macaddress[3] << 24));
   ETH->MACA0HR = (uint32_t)((uint32_t)macaddress[4] |
-                ((uint32_t)macaddress[5] << 8) | 0x80000000U);
+                ((uint32_t)macaddress[5] << 8) | 0x80000000U);   /* bit31=AE，必须置 1 */
 
   /* 3. 零拷贝接收池：把 RX_POOL 初始化（分配内存）。必须在 Start_IT 之前，
      因为 DMA 启动后立刻要 RxAllocate 回调从池里取缓冲 */
@@ -409,10 +415,6 @@ static err_t low_level_output(struct netif *netif, struct pbuf *p)
   HAL_ETH_ReleaseTxPacket(&heth);
 
 
-  /* ★★短帧补齐用的静态缓冲（轮转使用，见文件上方 ETH_MIN_FRAME_LEN 的说明） */
-  static uint8_t  tx_pad_buf[ETH_TX_DESC_CNT][ETH_MIN_FRAME_LEN] __ALIGNED(4);
-  static uint32_t tx_pad_idx = 0U;
-
   /* pbuf 可能是一整块，也可能是一串（链表）。把每段的 payload 指针
      填进 Txbuffer 数组，DMA 按这个表把各段数据串成一帧发出去 */
   for (q = p; q != NULL; q = q->next)
@@ -432,30 +434,11 @@ static err_t low_level_output(struct netif *netif, struct pbuf *p)
     i++;
   }
 
-  /* ★★短帧补齐：ARP（42 字节）这类帧短于以太网最小帧长，
-     拷到静态缓冲 + 尾部补 0，凑够 60 字节再发，避免被交换机/网卡当 runt 丢弃。
-     pbuf_copy_partial 会把 pbuf 链（可能多段）按顺序拷成连续的一段。 */
-  if (tx_len < ETH_MIN_FRAME_LEN)
-  {
-    uint8_t *pb = tx_pad_buf[tx_pad_idx];
-    uint16_t n;
-
-    tx_pad_idx = (tx_pad_idx + 1U) % ETH_TX_DESC_CNT;       /* 轮转到下一块，不覆盖正在发的 */
-    n = (uint16_t)pbuf_copy_partial(p, pb, tx_len, 0);      /* 把原帧内容拷成连续内存 */
-    memset(&pb[n], 0, (size_t)(ETH_MIN_FRAME_LEN - n));     /* 剩余部分填 0（padding） */
-
-    Txbuffer[0].buffer = pb;                                /* 只用一个连续段，DMA 直接发 */
-    Txbuffer[0].len    = ETH_MIN_FRAME_LEN;
-    Txbuffer[0].next   = NULL;
-    for (i = 1U; i < ETH_TX_DESC_CNT; i++)                  /* 清掉后面可能残留的段链 */
-    {
-      Txbuffer[i].buffer = NULL;
-      Txbuffer[i].len    = 0U;
-      Txbuffer[i].next   = NULL;
-    }
-    i    = 1U;                                              /* 现在是 1 段 */
-    tx_len = ETH_MIN_FRAME_LEN;
-  }
+  /* 短帧补齐说明（评审后删除软件补齐的原因）：
+     早期曾在 <60 字节时把帧拷到 4 块轮转静态缓冲里补 0——但轮转下标 tx_pad_idx
+     和"哪个 DMA 描述符还在发哪块缓冲"不绑定，存在 DMA 仍读旧缓冲时被 memcpy
+     覆盖的隐患。实测已确认 F4 MAC 硬件 CRCPAD 会自动把短帧补到 60 字节并算 FCS，
+     软件补齐既多余又危险，已整体移除；pbuf 里多少字节就发多少字节。 */
 
   /* 填 TxConfig（公共部分同事已配好：校验和/CRC 硬件算，这里只填每帧特有的） */
   TxConfig.Length   = tx_len;          /* 整帧总长（DMA 发这么多字节，补齐后可能 > p->tot_len） */
@@ -544,6 +527,12 @@ static void ethernetif_thread(void *argument)
          判断"没包是没中断还是中断来了但读不出数据"；二是万一中断丢了也能兜底轮询一次。
          正式运行保持 1 秒超时没有副作用（每次醒来读一遍没包就立刻睡回去） */
     osSemaphoreAcquire(RxPktSemaphore, 1000U);
+
+    /* ★评审要求：收发包用同一个任务上下文串行化 TX 提交/回收。
+       本线程每 ~1s 醒一次（无论有没有收到帧），顺手回收已发完的 Tx 描述符和 pbuf——
+       否则"最后一批已发帧"会一直占着描述符/pbuf 直到下一次发包。
+       和 low_level_output 开头的回收形成双保险：发包路径即时回收，空闲时本线程兜底回收。 */
+    HAL_ETH_ReleaseTxPacket(&heth);
 
 #if ETH_DBG_FRAMES
     /* 心跳：每秒打印一次中断/错误/读失败计数（只在有变化时打，避免刷屏） */
