@@ -9,10 +9,10 @@
  * M2（MQTT 上云）↔ M3（存储）队列协议
  * 对齐《M2→M3 存储接口约定 v0.1》第 4 节：
  *   - 所有队列由 M3 创建并持有，M2 通过下面的 getter 拿句柄
- *   - 写/拉取/回执消息为值传递（payload 指针除外）；M3 在 Storage_Task
- *     里收到后立即处理/拷贝，不跨队列持有 M2 的指针
- *   - 补传应答因体积大（~4.3KB），用单个静态缓冲 + 指针消息队列交付，
- *     M2 取走后即拷贝，同一时刻只允许一个在途请求（req_id 匹配）
+ *   - 全部消息为值传递（osMessageQueuePut/Get 内核拷贝）：M2 用栈上或
+ *     临时变量填好结构体，put 返回后即可复用，无生命周期约束
+ *   - 补传为单在途请求（req_id 匹配）：M2 发出一个请求须等收到应答后
+ *     再发下一个
  */
 
 #define STORAGE_M2_WRITE_Q_DEPTH    8
@@ -20,13 +20,13 @@
 #define STORAGE_M2_ACK_Q_DEPTH      8
 #define STORAGE_M2_FETCH_BATCH_MAX  8
 
-/* 4.1 M2 → M3：写入一条待持久化记录（离线缓存） */
+/* 4.1 M2 → M3：写入一条待持久化记录（离线缓存）。值传递，put 即拷贝 */
 typedef struct {
-    uint8_t        kind;            /* 1=telemetry 2=event */
-    uint64_t       seq;             /* M2 经 storage_seq_alloc 分配，单调递增 */
-    uint64_t       captured_at_ms;  /* Unix 毫秒；未校时 = 0 */
-    const uint8_t *payload;         /* JSON 原文；M3 出队后立即拷贝 */
-    uint16_t       payload_len;     /* ≤512 */
+    uint8_t  kind;            /* 1=telemetry 2=event */
+    uint64_t seq;             /* M2 经 storage_seq_alloc 分配，单调递增 */
+    uint64_t captured_at_ms;  /* Unix 毫秒；未校时 = 0 */
+    uint16_t payload_len;     /* ≤512 */
+    uint8_t  payload[512];    /* JSON 原文 */
 } storage_write_req_t;
 
 /* 4.2 M2 → M3：补传拉取请求 */
@@ -35,14 +35,14 @@ typedef struct {
     uint16_t max_count;             /* ≤8 */
 } storage_fetch_req_t;
 
-/* 4.3 M3 → M2：补传数据应答（单在途，M2 收到后立即拷贝） */
+/* 4.3 M3 → M2：补传数据应答（单在途，req_id 匹配） */
 typedef struct {
     uint32_t     req_id;
     uint16_t     count;             /* 0 = 没有更多历史记录 */
     record_out_t records[STORAGE_M2_FETCH_BATCH_MAX];
 } storage_fetch_resp_t;
 
-/* 4.4 M2 → M3：上传成功回执（按 seq 水位删除） */
+/* 4.4 M2 → M3：上传成功回执（按 seq 水位删除，取本批最大 seq） */
 typedef struct {
     uint64_t ack_upto_seq;
 } storage_ack_t;

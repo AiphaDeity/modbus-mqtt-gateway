@@ -3,9 +3,11 @@
  *
  * 队列全部由 M3 创建；Storage_Task 循环调用 storage_m2_process() 驱动：
  *   1) 写队列：M2 离线采集的记录 → storage_record_append（seq 由 M2 预先
- *      经 storage_seq_alloc 分配，payload 在本任务内立即拷入 576B 槽缓冲）
- *   2) 补传请求：填充静态应答缓冲（单在途，req_id 匹配），指针入应答队列
+ *      经 storage_seq_alloc 分配）
+ *   2) 补传请求：填入静态应答缓冲后值拷贝进应答队列（单在途，req_id 匹配）
  *   3) 回执：ack 水位推进 → storage_record_ack_upto
+ *
+ * 全部消息为值传递：M2 put 返回后栈上缓冲即可复用，无生命周期约束。
  */
 
 #include "storage_m2.h"
@@ -15,31 +17,28 @@
 
 /* ---------- 队列句柄 ---------- */
 
-static osMessageQueueId_t s_write_q   = NULL;   /* 元素：storage_write_req_t*（M2 侧分配） */
+static osMessageQueueId_t s_write_q   = NULL;   /* 元素：storage_write_req_t（536B 值） */
 static osMessageQueueId_t s_fetch_q   = NULL;   /* 元素：storage_fetch_req_t（值） */
-static osMessageQueueId_t s_resp_q    = NULL;   /* 元素：storage_fetch_resp_t*（单静态缓冲） */
+static osMessageQueueId_t s_resp_q    = NULL;   /* 元素：storage_fetch_resp_t（~4.3KB 值，深度 1） */
 static osMessageQueueId_t s_ack_q     = NULL;   /* 元素：storage_ack_t（值） */
 
-/* 应答缓冲：单在途请求；M2 收到指针后立即拷贝，再发下一个请求 */
+/* 应答组装缓冲：填好后值拷贝入队列，随后即可重填 */
 static storage_fetch_resp_t s_resp_buf;
 
 void storage_m2_init(void)
 {
-    osMessageQueueAttr_t attr = { 0 };
-    attr.name = "m3_write_q";
+    static const osMessageQueueAttr_t attr_write = { .name = "m3_write_q" };
+    static const osMessageQueueAttr_t attr_fetch = { .name = "m3_fetch_q" };
+    static const osMessageQueueAttr_t attr_resp  = { .name = "m3_resp_q"  };
+    static const osMessageQueueAttr_t attr_ack   = { .name = "m3_ack_q"   };
+
     s_write_q = osMessageQueueNew(STORAGE_M2_WRITE_Q_DEPTH,
-                                  sizeof(storage_write_req_t *), &attr);
-
-    attr.name = "m3_fetch_q";
+                                  sizeof(storage_write_req_t), &attr_write);
     s_fetch_q = osMessageQueueNew(STORAGE_M2_FETCH_Q_DEPTH,
-                                  sizeof(storage_fetch_req_t), &attr);
-
-    attr.name = "m3_resp_q";
-    s_resp_q = osMessageQueueNew(1, sizeof(storage_fetch_resp_t *), &attr);
-
-    attr.name = "m3_ack_q";
-    s_ack_q = osMessageQueueNew(STORAGE_M2_ACK_Q_DEPTH,
-                                sizeof(storage_ack_t), &attr);
+                                  sizeof(storage_fetch_req_t), &attr_fetch);
+    s_resp_q  = osMessageQueueNew(1, sizeof(storage_fetch_resp_t), &attr_resp);
+    s_ack_q   = osMessageQueueNew(STORAGE_M2_ACK_Q_DEPTH,
+                                  sizeof(storage_ack_t), &attr_ack);
 }
 
 osMessageQueueId_t storage_m2_write_queue(void)      { return s_write_q; }
@@ -61,12 +60,10 @@ void storage_m2_get_cache_stats(storage_cache_stats_t *out)
 
 static void process_write_queue(void)
 {
-    storage_write_req_t *req;
+    storage_write_req_t req;
     while (osMessageQueueGet(s_write_q, &req, NULL, 0) == osOK) {
-        if (req == NULL) continue;
-        /* payload 立即拷入 576B 槽缓冲并落盘，此后 M2 的缓冲即可复用 */
-        (void)storage_record_append(req->kind, req->seq, req->captured_at_ms,
-                                    req->payload, req->payload_len);
+        (void)storage_record_append(req.kind, req.seq, req.captured_at_ms,
+                                    req.payload, req.payload_len);
     }
 }
 
@@ -84,8 +81,8 @@ static void process_fetch_queue(void)
     s_resp_buf.req_id = req.req_id;
     s_resp_buf.count  = count;
 
-    /* 应答队列深度 1：上一份应答没被取走就丢弃（M2 会超时重试） */
-    (void)osMessageQueuePut(s_resp_q, &(storage_fetch_resp_t *){ &s_resp_buf }, 0, 0);
+    /* 应答队列深度 1：上一份应答没被取走就丢弃（M2 单在途 + 超时重试） */
+    (void)osMessageQueuePut(s_resp_q, &s_resp_buf, 0, 0);
 }
 
 static void process_ack_queue(void)

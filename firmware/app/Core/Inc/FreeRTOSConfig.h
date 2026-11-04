@@ -68,7 +68,9 @@
 #define configTICK_RATE_HZ                       ((TickType_t)1000)
 #define configMAX_PRIORITIES                     ( 56 )
 #define configMINIMAL_STACK_SIZE                 ((uint16_t)128)
-#define configTOTAL_HEAP_SIZE                    ((size_t)15360)
+/* 24KB：M3 的 M2↔M3 值传递队列（写 8×536B + 应答 1×~4.4KB ≈ 9KB）后，
+ * 仍给 Timer 任务和 M1/M2 后续队列留 ~14KB 余量 */
+#define configTOTAL_HEAP_SIZE                    ((size_t)24576)
 #define configMAX_TASK_NAME_LEN                  ( 16 )
 #define configUSE_TRACE_FACILITY                 1
 #define configUSE_16_BIT_TICKS                   0
