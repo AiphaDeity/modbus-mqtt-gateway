@@ -157,8 +157,4 @@ mb_status_e mb_delete_slave(uint8_t slave_id);
 mb_status_e mb_parse_frame(mb_frame_slot_t *local_frame);
 mb_status_e mb_send_slave_request(mb_slave_runtime_t *slave);
 
-static uint32_t mb_get_backoff_cooling_ms(uint8_t consecutive_fail);
-
-
-
 #endif

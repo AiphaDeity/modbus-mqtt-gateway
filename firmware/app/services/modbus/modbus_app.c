@@ -1,13 +1,131 @@
 #include "modbus_app.h"
 #include <stdlib.h>
 #include <string.h>
-#include "modbus_critical.h"
 #include "modbus_proto.h"
 #include "modbus.h"
 
-
-
 mb_handle_t *mb_handle = NULL;
+
+/*----------------------------------------------*/
+/**
+ * @brief 根据连续失败次数得到本次冷却时长，带封顶
+ */
+static uint32_t mb_get_backoff_cooling_ms(uint8_t consecutive_fail)
+{
+    if (consecutive_fail == 1)
+    {
+        return 5000;
+    }
+    else if (consecutive_fail == 2)
+    {
+        return 10000;
+    }
+    else
+    {
+        // >=3 之后封顶 20s，不再放大
+        return 20000;
+    }
+}
+
+
+static void mb_poll_idle()
+{
+    mb_slave_runtime_t *slave = NULL;
+    uint32_t now = osKernelGetTickCount();
+    // 寻找符合采集条件的从站
+    for (uint8_t i = 0; i < mb_handle->slave_max_num; i++)
+    {
+        slave = &mb_handle->slave_list[i];
+
+        if (slave->valid == 0 || slave->cfg.enable == 0) continue;
+        // ========== 阶梯冷却判断 ==========
+        if (slave->consecutive_fail > 0)
+        {
+            uint32_t cooling = mb_get_backoff_cooling_ms(slave->consecutive_fail);
+            if ((now - slave->last_trigger_tick) < cooling)
+            {
+                continue; // 还在冷却窗口内，跳过
+            }
+        }
+        // 正常采集周期判断
+        if ((now - slave->last_trigger_tick) < slave->cfg.collect_interval_ms) continue;
+
+        // 选中，发起新一轮采集
+        mb_handle->waiting_slave = slave;
+        slave->last_trigger_tick = now;
+        slave->fail_count = 0;
+        mb_handle->state = MB_STATE_TX;
+        break;
+    }
+}
+
+static void mb_poll_tx()
+{
+    mb_slave_runtime_t *slave = mb_handle->waiting_slave;
+    if (slave == NULL)
+    {
+        mb_handle->state = MB_STATE_IDLE;
+        return;
+    }
+    mb_status_e ret = mb_send_slave_request(slave);
+    if (ret == MB_STATUS_OK)
+    {
+        // DMA提交成功，等待 TxCplt 回调切 WAIT_ACK
+    }
+    else
+    {
+        mb_handle->state = MB_STATE_IDLE;
+        mb_handle->waiting_slave = NULL;
+    }
+}
+
+
+
+static void mb_poll_wait_ack()
+{
+    uint32_t now = osKernelGetTickCount();
+    mb_slave_runtime_t *slave = mb_handle->waiting_slave;
+    if (slave == NULL)
+    {
+        mb_handle->state = MB_STATE_IDLE;
+        return;
+    }
+
+    if ((now - mb_handle->send_tick) >= mb_handle->timeout_ms)
+    {
+        slave->collect_status = 2;
+        slave->is_online = 0;
+        slave->fail_count++;
+
+        if (slave->fail_count <= slave->cfg.retry_cnt)
+        {
+            // 本轮继续重试
+            mb_handle->state = MB_STATE_TX;
+        }
+        else
+        {
+            // ✅ 本轮所有重试耗尽：连续失败计数 +1
+            if (slave->consecutive_fail < 255)
+            {
+                slave->consecutive_fail++;
+            }
+            mb_handle->state = MB_STATE_IDLE;
+            mb_handle->waiting_slave = NULL;
+        }
+    }
+}
+
+
+
+static void mb_poll_err()
+{
+    mb_handle->state = MB_STATE_IDLE;
+    mb_handle->waiting_slave = NULL;
+}
+
+
+/*----------------------------------------------*/
+
 
 /**
  * @brief 初始化从站句柄
@@ -216,98 +334,31 @@ mb_status_e mb_in_slot(uint16_t len)
  */
 mb_status_e mb_poll_slave(void)
 {
-    uint32_t now = osKernelGetTickCount();
-    mb_slave_runtime_t *slave = NULL;
-
     switch (mb_handle->state)
     {
         case MB_STATE_IDLE:
         {
-            // 寻找符合采集条件的从站
-            for (uint8_t i = 0; i < mb_handle->slave_max_num; i++)
-            {
-                slave = &mb_handle->slave_list[i];
-
-                if (slave->valid == 0) continue;
-                if (slave->cfg.enable == 0) continue;
-                // ========== 阶梯冷却判断 ==========
-                if (slave->consecutive_fail > 0)
-                {
-                    uint32_t cooling = mb_get_backoff_cooling_ms(slave->consecutive_fail);
-                    if ((now - slave->last_trigger_tick) < cooling)
-                    {
-                        continue; // 还在冷却窗口内，跳过
-                    }
-                }
-                // 正常采集周期判断
-                if ((now - slave->last_trigger_tick) < slave->cfg.collect_interval_ms) continue;
-
-                // 选中，发起新一轮采集
-                mb_handle->waiting_slave = slave;
-                slave->last_trigger_tick = now;
-                slave->fail_count = 0;
-                mb_handle->state = MB_STATE_TX;
-                break;
-            }
+            mb_poll_idle();
             break;
         }
 
         case MB_STATE_TX:
         {
-            slave = mb_handle->waiting_slave;
-            if (slave == NULL)
-            {
-                mb_handle->state = MB_STATE_IDLE;
-                break;
-            }
-            mb_status_e ret = mb_send_slave_request(slave);
-            if (ret == MB_STATUS_OK)
-            {
-                // DMA提交成功，等待 TxCplt 回调切 WAIT_ACK
-            }
-            else
-            {
-                mb_handle->state = MB_STATE_IDLE;
-                mb_handle->waiting_slave = NULL;
-            }
+            mb_poll_tx();
             break;
         }
 
         case MB_STATE_WAIT_ACK:
         {
-            slave = mb_handle->waiting_slave;
-            if (slave == NULL)
-            {
-                mb_handle->state = MB_STATE_IDLE;
-                break;
-            }
-
-            if ((now - mb_handle->send_tick) >= mb_handle->timeout_ms)
-            {
-                slave->collect_status = 2;
-                slave->is_online = 0;
-                slave->fail_count++;
-
-                if (slave->fail_count <= slave->cfg.retry_cnt)
-                {
-                    // 本轮继续重试
-                    mb_handle->state = MB_STATE_TX;
-                }
-                else
-                {
-                    // ✅ 本轮所有重试耗尽：连续失败计数 +1
-                    if (slave->consecutive_fail < 255)
-                    {
-                        slave->consecutive_fail++;
-                    }
-                    mb_handle->state = MB_STATE_IDLE;
-                    mb_handle->waiting_slave = NULL;
-                }
-            }
+            mb_poll_wait_ack();
             break;
         }
 
         case MB_STATE_ERR:
+        {
+            mb_poll_err();
+            break;
+        }
         default:
         {
             mb_handle->state = MB_STATE_IDLE;
@@ -317,6 +368,9 @@ mb_status_e mb_poll_slave(void)
     }
     return MB_STATUS_OK;
 }
+
+
+
 
 
 /**
@@ -337,22 +391,8 @@ mb_status_e mb_send_slave_request(mb_slave_runtime_t *slave)
 }
 
 
-/**
- * @brief 根据连续失败次数得到本次冷却时长，带封顶
- */
-static uint32_t mb_get_backoff_cooling_ms(uint8_t consecutive_fail)
-{
-    if (consecutive_fail == 1)
-    {
-        return 5000;
-    }
-    else if (consecutive_fail == 2)
-    {
-        return 10000;
-    }
-    else
-    {
-        // >=3 之后封顶 20s，不再放大
-        return 20000;
-    }
-}
+
+
+
+
+

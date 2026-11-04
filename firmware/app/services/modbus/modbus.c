@@ -11,6 +11,33 @@ osMessageQueueId_t modbus_tx_queue = NULL;
 #define MODBUS_TX_QUEUE_DEPTH  8U
 #define MODBUS_TX_ITEM_SIZE    64U
 
+/*
+ * @brief  接收完成回调函数
+ * @param  rx_len: 接收字节数
+ * @retval None
+*/
+static void Modbus_Rs485FrameReceivedCb(uint16_t rx_len)
+{
+    // 数据入槽
+    mb_in_slot(rx_len);
+    // 通知解析任务有新帧
+    osSemaphoreRelease(mb_handle->xNewFrameNotifySem);
+}
+
+/**
+ * @brief 发送完成回调函数
+ * @param None
+ * @retval None
+*/
+static void Modbus_Tx485FrameSentCb(void)
+{
+    // 通发送完成
+    mb_handle->state = MB_STATE_WAIT_ACK;               // 等待应答
+    mb_handle->send_tick = osKernelGetTickCount();      // 记录发送时间
+}
+
+
+
 AppModuleInitResult Modbus_Init(void)
 {
     if (BSP_RS485_Init(&MODBUS_RS485_UART) != 0)
@@ -79,25 +106,3 @@ void vModbusPollTask(void *arg)
     }
 }
 
-/*
- * @brief  接收完成回调函数
- * @param  rx_len: 接收字节数
- * @retval None
-*/
-static void Modbus_Rs485FrameReceivedCb(uint16_t rx_len)
-{
-    // 数据入槽
-    mb_in_slot(rx_len);
-
-    
-
-    // 通知解析任务有新帧
-    osSemaphoreRelease(mb_handle->xNewFrameNotifySem);
-}
-
-static void Modbus_Tx485FrameSentCb(void)
-{
-    // 通发送完成
-    mb_handle->state = MB_STATE_WAIT_ACK;               // 等待应答
-    mb_handle->send_tick = osKernelGetTickCount();      // 记录发送时间
-}
