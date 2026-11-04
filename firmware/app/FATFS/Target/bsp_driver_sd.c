@@ -30,6 +30,7 @@
 #else
 /* USER CODE BEGIN FirstSection */
 /* can be used to modify / undefine following code or add new definitions */
+#include "main.h"   /* 需要 main.h 里的 SD_CARD_DET_GPIO_Port / SD_CARD_DET_Pin */
 /* USER CODE END FirstSection */
 /* Includes ------------------------------------------------------------------*/
 #include "bsp_driver_sd.h"
@@ -304,7 +305,9 @@ __weak uint8_t BSP_SD_IsDetected(void)
   __IO uint8_t status = SD_PRESENT;
 
   /* USER CODE BEGIN 1 */
-  /* user code can be inserted here */
+  /* PD3 卡座检测（硬件：卡插入时机械开关拉低 DET 引脚） */
+  return (HAL_GPIO_ReadPin(SD_CARD_DET_GPIO_Port, SD_CARD_DET_Pin) == GPIO_PIN_RESET)
+         ? SD_PRESENT : SD_NOT_PRESENT;
   /* USER CODE END 1 */
 
   return status;
