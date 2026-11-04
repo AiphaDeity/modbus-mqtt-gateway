@@ -18,6 +18,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdbool.h>
 
 #include "cmsis_os2.h"
 #include "FreeRTOS.h"
@@ -37,6 +38,8 @@
 #define MQTT_CLIENT_ID   "mb2mqtt_001"
 /* status topic = "<gateway_id>/status" */
 #define MQTT_STATUS_TOPIC "mb2mqtt_001/status"
+/* 下行命令订阅 topic */
+#define MQTT_CMD_TOPIC    "mb2mqtt_001/cmd"
 
 /* 收发缓冲：放静态区，不占 4KB 任务栈 */
 static uint8_t tx_buf[256];
@@ -94,6 +97,48 @@ static size_t mqtt_build_publish(const char *topic, const uint8_t *payload, size
 
   /* 0x30 = PUBLISH, DUP=0, QoS=0, RETAIN=0 */
   return mqtt_encode_header(0x30, vh, n);
+}
+
+/* 组 SUBSCRIBE（packet id=0x0001，订阅一个 topic，QoS0） */
+static size_t mqtt_build_subscribe(const char *topic)
+{
+  uint8_t vh[128];
+  size_t n = 0;
+
+  vh[n++] = 0x00; vh[n++] = 0x01;          /* packet id = 1 */
+  size_t tlen = strlen(topic);
+  vh[n++] = (uint8_t)(tlen >> 8);
+  vh[n++] = (uint8_t)(tlen & 0xFF);
+  memcpy(&vh[n], topic, tlen);
+  n += tlen;
+  vh[n++] = 0x00;                          /* 期望 QoS = 0 */
+
+  /* 0x82 = SUBSCRIBE, DUP=0, QoS=1（协议要求 SUBSCRIBE 固定带 QoS1） */
+  return mqtt_encode_header(0x82, vh, n);
+}
+
+/* 读一个 netbuf 到 rx_buf，返回读到的字节数 */
+static uint16_t mqtt_recv_to_buf(struct netconn *conn)
+{
+  struct netbuf *nb = NULL;
+  err_t err = netconn_recv(conn, &nb);
+  if (err != ERR_OK || nb == NULL)
+  {
+    if (nb) netbuf_delete(nb);
+    return 0;
+  }
+  uint16_t rlen = 0;
+  struct pbuf *chain = nb->p;
+  while (chain && rlen < sizeof(rx_buf))
+  {
+    uint16_t copy = chain->len;
+    if (rlen + copy > sizeof(rx_buf)) copy = sizeof(rx_buf) - rlen;
+    memcpy(&rx_buf[rlen], chain->payload, copy);
+    rlen += copy;
+    chain = chain->next;
+  }
+  netbuf_delete(nb);
+  return rlen;
 }
 
 AppModuleInitResult MqttClient_Init(void)
@@ -186,9 +231,54 @@ void MqttClient_Task(void *argument)
     err = netconn_write(conn, tx_buf, pkglen, NETCONN_COPY);
     printf("[MQTT] PUBLISH status 'online' -> %s, ret=%d\r\n", MQTT_STATUS_TOPIC, (int)err);
 
-    /* 骨架阶段：发完就挂起 30s，然后重连（后续改成 keepalive ping + 订阅循环） */
+    /* 5) 订阅下行命令 topic */
+    pkglen = mqtt_build_subscribe(MQTT_CMD_TOPIC);
+    err = netconn_write(conn, tx_buf, pkglen, NETCONN_COPY);
+    printf("[MQTT] SUBSCRIBE %s, ret=%d\r\n", MQTT_CMD_TOPIC, (int)err);
+    (void)mqtt_recv_to_buf(conn);
+    printf("[MQTT] SUBACK: %02X %02X %02X %02X %02X\r\n",
+           rx_buf[0], rx_buf[1], rx_buf[2], rx_buf[3], rx_buf[4]);
+
+    /* 6) 常驻 recv 循环：收 broker 下行，5s 收不到就累计，满 5 次发 PINGREQ 心跳 */
+    unsigned idle_ticks = 0;
+    bool broken = false;
+    while (!broken)
+    {
+      uint16_t n = mqtt_recv_to_buf(conn);
+      if (n == 0)
+      {
+        /* 收超时：累计，每 25s 发一次 PINGREQ（keepalive=30s） */
+        idle_ticks++;
+        if (idle_ticks >= 5)
+        {
+          tx_buf[0] = 0xC0; tx_buf[1] = 0x00;   /* PINGREQ */
+          err = netconn_write(conn, tx_buf, 2, NETCONN_COPY);
+          printf("[MQTT] PINGREQ sent, ret=%d\r\n", (int)err);
+          idle_ticks = 0;
+        }
+        continue;
+      }
+      idle_ticks = 0;
+
+      /* 按 MQTT 报文类型分流（骨架阶段只打日志，不解析 payload） */
+      uint8_t ptype = rx_buf[0] & 0xF0;
+      switch (ptype)
+      {
+        case 0xD0:  printf("[MQTT] recv PINGRESP\r\n"); break;
+        case 0x30:  /* PUBLISH：broker 下行命令 */
+        case 0x31:
+          printf("[MQTT] recv PUBLISH from broker, %u bytes\r\n", (unsigned)n);
+          /* 后续：解析 topic/payload，调 M1_ExecuteCommand */
+          break;
+        default:
+          printf("[MQTT] recv unknown type=%02X len=%u\r\n", rx_buf[0], (unsigned)n);
+          break;
+      }
+    }
+
+    /* 走到这里说明连接异常，外层 3 秒后重连 */
     netconn_close(conn);
     netconn_delete(conn);
-    osDelay(pdMS_TO_TICKS(30000));
+    osDelay(pdMS_TO_TICKS(3000));
   }
 }
