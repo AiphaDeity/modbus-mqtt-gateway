@@ -22,6 +22,8 @@
 #include "stm32f4xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "FreeRTOS.h"
+#include "task.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -354,5 +356,12 @@ void DMA2_Stream7_IRQHandler(void)
 }
 
 /* USER CODE BEGIN 1 */
+
+/* ★这里不要写 SysTick_Handler！
+   本工程 SysTick_Handler 由 cmsis_os2.c 的默认实现提供（只喂 FreeRTOS 心跳），
+   HAL 时基由 TIM6 单独提供（stm32f4xx_hal_timebase_tim.c）。
+   若在此处再定义一个 SysTick_Handler 并调 HAL_IncTick()，
+   会和 TIM6 双份递增 uwTick，所有 HAL 超时（HAL_Delay/HAL_GetTick）全部失真。
+   详见 LWIP_PING排障记录_修正版.md 第四节修正表。 */
 
 /* USER CODE END 1 */
