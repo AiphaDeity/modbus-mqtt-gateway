@@ -25,6 +25,11 @@ void BSP_RS485_SetRxCpltCallback(Rs485RxCpltCallback cb)
 {
     g_rx_cplt_cb = cb;
 }
+
+void BSP_RS485_SetTxCpltCallback(Rs485TxCpltCallback cb)
+{
+    g_tx_cplt_cb = cb;
+}
 /*----------------------------------------------------------------------------------------*/
 // 中断回调钩子（HAL库的串口完成回调）
 // void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
