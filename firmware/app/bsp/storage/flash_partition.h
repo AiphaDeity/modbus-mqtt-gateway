@@ -31,6 +31,8 @@
  *   0x043000  序列高水位 副本 B
  *   0x044000  持久时间下界 副本 A
  *   0x045000  持久时间下界 副本 B
+ *   0x046000  TF 记录环状态 副本 A（cur_seg/next_slot/ack 水位/dropped）
+ *   0x047000  TF 记录环状态 副本 B
  * 其余扇区保留。
  */
 #define FLASH_IDENTITY_A_ADDR        0x040000U
@@ -39,6 +41,8 @@
 #define FLASH_SEQ_B_ADDR             0x043000U
 #define FLASH_TIME_FLOOR_A_ADDR      0x044000U
 #define FLASH_TIME_FLOOR_B_ADDR      0x045000U
+#define FLASH_RING_STATE_A_ADDR      0x046000U
+#define FLASH_RING_STATE_B_ADDR      0x047000U
 
 /* === 控制日志：双区，各 512KiB === */
 #define FLASH_PART_CTRLLOG_BASE      0x080000U

@@ -8,6 +8,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/storage_timefloor.c
     ${CMAKE_CURRENT_LIST_DIR}/storage_ctrllog.c
     ${CMAKE_CURRENT_LIST_DIR}/storage_record.c
+    ${CMAKE_CURRENT_LIST_DIR}/storage_m2.c
 )
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}

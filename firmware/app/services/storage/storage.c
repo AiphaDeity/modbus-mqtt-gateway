@@ -12,6 +12,7 @@
 #include "storage_timefloor.h"
 #include "storage_ctrllog.h"
 #include "storage_record.h"
+#include "storage_m2.h"
 
 #include "cmsis_os2.h"
 
@@ -95,6 +96,9 @@ void Storage_Task(void *argument)
     /* 记录持久化（TF 卡）— 可能需要挂载/格式化，放在 Task 里不阻塞 Init */
     (void)storage_record_init();
 
+    /* M2↔M3 队列协议（写队列/补传/回执），队列句柄先于卡就绪创建 */
+    storage_m2_init();
+
     /* 2. 上报就绪位 */
 
     // 配置存储服务就绪：判据是 SPI Flash 可读写，空设备也算就绪
@@ -108,6 +112,7 @@ void Storage_Task(void *argument)
 
     /* 3. 业务循环 */
     uint32_t last_floor_tick = HAL_GetTick();
+    uint32_t last_record_retry_tick = HAL_GetTick();
 
     for (;;)
     {
@@ -123,11 +128,18 @@ void Storage_Task(void *argument)
         // 推进控制日志整区回收（无回收任务时立即返回）
         (void)storage_ctrllog_maintenance();
 
-        // TODO: 后续在这里处理：
-        //   - 配置保存请求队列
-        //   - RTC 校时同步
-        //   - TF 卡记录写入
-        //   - 看门狗喂狗
+        // M2↔M3 队列：写请求 / 补传拉取 / ack 回执
+        storage_m2_process();
+
+        // 记录环状态节流落盘（段切换时已在 append 内立即落盘）
+        storage_record_maintenance();
+
+        // TF 卡热插拔重试：未就绪时每 5s 重试一次挂载
+        if (!storage_record_is_ready() &&
+            (HAL_GetTick() - last_record_retry_tick) >= 5000U) {
+            last_record_retry_tick = HAL_GetTick();
+            (void)storage_record_init();
+        }
 
         osDelay(1000);
     }
