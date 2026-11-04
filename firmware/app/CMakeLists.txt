@@ -44,7 +44,6 @@ set(GATEWAY_APP_VECTOR_OFFSET "0x00000000" CACHE STRING "Application vector tabl
 target_compile_definitions(STM32_Drivers PRIVATE USER_VECT_TAB_ADDRESS VECT_TAB_OFFSET=${GATEWAY_APP_VECTOR_OFFSET})
 
 add_subdirectory(integration)
-add_subdirectory(bsp)
 add_subdirectory(services/modbus)
 
 
@@ -79,4 +78,5 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
     m2_ethernet
 
     # Add user defined libraries
+    modbus
 )
