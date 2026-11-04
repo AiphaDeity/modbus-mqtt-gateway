@@ -60,7 +60,7 @@ record_id = "{gateway_id}:{kind}:{seq_decimal_string}"
 ```
 
 - `kind`：`seq`=telemetry，`evt`=event。
-- `seq`：**uint64 全局单调递增计数器，telemetry/event 共用，从 1001 开始，跨重启连续**（存在 TF 卡记录区，不依赖 RTC）；JSON 里按**十进制字符串**传输（正反例已明确：数字类型会被平台 REJECT）。
+- `seq`：**uint64 全局单调递增计数器，telemetry/event 共用，从 1001 开始，跨重启连续**（M3 存在 W25Q128 双副本，高水位先于发号写入，掉电不回头）；JSON 里按**十进制字符串**传输（正反例已明确：数字类型会被平台 REJECT）。
   - ⚠️ 早期草案里写过"每 kind 各自计数、evt 从 1 起"（示例 `evt:0001`），**已废弃**——M3 实现的是全局单计数器，事件只是 kind 不同，序号接着 telemetry 往下走。
 - M3 侧内部存储**只用 (kind, seq) 定位**，不必存 record_id 字符串——补传时 M2 按记录内容自己拼字符串。
 - `boot_id`：每次启动生成（如 `boot_%u`，写 RTC/RAM，不持久化）；`uptime_ms` 辅助。
@@ -101,37 +101,36 @@ record_id = "{gateway_id}:{kind}:{seq_decimal_string}"
 
 > 🟡 如果 M3 倾向 FatFs 落盘（文件系统而不是裸扇区）：上述"记录壳"不变，只是存储介质从"裸扇区环形区"变成"一个追加写的日志文件 + 索引文件（kind,seq → 文件偏移）"。**接口字段不变，M2 无感。**
 
-### 3.3 TF 卡满策略（🟡 M2 提议）
+### 3.3 TF 卡满策略（✅ 已按 M3 实现确认）
 
 **循环覆盖最旧记录（环形）**，而不是停写丢新数据：
 
 - 理由：现场设备无人维护，断网可能数天；停写会丢**最新**数据（最关键）。环形策略保证"最近的数据永远在"。
-- 覆盖时 M3 维护 `dropped` 计数，M2 在 status 报文 `cache_stats.dropped` 上报（字段已在 `tests/mqtt/status_valid.json` 定稿）。
-- 🔴 待拍板：环形区容量（建议按 32 KB 扇区对齐，先给 **2000 条 ≈ 1 MB** 起，实测后调）。
-- M2 提供 `pending` 查询：M3 随时报告当前未补传条数，M2 填 `cache_stats.pending`。
+- 覆盖时 M3 维护 `dropped` 计数，M2 在 status 报文 `cache_stats.dropped` 上报。
+- ✅ 环形区容量：**48 段 × 4 MiB ≈ 192 MiB（约 36 万条）**，FatFs 段文件环形。
+- M2 调 `storage_m2_get_cache_stats()` 读 pending/dropped。
 
 ---
 
-## 4. M2 ↔ M3 队列协议（🟡 M2 提议，FreeRTOS 消息队列，内存紧张请给上限）
+## 4. M2 ↔ M3 队列协议（✅ M3 已实现，M2 按 storage_m2.h 接入）
 
-> 双方任务优先级都 = Normal(24)，用队列解耦；**所有消息指针只在本块生命周期内有效**，M3/M2 收到消息后内部拷贝，不持有对方指针跨队列。
+> 全部消息为**值传递**（osMessageQueuePut 内核拷贝），M2 用栈上变量填好即可，无指针生命周期负担。
+> 队列由 M3 创建，M2 通过 `storage_m2.h` 的 getter 拿句柄。
+> 队列深度：写 8 / 补传请求 4 / 应答 1 / 回执 8。
 
 ### 4.1 M2 → M3：写入一条待持久化记录（离线时）
 
 ```c
 typedef struct {
   uint8_t  kind;           /* 1=telemetry, 2=event */
-  uint64_t seq;
+  uint64_t seq;            /* M2 先调 storage_seq_alloc(&seq) 取号 */
   uint64_t captured_at_ms;
-  const uint8_t *payload;  /* JSON UTF-8；M3 拷贝进自己的缓冲，M2 不持有 */
   uint16_t payload_len;
+  uint8_t  payload[512];   /* JSON UTF-8 原文，值拷贝，无指针 */
 } storage_write_req_t;
-/* 队列深度建议 8；写失败（卡满/卡故障）由 M3 内部处理，
-   M2 从 pending 查询接口感知，不阻塞采集任务。 */
 ```
 
-> ⚠️ **指针所有权（M3 已实现，M2 必须遵守）**：写队列传的是 `storage_write_req_t *` 指针，M2 分配缓冲，**M3 出队后立即把 payload 拷进自己的槽位缓冲**，M2 的指针在 M3 出队后即可复用。M2 不要假设 M3 还持有这块内存。
-```
+写失败（队列满）由 M2 重试；pending/dropped 调 `storage_m2_get_cache_stats()` 读。
 
 ### 4.2 M2 → M3：补传拉取请求（联网后）
 
