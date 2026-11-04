@@ -1017,3 +1017,35 @@ DHCP assigned: 192.168.2.4 / 255.255.255.0 / gw 192.168.2.1
 | 2026-11-04 上午 | 定位并修复问题 1（初始化位置 + 临界区夹 `HAL_Delay`）、问题 2（`eth_dhcp` 栈溢出 → `Error_Handler`）；系统稳定运行、DHCP 成功 |
 | 2026-11-04 下午 | 用 UDP 广播探针定位问题 3（Tx 描述符不回收）→ **PING 打通，60/60、0% 丢包** |
 | 2026-11-04 晚 | 清理临时诊断代码（`ETH_DBG_FRAMES=0`、删除探针、清 `port.c` 插桩），重编重烧复验仍 0% 丢包；产出本文档 |
+
+---
+
+## 十四、代码评审修订记录（2026-11-04 下午，commit `bfc2f7a`）
+
+> 本章为合入主线前同事代码评审后的修订。与上文冲突处以本章为准。
+> 评审基线：`cf576d2`（已验证快照）；修订后复测：`ping 192.168.2.67` 60/60 0% 丢包，邻居表 `02-2d-00-26-e4-52`。
+
+### 14.1 合入前三项硬修复
+
+| # | 评审意见 | 处理 |
+|---|---|---|
+| 1 | `netif_set_*/dhcp_start/stop` 在链接/DHCP 线程直接调，与 tcpip 线程竞争 netif 结构 | 全部改走 `netifapi_*`（内部投递到 tcpip_thread 执行）。**隐藏坑**：整个 `src/api/netifapi.c` 被 `#if LWIP_NETIF_API` 包住，lwipopts 里必须显式 `#define LWIP_NETIF_API 1`，否则链接报 undefined reference。 |
+| 2 | TX 只在下次发包时回收，最后一批 pbuf 长期占用；软件短帧静态缓冲轮转与描述符释放不绑定，存在 DMA 复用隐患 | ①软件补帧代码**整体删除**——F4 MAC 硬件 CRCPAD 自动补 pad+FCS（`eth.c:73 CRCPadCtrl=ETH_CRC_PAD_INSERT`），实测删后 42 字节 ARP 短帧收发正常；②收包线程每 1s 醒一次时兜底 `HAL_ETH_ReleaseTxPacket()`，空闲时也能归还 pbuf，不新建线程。 |
+| 3 | `App_Entry` 网络初始化失败即 `Error_Handler()`，局部网络故障升级为整机停机 | 改为最多重试 5 次（间隔 2s），仍失败则打日志后**继续装配** Modbus/存储，网络保持未就绪待后续重试。 |
+
+### 14.2 文档与规范修正（按评审口径）
+
+- **MAC**：UID 派生 MAC 前 3 字节不属于任何注册 OUI，已加本地管理位（`mac[0]=(mac[0]&0xFC)\|0x02`），实测 `00:2D:..` → `02:2D:00:26:E4:52`；`MACA0HR` bit31 是 F4 手册的 AE 位（地址表项有效），不是通用"源地址有效位"。
+- **根因表述更正**（第七/八章以评审口径为准）：①"临界区问题"= `netif_add` 外层 `taskENTER_CRITICAL` 夹住了 `HAL_Delay`，BASEPRI=0x50 屏蔽 TIM6 → uwTick 冻结，**单次读 `HAL_GetTick()` 不会因此卡住**；②"栈溢出问题"是独立事件：`eth_dhcp` 栈爆 → `vApplicationStackOverflowHook` → `Error_Handler` → `PRIMASK=1` 全关中断。二者是两次独立故障，不要合并表述。
+- `osKernelInitialize()` 保持 CubeMX 原位置即可，只要在 `MX_FREERTOS_Init()` 之前、网络初始化在调度器启动之后。
+- 静态回落 IP 末字节由 UID 派生（原固定 `.30` 多板同网段会冲突）。
+- 验证结论口径："**指定固件（commit bfc2f7a）与测试网络环境下，60 次 ping 零丢包**"，不推广为长期结论；长期运行/无 DHCP/拔插恢复/TCP 收发为待补测试。
+- 删除"改 .h 必须 touch .c"这条无通用价值的规则；复现步骤以 commit + CMake preset + ELF 路径为准。
+- 看门狗后续应按关键任务进展决定喂狗，不搞独立线程无条件喂狗（会掩盖其他任务卡死）。
+- 工程当前为 512KiB 直启构建（0x08000000）；Bootloader 的 448KiB 偏移构建另记账，与本文档分开。
+
+### 14.3 仍待办
+
+- 接 MQTT 前实测 FreeRTOS 各任务栈高水位、最低剩余堆、LwIP pbuf 池耗尽次数，据此调 TCP_MSS/pbuf 池。
+- PHYAD0/nINTSEL 引脚事实、多板同网段 MAC 冲突测试，请 M4 核对硬件。
+- 发送中拔插网线的恢复收发实测（代码路径已通，未做拔线专项测试）。
