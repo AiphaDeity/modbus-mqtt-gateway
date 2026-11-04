@@ -7,7 +7,9 @@
             "generator": "Ninja",
             "binaryDir": "${sourceDir}/build/${presetName}",
             "toolchainFile": "${sourceDir}/firmware/app/cmake/gcc-arm-none-eabi.cmake",
-            "cacheVariables": {}
+            "cacheVariables": {
+                "GATEWAY_FIRMWARE": "app"
+            }
         },
         {
             "name": "Debug",
@@ -22,7 +24,25 @@
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Release"
             }
+        },
+        {
+            "name": "BootDebug",
+            "inherits": "Debug",
+            "toolchainFile":"${sourceDir}/firmware/bootloader/cmake/gcc-arm-none-eabi.cmake",
+            "cacheVariables": {
+                "GATEWAY_FIRMWARE": "bootloader"
+            }
+        },
+        {
+            "name": "AppDebug",
+            "inherits": "Debug",
+            "cacheVariables": {
+                "GATEWAY_FIRMWARE": "app",
+                "GATEWAY_APP_LINKER_SCRIPT": "${sourceDir}/firmware/app/STM32F407xx_APP.ld",
+                "GATEWAY_APP_VECTOR_OFFSET": "0x00010000"
+            }
         }
+        
     ],
     "buildPresets": [
         {
@@ -32,6 +52,14 @@
         {
             "name": "Release",
             "configurePreset": "Release"
+        },
+        {
+            "name": "BootDebug",
+            "configurePreset": "BootDebug"
+        },
+        {
+            "name": "AppDebug",
+            "configurePreset": "AppDebug"
         }
     ]
 }
