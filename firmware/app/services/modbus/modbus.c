@@ -93,12 +93,12 @@ void vModbusPollTask(void *arg)
                 osMutexRelease(mb_handle->xSlaveDataMutex);
             }
 
-            // ========== 读取/修改配置，拿 slave_cfg_mutex ==========
-            if (osMutexAcquire(slave_cfg_mutex, 10) == osOK)
+            // ========== 读取/修改配置，拿 xSlaveCfgMutex ==========
+            if (osMutexAcquire(mb_handle->xSlaveCfgMutex, 10) == osOK)
             {
                 // 读取/修改 slave_id、采集间隔、使能标志
                 // ...
-                osMutexRelease(slave_cfg_mutex);
+                osMutexRelease(mb_handle->xSlaveCfgMutex);
             }
 
             // 组应答帧，丢发送队列
