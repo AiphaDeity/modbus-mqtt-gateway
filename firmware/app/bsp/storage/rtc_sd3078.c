@@ -1,4 +1,4 @@
-/*
+/*这是 SD3078 时钟芯片的 BSP 驱动底层代码，主要定义了芯片的 I2C 地址、寄存器编号，还有 BCD 码转换宏，用来给上层提供读取和设置时间的接口。
  * rtc_sd3078.c — SD3078 外部 RTC 驱动实现
  *
  * 硬件：I2C1 (PB6=SCL, PB7=SDA)，7位地址 0x32
@@ -35,6 +35,9 @@ extern I2C_HandleTypeDef hi2c1;   // CubeMX 在 i2c.c 里定义的全局句柄
 /* ---------- 内部工具函数 ---------- */
 
 // 向单个寄存器写 1 字节
+//&hi2c1：IIC外设句柄；SD3078_I2C_ADDR_W：芯片的8位写地址
+//reg：芯片内部的寄存器地址；I2C_MEMADD_SIZE_8BIT：地址字节大小为8位
+//val：要写入的字节值
 static HAL_StatusTypeDef sd3078_write_reg(uint8_t reg, uint8_t val)
 {
     return HAL_I2C_Mem_Write(&hi2c1, SD3078_I2C_ADDR_WR,

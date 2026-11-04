@@ -21,6 +21,7 @@
 #include "cmsis_os.h"
 #include "dma.h"
 #include "eth.h"
+#include "fatfs.h"
 #include "i2c.h"
 #include "spi.h"
 #include "tim.h"
@@ -102,6 +103,7 @@ int main(void)
   MX_USART3_UART_Init();
   MX_TIM7_Init();
   MX_USART1_UART_Init();
+  MX_FATFS_Init();
   /* USER CODE BEGIN 2 */
   printf("Gateway boot\r\n");
   fflush(stdout);

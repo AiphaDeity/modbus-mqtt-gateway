@@ -11,6 +11,7 @@
 #include "storage_identity.h"
 #include "storage_timefloor.h"
 #include "storage_ctrllog.h"
+#include "storage_record.h"
 
 #include "cmsis_os2.h"
 
@@ -90,6 +91,9 @@ void Storage_Task(void *argument)
     uint32_t now = storage_get_unix_time();
     if (now != 0)
         (void)storage_timefloor_update(now);
+
+    /* 记录持久化（TF 卡）— 可能需要挂载/格式化，放在 Task 里不阻塞 Init */
+    (void)storage_record_init();
 
     /* 2. 上报就绪位 */
 
