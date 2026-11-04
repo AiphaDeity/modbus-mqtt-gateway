@@ -1,8 +1,11 @@
 /*
- * storage_seq.c — 序列号管理实现
+ * storage_seq.c — 序列号管理（双份冗余高水位）
  *
- * 持久化位置：Flash 0x040000 区（身份/元数据区）开头。
- * 布局：[magic(4B)][next_reserved(8B)][crc32(4B)]
+ * 持久化位置：身份区 0x042000 / 0x043000（各占一个 4KiB 扇区）。
+ * 每份布局：[magic(4B)][next_reserved(8B)][crc32(4B)]
+ *
+ * 写入时覆盖"较旧的那份"，保留较新的一份作掉电回退。
+ * 启动时取两份中有效且较大的高水位，避免序号复用。
  */
 
 #include "storage_seq.h"
@@ -10,9 +13,7 @@
 #include "spi_flash_w25q128.h"
 #include <string.h>
 
-#define SEQ_MAGIC        0x53455131U  /* "SEQ1" */
-#define SEQ_FLASH_ADDR   FLASH_PART_IDENTITY_BASE
-#define SEQ_STRUCT_SIZE  16U
+#define SEQ_MAGIC   0x53455131U  /* "SEQ1" */
 
 typedef struct __attribute__((packed)) {
     uint32_t magic;
@@ -20,10 +21,17 @@ typedef struct __attribute__((packed)) {
     uint32_t crc32;
 } seq_meta_t;
 
-static uint64_t s_next_reserved = 0;   /* 持久化的高水位 */
-static uint64_t s_current       = 0;   /* 当前可用序号起点 */
+_Static_assert(sizeof(seq_meta_t) == 16, "seq_meta_t must be 16 bytes");
+
+#define SEQ_CRC_LEN (sizeof(seq_meta_t) - sizeof(uint32_t))
+
+static const uint32_t s_copy_addr[2] = { FLASH_SEQ_A_ADDR, FLASH_SEQ_B_ADDR };
+
+static uint64_t s_next_reserved = 0;   /* 已持久化的高水位 */
+static uint64_t s_current       = 0;   /* 当前可分配序号 */
 static uint64_t s_window_end    = 0;   /* 当前窗口结束（不含） */
 static bool     s_inited        = false;
+static int      s_newer         = -1;  /* 高水位所在副本索引 */
 
 static uint32_t crc32_calc(const uint8_t *data, uint32_t len)
 {
@@ -37,52 +45,65 @@ static uint32_t crc32_calc(const uint8_t *data, uint32_t len)
     return ~crc;
 }
 
-/* 从 Flash 读取序列号元数据 */
-static HAL_StatusTypeDef seq_read_meta(seq_meta_t *meta)
+static bool copy_read(int idx, seq_meta_t *meta)
 {
-    return spi_flash_w25q128_read(SEQ_FLASH_ADDR, (uint8_t *)meta, sizeof(seq_meta_t));
+    if (spi_flash_w25q128_read(s_copy_addr[idx], (uint8_t *)meta,
+                               sizeof(*meta)) != HAL_OK) {
+        return false;
+    }
+    if (meta->magic != SEQ_MAGIC) return false;
+    if (meta->crc32 != crc32_calc((const uint8_t *)meta, SEQ_CRC_LEN)) return false;
+    return true;
 }
 
-/* 写入序列号元数据到 Flash（先擦后写） */
-static HAL_StatusTypeDef seq_write_meta(const seq_meta_t *meta)
+static HAL_StatusTypeDef copy_write(int idx, uint64_t next_reserved)
 {
-    HAL_StatusTypeDef st = spi_flash_w25q128_sector_erase(SEQ_FLASH_ADDR);
+    seq_meta_t meta;
+    meta.magic         = SEQ_MAGIC;
+    meta.next_reserved = next_reserved;
+    meta.crc32         = crc32_calc((const uint8_t *)&meta, SEQ_CRC_LEN);
+
+    HAL_StatusTypeDef st = spi_flash_w25q128_sector_erase(s_copy_addr[idx]);
     if (st != HAL_OK) return st;
-    return spi_flash_w25q128_write(SEQ_FLASH_ADDR, (const uint8_t *)meta,
-                                    sizeof(seq_meta_t));
+
+    return spi_flash_w25q128_write(s_copy_addr[idx], (const uint8_t *)&meta,
+                                    sizeof(meta));
 }
 
 HAL_StatusTypeDef storage_seq_init(void)
 {
-    seq_meta_t meta;
-    HAL_StatusTypeDef st = seq_read_meta(&meta);
+    seq_meta_t meta_a, meta_b;
+    bool ok_a = copy_read(0, &meta_a);
+    bool ok_b = copy_read(1, &meta_b);
 
-    if (st == HAL_OK && meta.magic == SEQ_MAGIC) {
-        uint32_t calc = crc32_calc((uint8_t *)&meta,
-                                    sizeof(meta) - sizeof(uint32_t));
-        if (calc == meta.crc32) {
-            s_next_reserved = meta.next_reserved;
-            s_current       = meta.next_reserved;
-            s_window_end    = meta.next_reserved;
-            s_inited        = true;
-            return HAL_OK;
-        }
+    s_newer = -1;
+    if (ok_a && ok_b) {
+        s_newer = (meta_a.next_reserved >= meta_b.next_reserved) ? 0 : 1;
+    } else if (ok_a) {
+        s_newer = 0;
+    } else if (ok_b) {
+        s_newer = 1;
     }
 
-    /* 无有效元数据，从 0 开始 */
-    s_next_reserved = 0;
-    s_current       = 0;
-    s_window_end    = 0;
-    s_inited        = true;
+    if (s_newer >= 0) {
+        const seq_meta_t *meta = (s_newer == 0) ? &meta_a : &meta_b;
+        s_next_reserved = meta->next_reserved;
+    } else {
+        s_next_reserved = 0;
+    }
 
-    /* 持久化初始高水位 */
-    seq_meta_t init_meta = {
-        .magic = SEQ_MAGIC,
-        .next_reserved = 0,
-    };
-    init_meta.crc32 = crc32_calc((uint8_t *)&init_meta,
-                                  sizeof(init_meta) - sizeof(uint32_t));
-    return seq_write_meta(&init_meta);
+    s_current    = s_next_reserved;
+    s_window_end = s_next_reserved;
+    s_inited     = true;
+
+    /* 空设备：把初始高水位落下，避免下一次写入时两份都为空 */
+    if (s_newer < 0) {
+        HAL_StatusTypeDef st = copy_write(0, 0);
+        if (st != HAL_OK) return st;
+        s_newer = 0;
+    }
+
+    return HAL_OK;
 }
 
 HAL_StatusTypeDef storage_seq_alloc(uint64_t *seq_out)
@@ -93,24 +114,26 @@ HAL_StatusTypeDef storage_seq_alloc(uint64_t *seq_out)
     if (s_current >= s_window_end) {
         uint64_t new_reserved = s_next_reserved + SEQ_RESERVE_BATCH;
 
-        /* 接近最大值，停止生成 */
-        if (new_reserved > UINT64_MAX - SEQ_RESERVE_BATCH) {
+        /* 接近最大值则停止生成，不回绕 */
+        if (new_reserved < s_next_reserved ||
+            new_reserved > UINT64_MAX - SEQ_RESERVE_BATCH) {
             return HAL_ERROR;
         }
 
-        /* 先持久化新高水位 */
-        seq_meta_t meta = {
-            .magic = SEQ_MAGIC,
-            .next_reserved = new_reserved,
-        };
-        meta.crc32 = crc32_calc((uint8_t *)&meta,
-                                 sizeof(meta) - sizeof(uint32_t));
-        HAL_StatusTypeDef st = seq_write_meta(&meta);
+        /* 先持久化新高水位：覆盖较旧副本 */
+        int target = (s_newer < 0) ? 0 : (1 - s_newer);
+        HAL_StatusTypeDef st = copy_write(target, new_reserved);
         if (st != HAL_OK) return st;
 
+        /* 回读校验，失败则不发放新窗口内的号 */
+        seq_meta_t verify;
+        if (!copy_read(target, &verify) || verify.next_reserved != new_reserved) {
+            return HAL_ERROR;
+        }
+
+        s_newer         = target;
         s_next_reserved = new_reserved;
         s_window_end    = new_reserved;
-        /* s_current 不变，从上次窗口结束处继续 */
     }
 
     *seq_out = s_current++;

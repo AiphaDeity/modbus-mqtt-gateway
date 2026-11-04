@@ -22,10 +22,24 @@
  * JSON 解析与字段校验由配置维护模块负责。
  */
 
-// 启动时加载当前有效配置的 JSON 数据
-// json_buf: 调用方提供的缓冲区，buf_size 应 >= 64KiB
-// actual_len: 返回实际 JSON 长度
-HAL_StatusTypeDef storage_config_load(uint8_t *json_buf, uint32_t buf_size, uint32_t *actual_len);
+/*
+ * 配置读取句柄（流式读取，不占用大块 RAM）。
+ * M3 只按块把 JSON 字节流交给调用方，解析由配置维护模块负责。
+ */
+typedef struct {
+    uint32_t slot_idx;    /* 当前运行槽索引（内部使用） */
+    uint32_t generation;  /* 配置代次 */
+    uint32_t total_len;   /* JSON 总字节数 */
+    uint32_t crc32;       /* JSON 的 CRC32，供调用方整体校验 */
+} storage_config_reader_t;
+
+// 打开当前有效配置：填充句柄信息（不复制数据）
+HAL_StatusTypeDef storage_config_open(storage_config_reader_t *rd);
+
+// 从当前配置中按块读取（offset 从 0 开始，len 由调用方决定）
+HAL_StatusTypeDef storage_config_read_chunk(const storage_config_reader_t *rd,
+                                             uint32_t offset, uint8_t *buf,
+                                             uint32_t len);
 
 // 开始配置写入事务：擦除候选槽，返回 session_id
 HAL_StatusTypeDef storage_config_begin(uint32_t total_len, uint32_t *session_id);

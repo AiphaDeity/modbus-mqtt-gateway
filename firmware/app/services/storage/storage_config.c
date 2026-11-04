@@ -126,32 +126,36 @@ static void config_select_running(void)
 
 /* ---------- 公共 API ---------- */
 
-HAL_StatusTypeDef storage_config_load(uint8_t *json_buf, uint32_t buf_size,
-                                       uint32_t *actual_len)
+HAL_StatusTypeDef storage_config_open(storage_config_reader_t *rd)
 {
-    if (json_buf == NULL || actual_len == NULL) return HAL_ERROR;
+    if (rd == NULL) return HAL_ERROR;
 
     if (s_r_slot < 0) {
         config_select_running();
     }
-
-    if (s_r_slot < 0) {
-        *actual_len = 0;
-        return HAL_OK;  /* 无有效配置，返回空 */
-    }
+    if (s_r_slot < 0) return HAL_ERROR;   /* 无有效配置 */
 
     config_slot_header_t hdr;
     if (slot_read_header(s_r_slot, &hdr) != HAL_OK) return HAL_ERROR;
 
-    if (hdr.json_length > buf_size) return HAL_ERROR;
-
-    HAL_StatusTypeDef st = spi_flash_w25q128_read(
-        slot_base[s_r_slot] + JSON_DATA_OFFSET,
-        json_buf, hdr.json_length);
-    if (st != HAL_OK) return st;
-
-    *actual_len = hdr.json_length;
+    rd->slot_idx   = (uint32_t)s_r_slot;
+    rd->generation = hdr.generation;
+    rd->total_len  = hdr.json_length;
+    rd->crc32      = hdr.json_crc32;
     return HAL_OK;
+}
+
+HAL_StatusTypeDef storage_config_read_chunk(const storage_config_reader_t *rd,
+                                             uint32_t offset, uint8_t *buf,
+                                             uint32_t len)
+{
+    if (rd == NULL || buf == NULL) return HAL_ERROR;
+    if (rd->slot_idx > 2) return HAL_ERROR;
+    if (offset > rd->total_len) return HAL_ERROR;
+    if (len > rd->total_len - offset) return HAL_ERROR;
+
+    return spi_flash_w25q128_read(
+        slot_base[rd->slot_idx] + JSON_DATA_OFFSET + offset, buf, len);
 }
 
 HAL_StatusTypeDef storage_config_begin(uint32_t total_len, uint32_t *session_id)

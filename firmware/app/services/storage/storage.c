@@ -8,14 +8,14 @@
 #include "storage_config.h"
 #include "storage_time.h"
 #include "storage_seq.h"
+#include "storage_identity.h"
 
 #include "cmsis_os2.h"
 
-/* 配置 JSON 缓冲区（64KiB，最大配置大小） */
-static uint8_t s_config_json[64 * 1024];
-static uint32_t s_config_json_len = 0;
-
 osMutexId_t g_m3_i2c1_mutex = NULL;
+
+/* 底层介质初始化结果，供 Task 上报就绪位使用 */
+static bool s_flash_ok = false;
 
 AppModuleInitResult Storage_Init(void)
 {
@@ -43,13 +43,16 @@ AppModuleInitResult Storage_Init(void)
     (void)rtc_sd3078_init();
 
     // SPI Flash（W25Q128）— 配置存储依赖它，失败也不阻塞
-    (void)spi_flash_w25q128_init();
+    s_flash_ok = (spi_flash_w25q128_init() == HAL_OK);
 
     // TF 卡 — 可能没插卡，失败正常
     (void)sdcard_tf_init();
 
-    // 序列号管理 — 从 Flash 恢复高水位
+    // 序列号管理 — 从 Flash 恢复高水位（双份冗余取最大）
     (void)storage_seq_init();
+
+    // 设备身份 — 读取双份 gateway_id，取有效且最新的一份
+    (void)storage_identity_init();
 
     /*
      * 注意：不在 Init 里加载配置。
@@ -64,14 +67,19 @@ void Storage_Task(void *argument)
 {
     (void)argument;
 
-    /* 1. 加载配置（从 W25Q128 三槽中选最新有效 JSON） */
-    (void)storage_config_load(s_config_json, sizeof(s_config_json),
-                               &s_config_json_len);
+    /*
+     * 1. 确认配置区状态。
+     * M3 不再把整份 JSON 读进 RAM（最大 64KiB 会吃掉一半 RAM），
+     * 这里只打开句柄以触发运行槽选择；真正的字节流由配置维护模块
+     * 按块调用 storage_config_read_chunk() 读取。
+     */
+    storage_config_reader_t cfg_rd;
+    (void)storage_config_open(&cfg_rd);
 
     /* 2. 上报就绪位 */
 
-    // 配置存储服务就绪（SPI Flash 初始化成功 + 配置已加载）
-    App_SetResourceReady(APP_RESOURCE_STORAGE, true);
+    // 配置存储服务就绪：判据是 SPI Flash 可读写，空设备也算就绪
+    App_SetResourceReady(APP_RESOURCE_STORAGE, s_flash_ok);
 
     // 时间服务就绪（RTC 在走就行，时间准不准由上层校时）
     App_SetResourceReady(APP_RESOURCE_TIME, storage_time_is_valid());
