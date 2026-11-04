@@ -89,7 +89,8 @@ HAL_StatusTypeDef storage_seq_init(void)
         const seq_meta_t *meta = (s_newer == 0) ? &meta_a : &meta_b;
         s_next_reserved = meta->next_reserved;
     } else {
-        s_next_reserved = 0;
+        /* 空设备：高水位从首发序号起（M2 约定全局 seq 从 1001 开始） */
+        s_next_reserved = SEQ_FIRST_VALUE;
     }
 
     s_current    = s_next_reserved;
@@ -98,7 +99,7 @@ HAL_StatusTypeDef storage_seq_init(void)
 
     /* 空设备：把初始高水位落下，避免下一次写入时两份都为空 */
     if (s_newer < 0) {
-        HAL_StatusTypeDef st = copy_write(0, 0);
+        HAL_StatusTypeDef st = copy_write(0, SEQ_FIRST_VALUE);
         if (st != HAL_OK) return st;
         s_newer = 0;
     }

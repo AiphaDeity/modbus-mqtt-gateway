@@ -19,6 +19,9 @@
 /* 每次预留的序号数量 */
 #define SEQ_RESERVE_BATCH   1024U
 
+/* 空设备首发序号（M2 约定：全局单计数器从 1001 起，跨重启连续） */
+#define SEQ_FIRST_VALUE     1001U
+
 /* 初始化序列号服务：从 Flash 读取 next_reserved */
 HAL_StatusTypeDef storage_seq_init(void);
 

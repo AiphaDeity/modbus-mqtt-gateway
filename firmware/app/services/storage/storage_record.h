@@ -44,6 +44,10 @@
 #define RECORD_KIND_TELEMETRY    1U
 #define RECORD_KIND_EVENT        2U
 
+/* 初始 ack 水位 = 首发 seq - 1。M2 约定全局 seq 从 1001 起（见 SEQ_FIRST_VALUE），
+ * 用 1000 作基准，”无记录“时 pending/last_seq 都等于它，pending 才不会虚高。 */
+#define RECORD_SEQ_INITIAL_WM    1000ULL
+
 /* 单条取出的记录（补传应答用） */
 typedef struct {
     uint8_t  kind;
@@ -92,7 +96,7 @@ void storage_record_stats(uint32_t *pending, uint32_t *dropped);
 /* 按写入顺序（旧→新）遍历所有有效记录（调试/测试用） */
 HAL_StatusTypeDef storage_record_foreach(record_visit_fn fn, void *user);
 
-/* 最近一条已提交记录的序列号（无记录时返回 0） */
+/* 最近一条已提交记录的序列号（无记录时返回 RECORD_SEQ_INITIAL_WM，即 1000） */
 uint64_t storage_record_last_seq(void);
 
 /* 周期维护：环状态节流落盘（Storage_Task 循环调用） */

@@ -338,9 +338,9 @@ HAL_StatusTypeDef storage_record_init(void)
     s_ready   = false;
     s_cur_seg = -1;
     s_file_open = false;
-    s_last_seq  = 0;
+    s_last_seq  = RECORD_SEQ_INITIAL_WM;
     s_next_slot = 0;
-    s_ack_wm    = 0;
+    s_ack_wm    = RECORD_SEQ_INITIAL_WM;
     s_dropped   = 0;
     s_gen       = 0;
     s_state_dirty = false;
@@ -379,6 +379,10 @@ HAL_StatusTypeDef storage_record_init(void)
         bool seg_exists = (f_stat(path, &fi) == FR_OK && fi.fsize > 0);
 
         if (seg_exists && open_segment(cur_seg, false) == FR_OK) {
+            /* 兼容旧环状态（曾从 0 起算）：把水位抬到基准值 */
+            if (last_seq < RECORD_SEQ_INITIAL_WM) last_seq = RECORD_SEQ_INITIAL_WM;
+            if (ack_wm  < RECORD_SEQ_INITIAL_WM) ack_wm  = RECORD_SEQ_INITIAL_WM;
+
             s_cur_seg   = cur_seg;
             s_next_slot = next_slot;
             s_ack_wm    = ack_wm;
