@@ -39,7 +39,7 @@
 /* 环状态落盘节流 */
 #define RSTATE_PERSIST_APPENDS   16U
 #define RSTATE_PERSIST_MS        30000U
-#define RSTATE_MAGIC             0x52535431U  /* "RST1" */
+#define RSTATE_MAGIC             0x52535432U  /* "RST2" */
 
 /* ---------- 内部状态 ---------- */
 
@@ -50,6 +50,18 @@ static uint64_t s_last_seq  = 0;   /* 最近一次 append 的 seq（含失败尝
 static uint64_t s_ack_wm    = 0;   /* ack 水位：seq ≤ wm 已上传，可复用 */
 static uint32_t s_dropped   = 0;   /* 未 ack 即被覆盖/写失败的条数 */
 static uint32_t s_gen       = 0;   /* 环状态代数（双副本取较大者） */
+
+/* 补传读游标：下次 fetch 从这里开始，避免每次从最旧段重扫。
+ * 语义是「第一条未 ack 记录的位置」——只在 ack 推进到该记录时才前移，
+ * 保证 fetch 了但没 ack 的记录下次还能被重新取到。 */
+static int      s_fetch_seg  = 0;
+static uint32_t s_fetch_slot = 0;
+
+/* 最近一次 fetch 返回的最后一条记录位置（供 ack 推进游标用，仅 RAM） */
+static bool     s_last_pos_valid = false;
+static int      s_last_pos_seg   = 0;
+static uint32_t s_last_pos_slot  = 0;
+static uint64_t s_last_pos_seq   = 0;
 
 static FIL      s_cur_file;
 static bool     s_file_open = false;
@@ -229,47 +241,72 @@ static uint32_t count_unacked_in_segment(int seg)
 
 /* ---------- 环状态持久化（W25Q128 双副本） ---------- */
 /*
- * 布局（40B，小端）：
- *   0  magic(4) = "RST1"
- *   4  gen(4)       代数，双副本取较大者；写入时写 gen 较旧的那份
- *   8  cur_seg(4)
- *   12 next_slot(4)
- *   16 ack_wm(8)
- *   24 last_seq(8)
- *   32 dropped(4)
- *   36 crc32(4)     覆盖 [0,36)
+ * 布局（48B，小端）：
+ *   0  magic(4) = "RST2"
+ *   4  gen(4)           代数，双副本取较大者；写入时写 gen 较旧的那份
+ *   8  cur_seg(4)       当前写入段
+ *   12 next_slot(4)     当前段下一个待写槽
+ *   16 ack_wm(8)        补传水位：seq ≤ 此值已上传
+ *   24 last_seq(8)      已写入的最大 seq
+ *   32 dropped(4)       未 ack 即被覆盖/写失败的条数
+ *   36 fetch_seg(4)     补传读游标：段号（避免每次从最旧段重扫）
+ *   40 fetch_slot(4)    补传读游标：槽号
+ *   44 crc32(4)         覆盖 [0,44)
+ *
+ * magic 用 RST2（旧版 RST1 的 40B 布局不兼容，读到即视为无环状态，
+ * 退化为全盘扫描一次，不影响正确性）。
  */
 
-static void state_pack(uint8_t *buf)
+typedef struct {
+    uint32_t gen;
+    int      cur_seg;
+    uint32_t next_slot;
+    uint64_t ack_wm;
+    uint64_t last_seq;
+    uint32_t dropped;
+    int      fetch_seg;
+    uint32_t fetch_slot;
+} ring_state_t;
+
+#define RSTATE_SIZE  48U
+#define RSTATE_CRC_LEN 44U
+
+static void state_pack(uint8_t *buf, const ring_state_t *st)
 {
-    memset(buf, 0, 40);
+    memset(buf, 0, RSTATE_SIZE);
     put_u32(buf + 0,  RSTATE_MAGIC);
-    put_u32(buf + 4,  s_gen);
-    put_u32(buf + 8,  (uint32_t)s_cur_seg);
-    put_u32(buf + 12, s_next_slot);
-    put_u64(buf + 16, s_ack_wm);
-    put_u64(buf + 24, s_last_seq);
-    put_u32(buf + 32, s_dropped);
-    put_u32(buf + 36, crc32_calc(buf, 36));
+    put_u32(buf + 4,  st->gen);
+    put_u32(buf + 8,  (uint32_t)st->cur_seg);
+    put_u32(buf + 12, st->next_slot);
+    put_u64(buf + 16, st->ack_wm);
+    put_u64(buf + 24, st->last_seq);
+    put_u32(buf + 32, st->dropped);
+    put_u32(buf + 36, (uint32_t)st->fetch_seg);
+    put_u32(buf + 40, st->fetch_slot);
+    put_u32(buf + 44, crc32_calc(buf, RSTATE_CRC_LEN));
 }
 
-static bool state_unpack(const uint8_t *buf, uint32_t *gen, int *cur_seg,
-                         uint32_t *next_slot, uint64_t *ack_wm,
-                         uint64_t *last_seq, uint32_t *dropped)
+static bool state_unpack(const uint8_t *buf, ring_state_t *st)
 {
     if (get_u32(buf + 0) != RSTATE_MAGIC) return false;
-    if (get_u32(buf + 36) != crc32_calc(buf, 36)) return false;
+    if (get_u32(buf + 44) != crc32_calc(buf, RSTATE_CRC_LEN)) return false;
 
     uint32_t cs = get_u32(buf + 8);
+    uint32_t fs = get_u32(buf + 36);
     if (cs >= RECORD_SEGMENT_COUNT) return false;
+    if (fs >= RECORD_SEGMENT_COUNT) return false;
 
-    *gen       = get_u32(buf + 4);
-    *cur_seg   = (int)cs;
-    *next_slot = get_u32(buf + 12);
-    *ack_wm    = get_u64(buf + 16);
-    *last_seq  = get_u64(buf + 24);
-    *dropped   = get_u32(buf + 32);
-    if (*next_slot > RECORD_SEGMENT_SLOTS) return false;
+    st->gen        = get_u32(buf + 4);
+    st->cur_seg    = (int)cs;
+    st->next_slot  = get_u32(buf + 12);
+    st->ack_wm     = get_u64(buf + 16);
+    st->last_seq   = get_u64(buf + 24);
+    st->dropped    = get_u32(buf + 32);
+    st->fetch_seg  = (int)fs;
+    st->fetch_slot = get_u32(buf + 40);
+
+    if (st->next_slot > RECORD_SEGMENT_SLOTS) return false;
+    if (st->fetch_slot > RECORD_SEGMENT_SLOTS) return false;
     return true;
 }
 
@@ -278,9 +315,19 @@ static void state_store_now(void)
 {
     static int s_newer = 0;   /* 较新副本索引，掉电丢失后两份等价，任选 */
 
-    uint8_t buf[40];
-    s_gen++;
-    state_pack(buf);
+    ring_state_t st = {
+        .gen        = s_gen + 1U,
+        .cur_seg    = s_cur_seg,
+        .next_slot  = s_next_slot,
+        .ack_wm     = s_ack_wm,
+        .last_seq   = s_last_seq,
+        .dropped    = s_dropped,
+        .fetch_seg  = s_fetch_seg,
+        .fetch_slot = s_fetch_slot,
+    };
+
+    uint8_t buf[RSTATE_SIZE];
+    state_pack(buf, &st);
 
     int target = (s_newer == 0) ? 1 : 0;
     const uint32_t addr[2] = { FLASH_RING_STATE_A_ADDR, FLASH_RING_STATE_B_ADDR };
@@ -288,6 +335,7 @@ static void state_store_now(void)
     if (spi_flash_w25q128_sector_erase(addr[target]) == HAL_OK) {
         if (spi_flash_w25q128_write(addr[target], buf, sizeof(buf)) == HAL_OK) {
             s_newer = target;
+            s_gen   = st.gen;
         }
     }
 
@@ -297,35 +345,26 @@ static void state_store_now(void)
 }
 
 /* 上电读环状态：双副本取 gen 较大的有效份 */
-static bool state_load(uint32_t *gen, int *cur_seg, uint32_t *next_slot,
-                       uint64_t *ack_wm, uint64_t *last_seq, uint32_t *dropped)
+static bool state_load(ring_state_t *out)
 {
     static const uint32_t addr[2] = { FLASH_RING_STATE_A_ADDR, FLASH_RING_STATE_B_ADDR };
-    uint8_t buf[40];
-    bool     ok[2]  = { false, false };
-    uint32_t g[2]   = { 0, 0 };
-    int      cs[2];
-    uint32_t ns[2], dp[2];
-    uint64_t aw[2], ls[2];
+    uint8_t buf[RSTATE_SIZE];
+    ring_state_t st[2];
+    bool ok[2] = { false, false };
 
     for (int i = 0; i < 2; i++) {
         if (spi_flash_w25q128_read(addr[i], buf, sizeof(buf)) != HAL_OK) continue;
-        if (!state_unpack(buf, &g[i], &cs[i], &ns[i], &aw[i], &ls[i], &dp[i])) continue;
+        if (!state_unpack(buf, &st[i])) continue;
         ok[i] = true;
     }
 
     int sel = -1;
-    if (ok[0] && ok[1])      sel = (g[1] > g[0]) ? 1 : 0;
+    if (ok[0] && ok[1])      sel = (st[1].gen > st[0].gen) ? 1 : 0;
     else if (ok[0])          sel = 0;
     else if (ok[1])          sel = 1;
     if (sel < 0) return false;
 
-    *gen       = g[sel];
-    *cur_seg   = cs[sel];
-    *next_slot = ns[sel];
-    *ack_wm    = aw[sel];
-    *last_seq  = ls[sel];
-    *dropped   = dp[sel];
+    *out = st[sel];
     return true;
 }
 
@@ -343,6 +382,9 @@ HAL_StatusTypeDef storage_record_init(void)
     s_ack_wm    = RECORD_SEQ_INITIAL_WM;
     s_dropped   = 0;
     s_gen       = 0;
+    s_fetch_seg  = 0;
+    s_fetch_slot = 0;
+    s_last_pos_valid = false;
     s_state_dirty = false;
     s_appends_since = 0;
     s_last_persist_tick = HAL_GetTick();
@@ -368,27 +410,27 @@ HAL_StatusTypeDef storage_record_init(void)
     if (fr != FR_OK && fr != FR_EXIST) return HAL_ERROR;
 
     /* —— 快路径：用 W25Q128 环状态恢复 —— */
-    uint32_t gen, next_slot, dropped;
-    int cur_seg;
-    uint64_t ack_wm, last_seq;
+    ring_state_t st;
 
-    if (state_load(&gen, &cur_seg, &next_slot, &ack_wm, &last_seq, &dropped)) {
+    if (state_load(&st)) {
         char path[64];
-        seg_path(cur_seg, path, sizeof(path));
+        seg_path(st.cur_seg, path, sizeof(path));
         FILINFO fi;
         bool seg_exists = (f_stat(path, &fi) == FR_OK && fi.fsize > 0);
 
-        if (seg_exists && open_segment(cur_seg, false) == FR_OK) {
+        if (seg_exists && open_segment(st.cur_seg, false) == FR_OK) {
             /* 兼容旧环状态（曾从 0 起算）：把水位抬到基准值 */
-            if (last_seq < RECORD_SEQ_INITIAL_WM) last_seq = RECORD_SEQ_INITIAL_WM;
-            if (ack_wm  < RECORD_SEQ_INITIAL_WM) ack_wm  = RECORD_SEQ_INITIAL_WM;
+            if (st.last_seq < RECORD_SEQ_INITIAL_WM) st.last_seq = RECORD_SEQ_INITIAL_WM;
+            if (st.ack_wm  < RECORD_SEQ_INITIAL_WM) st.ack_wm  = RECORD_SEQ_INITIAL_WM;
 
-            s_cur_seg   = cur_seg;
-            s_next_slot = next_slot;
-            s_ack_wm    = ack_wm;
-            s_dropped   = dropped;
-            s_gen       = gen;
-            s_last_seq  = last_seq;
+            s_cur_seg   = st.cur_seg;
+            s_next_slot = st.next_slot;
+            s_ack_wm    = st.ack_wm;
+            s_dropped   = st.dropped;
+            s_gen       = st.gen;
+            s_last_seq  = st.last_seq;
+            s_fetch_seg  = st.fetch_seg;
+            s_fetch_slot = st.fetch_slot;
 
             uint32_t ns = 0;
             if (scan_seg_forward(&s_cur_file, s_next_slot, &ns, &s_last_seq) == FR_OK) {
@@ -427,11 +469,16 @@ HAL_StatusTypeDef storage_record_init(void)
     if (found_cur < 0) {
         if (open_segment(0, true) != FR_OK) return HAL_ERROR;
         s_next_slot = 0;
+        s_fetch_seg  = 0;
+        s_fetch_slot = 0;
     } else {
         if (open_segment(found_cur, false) != FR_OK) return HAL_ERROR;
         s_next_slot = found_last_slot + 1;
         if (s_next_slot > RECORD_SEGMENT_SLOTS) s_next_slot = RECORD_SEGMENT_SLOTS;
         s_last_seq = max_seq_all;
+        /* 环状态已丢（ack 水位回到基准）→ 全部记录视为未传，从最旧段开始扫 */
+        s_fetch_seg  = (int)((found_cur + 1U) % RECORD_SEGMENT_COUNT);
+        s_fetch_slot = 0;
     }
 
     s_ready = true;
@@ -461,6 +508,12 @@ HAL_StatusTypeDef storage_record_append(uint8_t kind, uint64_t seq,
         int next = (s_cur_seg + 1) % RECORD_SEGMENT_COUNT;
         s_dropped += count_unacked_in_segment(next);
         (void)delete_segment(next);
+        /* 该段内容被覆盖：若读游标停在这里，归零从头扫 */
+        if (s_fetch_seg == next) {
+            s_fetch_slot     = 0;
+            s_last_pos_valid = false;
+            s_state_dirty    = true;
+        }
         if (open_segment(next, true) != FR_OK) {
             s_state_dirty = true;
             return HAL_ERROR;
@@ -529,9 +582,24 @@ HAL_StatusTypeDef storage_record_append(uint8_t kind, uint64_t seq,
 void storage_record_ack_upto(uint64_t ack_upto_seq)
 {
     if (!s_ready) return;
-    if (ack_upto_seq > s_ack_wm) {
-        s_ack_wm = ack_upto_seq;
-        s_state_dirty = true;   /* maintenance 节流落盘 */
+    if (ack_upto_seq <= s_ack_wm) return;
+
+    s_ack_wm = ack_upto_seq;
+    s_state_dirty = true;   /* maintenance 节流落盘 */
+
+    /* 这批记录已确认上传 → 读游标可以安全越过它们，
+     * 下次 fetch 不必从这批开头重扫 */
+    if (s_last_pos_valid && s_last_pos_seq <= ack_upto_seq) {
+        if (s_fetch_seg != s_last_pos_seg || s_fetch_slot != s_last_pos_slot) {
+            s_fetch_seg  = s_last_pos_seg;
+            s_fetch_slot = s_last_pos_slot;
+            if (s_fetch_seg >= (int)RECORD_SEGMENT_COUNT) {
+                s_fetch_seg  = 0;
+                s_fetch_slot = 0;
+            }
+            s_state_dirty = true;
+        }
+        s_last_pos_valid = false;
     }
 }
 
@@ -542,41 +610,85 @@ HAL_StatusTypeDef storage_record_fetch(uint16_t max_count,
     if (out == NULL || count == NULL || max_count == 0) return HAL_ERROR;
 
     *count = 0;
+    s_last_pos_valid = false;
 
-    /* 环序（旧→新）：cur+1, cur+2, ..., cur */
-    for (uint32_t k = 0; k < RECORD_SEGMENT_COUNT && *count < max_count; k++) {
-        int seg = (s_cur_seg < 0)
-                  ? (int)k
-                  : (int)((s_cur_seg + 1U + k) % RECORD_SEGMENT_COUNT);
+    /* 从读游标开始（旧→新环序），而不是每次从最旧段重扫 */
+    int seg = s_fetch_seg;
+    uint32_t slot = s_fetch_slot;
+    if (seg < 0 || seg >= (int)RECORD_SEGMENT_COUNT) { seg = 0; slot = 0; }
+    if (slot > RECORD_SEGMENT_SLOTS) slot = 0;
 
+    uint32_t visited = 0;
+    bool done = false;
+
+    while (visited < RECORD_SEGMENT_COUNT && !done) {
         FILINFO fi;
         char path[64];
         seg_path(seg, path, sizeof(path));
-        if (f_stat(path, &fi) != FR_OK || fi.fsize == 0) continue;
+
+        if (f_stat(path, &fi) != FR_OK || fi.fsize == 0) {
+            seg = (int)((seg + 1U) % RECORD_SEGMENT_COUNT);
+            slot = 0;
+            visited++;
+            continue;
+        }
 
         FIL f;
-        if (f_open(&f, path, FA_READ) != FR_OK) continue;
+        if (f_open(&f, path, FA_READ) != FR_OK) {
+            seg = (int)((seg + 1U) % RECORD_SEGMENT_COUNT);
+            slot = 0;
+            visited++;
+            continue;
+        }
+
+        /* 游标在段内 → 直接 seek 跳过已处理部分，不搬数据 */
+        if (slot > 0) {
+            if (f_lseek(&f, (FSIZE_t)slot * RECORD_SLOT_SIZE) != FR_OK) {
+                f_close(&f);
+                break;
+            }
+        }
 
         uint8_t buf[RECORD_SLOT_SIZE];
         UINT br;
-        for (uint32_t i = 0; i < RECORD_SEGMENT_SLOTS && *count < max_count; i++) {
-            if (f_read(&f, buf, RECORD_SLOT_SIZE, &br) != FR_OK || br == 0) break;
-            if (br < RECORD_SLOT_SIZE) break;
+        while (slot < RECORD_SEGMENT_SLOTS) {
+            if (f_read(&f, buf, RECORD_SLOT_SIZE, &br) != FR_OK ||
+                br < RECORD_SLOT_SIZE) {
+                done = true;      /* 到文件尾 */
+                break;
+            }
+            slot++;
+
             record_view_t rec;
             if (!parse_slot(buf, &rec)) continue;
             if (rec.seq <= s_ack_wm) continue;   /* 已 ack，跳过 */
 
             record_out_t *dst = &out[*count];
-            dst->kind          = (uint8_t)rec.kind;
-            dst->seq           = rec.seq;
+            dst->kind           = (uint8_t)rec.kind;
+            dst->seq            = rec.seq;
             dst->captured_at_ms = rec.captured_at_ms;
-            dst->payload_len   = rec.payload_len;
+            dst->payload_len    = rec.payload_len;
             memcpy(dst->payload, rec.payload, rec.payload_len);
             (*count)++;
+
+            /* 记住这条的位置，等 ack 后再把游标推过来 */
+            s_last_pos_valid = true;
+            s_last_pos_seg   = seg;
+            s_last_pos_slot  = slot;
+            s_last_pos_seq   = rec.seq;
+
+            if (*count >= max_count) { done = true; break; }
         }
         f_close(&f);
+
+        if (done) break;
+
+        seg = (int)((seg + 1U) % RECORD_SEGMENT_COUNT);
+        slot = 0;
+        visited++;
     }
 
+    /* 没有可推进的 ack 时游标原地不动，保证未 ack 数据可重读 */
     return HAL_OK;
 }
 
