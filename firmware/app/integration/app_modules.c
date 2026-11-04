@@ -8,6 +8,8 @@
 #include "cmsis_os2.h"
 #include "main.h"
 
+
+
 #define STORAGE_STACK_SIZE_BYTES (4U * 1024U)
 #define CONFIG_STACK_SIZE_BYTES  (4U * 1024U)
 #define MODBUS_STACK_SIZE_BYTES  (2U * 1024U)
@@ -118,7 +120,7 @@ static AppModuleSlot module_slots[APP_MODULE_COUNT] =
   },
   [APP_MODULE_MODBUS] =
   {
-    .init = NULL, .task = NULL, .attributes = &modbus_attributes,
+    .init = Modbus_Init, .task = vModbusPollTask, .attributes = &modbus_attributes,
     .result = APP_MODULE_INIT_NOT_READY, .task_state = APP_MODULE_TASK_NOT_STARTED
   },
   [APP_MODULE_MQTT] =
