@@ -6,7 +6,11 @@
       "type": "cortex-debug",
       "request": "launch",
       "cwd": "${workspaceFolder}",
-      "executable": "${workspaceFolder}/build/Debug/firmware/app/modbus-mqtt-gateway.elf",
+      "executable": "${workspaceFolder}/build/BootDebug/firmware/bootloader/bootloader.elf",
+      "loadFiles": [
+        "${workspaceFolder}/build/BootDebug/firmware/bootloader/bootloader.elf",
+        "${workspaceFolder}/build/AppDebug/firmware/app/modbus-mqtt-gateway.elf"
+      ],
       "servertype": "openocd",
       "serverpath": "${input:openocdExecutable}",
       "armToolchainPath": "${input:armToolchainBin}",
@@ -51,7 +55,7 @@
           "value": "interface/cmsis-dap.cfg"
         },
         {
-            "label": "ST-LINK（ST OpenOCD 原生 DAP）",
+            "label": "ST-LINK(ST OpenOCD 原生 DAP)",
             "value": "interface/stlink-dap.cfg"
         }
       ],
