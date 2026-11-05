@@ -126,7 +126,7 @@ static AppModuleSlot module_slots[APP_MODULE_COUNT] =
   },
   [APP_MODULE_MQTT] =
   {
-    .init = MqttClient_Init, .task = MqttClient_Task, .attributes = &mqtt_attributes,
+    .init = NULL/*MqttClient_Init*/, .task = NULL/*MqttClient_Task*/, .attributes = &mqtt_attributes,
     .result = APP_MODULE_INIT_NOT_READY, .task_state = APP_MODULE_TASK_NOT_STARTED
   },
   [APP_MODULE_MONITOR] =

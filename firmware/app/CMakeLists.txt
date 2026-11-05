@@ -79,3 +79,11 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
     # Add user defined libraries
     modbus
 )
+
+
+# ========== POST_BUILD：编译elf成功之后自动执行的命令 ==========
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_OBJCOPY} -O ihex $<TARGET_FILE:${PROJECT_NAME}> ${PROJECT_NAME}.hex   # elf转hex
+    COMMAND ${CMAKE_OBJCOPY} -O binary $<TARGET_FILE:${PROJECT_NAME}> ${PROJECT_NAME}.bin # elf转bin
+    COMMAND ${CMAKE_SIZE} $<TARGET_FILE:${PROJECT_NAME}>  # 打印Flash、RAM占用大小
+)

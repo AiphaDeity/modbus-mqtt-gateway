@@ -2,6 +2,7 @@
 #define __MODBUS_APP_H__
 #include <stdint.h>
 #include "modbus.h"
+#include "mb_pointmap.h"
 
 /* ========= 前向声明 ========= */
 typedef struct mb_slave_runtime mb_slave_runtime_t;
@@ -23,26 +24,29 @@ typedef struct mb_slave_runtime mb_slave_runtime_t;
     #define MB_LOG_LEVEL  MB_LOG_LEVEL_INFO   // ← 这里量产前改成 MB_LOG_LEVEL_OFF
 #endif
 
+// 【解耦层】只改这一处就能替换底层输出，比如改成rt_kprintf、自定义串口函数
+#define MB_LOG_OUT(fmt, ...)    printf(fmt, ##__VA_ARGS__)
+
 #if MB_LOG_LEVEL >= MB_LOG_LEVEL_ERROR
-    #define MB_LOGE(fmt, ...)   printf("[MB-E] " fmt "\r\n", ##__VA_ARGS__)
+    #define MB_LOGE(fmt, ...)   MB_LOG_OUT("[MB-E] %s:%d " fmt "\r\n", __FILE__, __LINE__, ##__VA_ARGS__)
 #else
     #define MB_LOGE(fmt, ...)   ((void)0)
 #endif
 
 #if MB_LOG_LEVEL >= MB_LOG_LEVEL_WARN
-    #define MB_LOGW(fmt, ...)   printf("[MB-W] " fmt "\r\n", ##__VA_ARGS__)
+    #define MB_LOGW(fmt, ...)   MB_LOG_OUT("[MB-W] %s:%d " fmt "\r\n", __FILE__, __LINE__, ##__VA_ARGS__)
 #else
     #define MB_LOGW(fmt, ...)   ((void)0)
 #endif
 
 #if MB_LOG_LEVEL >= MB_LOG_LEVEL_INFO
-    #define MB_LOGI(fmt, ...)   printf("[MB-I] " fmt "\r\n", ##__VA_ARGS__)
+    #define MB_LOGI(fmt, ...)   MB_LOG_OUT("[MB-I] %s:%d " fmt "\r\n", __FILE__, __LINE__, ##__VA_ARGS__)
 #else
     #define MB_LOGI(fmt, ...)   ((void)0)
 #endif
 
 #if MB_LOG_LEVEL >= MB_LOG_LEVEL_DEBUG
-    #define MB_LOGD(fmt, ...)   printf("[MB-D] " fmt "\r\n", ##__VA_ARGS__)
+    #define MB_LOGD(fmt, ...)   MB_LOG_OUT("[MB-D] %s:%d " fmt "\r\n", __FILE__, __LINE__, ##__VA_ARGS__)
 #else
     #define MB_LOGD(fmt, ...)   ((void)0)
 #endif
@@ -129,7 +133,8 @@ typedef struct
 typedef struct
 {
     uint8_t  slave_id;           // 从站地址
-    uint8_t  is_online;          // 在线状态
+    uint8_t  is_online;          // 在线状态（poll 成功置 1，超时置 0）
+    uint8_t  data_valid;         // 数据新鲜度（1=本次周期 poll 成功；0=无新数据）
     uint16_t reg_addr;           // 寄存器起始地址
     uint16_t valid_point;        // 有效数据长度
     uint16_t data[MB_REG_MAX_PER_SLAVE];  // 数据快照（拷贝而非指针）
@@ -159,6 +164,8 @@ struct mb_slave_runtime
     mb_errot_t collect_status;                       // 采集状态
 
     uint8_t data_valid;                            // 0无效数据；1有效数据
+
+    mb_point_t points[MB_POINTS_PER_SLAVE];        // 点位表（配置下发/FROM Flash 填充）
 };
 
 /**
