@@ -23,6 +23,7 @@
 #include "eth.h"
 #include "fatfs.h"
 #include "i2c.h"
+#include "sdio.h"
 #include "spi.h"
 #include "tim.h"
 #include "usart.h"
@@ -104,6 +105,7 @@ int main(void)
   MX_USART3_UART_Init();
   MX_TIM7_Init();
   MX_USART1_UART_Init();
+  MX_SDIO_SD_Init();
   MX_FATFS_Init();
   /* USER CODE BEGIN 2 */
   /* ★排障修复：Picolibc 的 stdout 默认是全缓冲的——printf 的内容会攒在缓冲区里，

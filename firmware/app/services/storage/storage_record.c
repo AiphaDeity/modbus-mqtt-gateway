@@ -17,6 +17,7 @@
 #include "flash_partition.h"
 #include "spi_flash_w25q128.h"
 #include "fatfs.h"
+#include "diskio.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -389,6 +390,13 @@ HAL_StatusTypeDef storage_record_init(void)
     s_appends_since = 0;
     s_last_persist_tick = HAL_GetTick();
 
+    /* 强制物理层重新初始化：
+     * 热插拔后 FatFs 里的 fs_type 仍为已挂载，find_volume 会跳过 disk_initialize
+     * 直接用旧的 SD 句柄去读，导致 30s 超时。这里先显式初始化一次，
+     * 走完整的 BSP_SD_Init（SDIO RCC reset + 重新枚举卡）。
+     */
+    (void)disk_initialize(0);
+
     /* 挂载 SD 卡（延迟挂载，不阻塞） */
     fr = f_mount(&SDFatFS, SDPath, 0);
     if (fr == FR_NOT_READY || fr == FR_DISK_ERR) {
@@ -752,4 +760,30 @@ void storage_record_maintenance(void)
 bool storage_record_is_ready(void)
 {
     return s_ready;
+}
+
+/* ---------- 卸载（热插拔拔出路径） ---------- */
+
+void storage_record_unmount(void)
+{
+    /* 1. 关闭当前段文件（如果打开） */
+    if (s_file_open) {
+        (void)f_close(&s_cur_file);
+        s_file_open = false;
+    }
+
+    /* 2. 强制把 Flash 环状态落盘（以防上次 dirty 没写） */
+    if (s_state_dirty) {
+        state_store_now();
+        s_state_dirty = false;
+    }
+
+    /* 3. FatFs 卸载 — 释放对底层 SDIO 的引用 */
+    (void)f_mount(NULL, SDPath, 0);
+
+    /* 4. 清所有状态 — init() 会重新填充 */
+    s_ready = false;
+    s_cur_seg = -1;
+    s_last_pos_valid = false;
+    s_state_dirty = false;
 }

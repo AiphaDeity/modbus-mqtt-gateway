@@ -1,7 +1,9 @@
 #include "storage.h"
 #include "app_readiness.h"
 #include "main.h"
+#include "usart.h"   /* huart1 */
 
+#include <stdio.h>   /* 业务级日志（Gateway boot / 热插拔事件） */
 #include "rtc_sd3078.h"
 #include "spi_flash_w25q128.h"
 #include "sdcard_tf.h"
@@ -13,6 +15,7 @@
 #include "storage_ctrllog.h"
 #include "storage_record.h"
 #include "storage_m2.h"
+#include "m3_selftest.h"
 
 #include "cmsis_os2.h"
 
@@ -22,6 +25,58 @@ osMutexId_t g_m3_i2c1_mutex = NULL;
 static bool s_flash_ok = false;
 static bool s_floor_ok = false;
 static bool s_log_ok = false;
+
+/* ---- PD3 EXTI 热插拔中断 ----
+ *
+ * 卡座 PD3：卡插入→LOW，卡拔出→HIGH。
+ * 用 EXTI line 3 双边沿捕获，确保即使主循环被 HAL_SD_Init 阻塞
+ * 也不会错过物理插拔事件。中断里只设标志，主循环处理。
+ */
+#define SD_CARD_DET_IRQn EXTI3_IRQn
+
+static volatile bool s_cd_event_flag = false;   /* 中断里置位 */
+
+/* 中断回调：HAL_GPIO_EXTI_IRQHandler(EXTI_LINE_x) → HAL_GPIO_EXTI_Callback
+ *
+ * 注意：中断上下文里不能跑 HAL_SD_Init 这种重活！
+ * 所以这里只置标志，真正的处理在主循环里做。
+ */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+    if (GPIO_Pin == SD_CARD_DET_Pin) {
+        s_cd_event_flag = true;
+        __HAL_GPIO_EXTI_CLEAR_IT(GPIO_Pin);
+    }
+}
+
+/* 在 Init 里配置 EXTI */
+static void sdcard_detect_exti_init(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    /* 重新配置 PD3：从 GPIO_MODE_INPUT 改为 GPIO_MODE_IT_RISING_FALLING
+     * 这样 PD3 上任何电平变化（LOW→HIGH 或 HIGH→LOW）都会触发 EXTI3。
+     */
+    GPIO_InitStruct.Pin = SD_CARD_DET_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    HAL_GPIO_Init(SD_CARD_DET_GPIO_Port, &GPIO_InitStruct);
+
+    /* HAL 内部会自动把 GPIO_Pin=BIT3 连接到 EXTI line 3，
+     * 但我们需要手动 enable NVIC。
+     */
+    HAL_NVIC_SetPriority(SD_CARD_DET_IRQn, 5, 0);  /* 优先级 5 */
+    HAL_NVIC_EnableIRQ(SD_CARD_DET_IRQn);
+
+    s_cd_event_flag = false;   /* 清 pending */
+    __HAL_GPIO_EXTI_CLEAR_IT(SD_CARD_DET_Pin);
+}
+
+/* EXTI line 3 IRQ handler — 覆盖 startup.s 里的 weak Default_Handler */
+void EXTI3_IRQHandler(void)
+{
+    HAL_GPIO_EXTI_IRQHandler(SD_CARD_DET_Pin);
+}
 
 AppModuleInitResult Storage_Init(void)
 {
@@ -54,6 +109,9 @@ AppModuleInitResult Storage_Init(void)
     // TF 卡 — 可能没插卡，失败正常
     (void)sdcard_tf_init();
 
+    // PD3 EXTI 热插拔：让插拔事件在任何时候都能被捕获
+    sdcard_detect_exti_init();
+
     // 序列号管理 — 从 Flash 恢复高水位（双份冗余取最大）
     (void)storage_seq_init();
 
@@ -73,6 +131,17 @@ AppModuleInitResult Storage_Init(void)
      */
 
     return APP_MODULE_INIT_OK;
+}
+
+/*
+ * TF 卡物理检测（PD3）：
+ *   - 卡插入 → PD3 低电平 (GPIO_PIN_RESET)
+ *   - 卡拔出 → PD3 高电平 (GPIO_PIN_SET)
+ * 卡座机械开关 + 内部上拉 (gpio.c 已改 PULLUP)。
+ */
+static bool sdcard_physical_present(void)
+{
+    return (HAL_GPIO_ReadPin(SD_CARD_DET_GPIO_Port, SD_CARD_DET_Pin) == GPIO_PIN_RESET);
 }
 
 void Storage_Task(void *argument)
@@ -110,9 +179,15 @@ void Storage_Task(void *argument)
     // 控制状态恢复：持久时间下界 + 控制日志（去重表）均已恢复
     App_SetResourceReady(APP_RESOURCE_CONTROL_STATE, s_floor_ok && s_log_ok);
 
+#if M3_SELFTEST_ENABLE
+    // 上板自检：把各层状态一次性打印到日志串口（USART1, 115200）
+    m3_selftest_run();
+#endif
+
     /* 3. 业务循环 */
     uint32_t last_floor_tick = HAL_GetTick();
-    uint32_t last_record_retry_tick = HAL_GetTick();
+    uint32_t last_cd_poll_tick = HAL_GetTick();
+    bool last_card_present = sdcard_physical_present();
 
     for (;;)
     {
@@ -134,11 +209,54 @@ void Storage_Task(void *argument)
         // 记录环状态节流落盘（段切换时已在 append 内立即落盘）
         storage_record_maintenance();
 
-        // TF 卡热插拔重试：未就绪时每 5s 重试一次挂载
-        if (!storage_record_is_ready() &&
-            (HAL_GetTick() - last_record_retry_tick) >= 5000U) {
-            last_record_retry_tick = HAL_GetTick();
-            (void)storage_record_init();
+        /*
+         * TF 卡热插拔：
+         *   - EXTI 中断优先（PD3 任何边沿变化都设 s_cd_event_flag）
+         *   - 2s 轮询兜底（防止中断偶发丢失）
+         */
+        bool now_present = sdcard_physical_present();
+        bool cd_event = false;
+
+        if (s_cd_event_flag) {
+            /* EXTI 捕获到了物理插拔边缘 */
+            s_cd_event_flag = false;
+            cd_event = true;
+        } else if ((HAL_GetTick() - last_cd_poll_tick) >= 2000U) {
+            /* 2s 轮询兜底 */
+            last_cd_poll_tick = HAL_GetTick();
+            cd_event = (now_present != last_card_present);
+        }
+
+        if (cd_event) {
+            if (!now_present && last_card_present) {
+                /* LOW→HIGH：检测到卡拔出 */
+                printf("[M3] TF card removed (PD3=HIGH) unmounting...\r\n"); fflush(stdout);
+                storage_record_unmount();
+                (void)sdcard_tf_deinit();
+                printf("[M3] TF card unmounted + SDIO deinit done\r\n"); fflush(stdout);
+            } else if (now_present && !last_card_present) {
+                /* HIGH→LOW：检测到卡插入 */
+                printf("[M3] TF card inserted (PD3=LOW) mounting...\r\n"); fflush(stdout);
+                uint32_t t0 = HAL_GetTick();
+                HAL_StatusTypeDef st = storage_record_init();
+                uint32_t dt = HAL_GetTick() - t0;
+                bool ready = storage_record_is_ready();
+                printf("[M3] TF card mount %s (init_st=%d dt=%lums)\r\n",
+                       ready ? "OK" : "FAIL", st, (unsigned long)dt); fflush(stdout);
+            }
+            last_card_present = now_present;
+        } else if (now_present && !storage_record_is_ready()) {
+            /* 卡物理在场但逻辑没 ready → 兜底重试（每 10s 一次） */
+            static uint32_t last_retry_tick = 0;
+            if ((HAL_GetTick() - last_retry_tick) >= 10000U) {
+                last_retry_tick = HAL_GetTick();
+                printf("[M3] TF card present but not ready, retry init\r\n"); fflush(stdout);
+                uint32_t t0 = HAL_GetTick();
+                (void)storage_record_init();
+                uint32_t dt = HAL_GetTick() - t0;
+                printf("[M3] retry init done dt=%lums ready=%d\r\n",
+                       (unsigned long)dt, storage_record_is_ready()); fflush(stdout);
+            }
         }
 
         osDelay(1000);

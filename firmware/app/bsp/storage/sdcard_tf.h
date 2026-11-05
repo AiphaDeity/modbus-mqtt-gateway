@@ -19,6 +19,9 @@
 // 初始化：检测 TF 卡、读取 CSD/CID、初始化 SDIO
 HAL_StatusTypeDef sdcard_tf_init(void);
 
+// 反初始化：让 SDIO 外设和句柄回到 RESET 状态（热插拔拔卡时调用）
+HAL_StatusTypeDef sdcard_tf_deinit(void);
+
 // 判断 TF 卡是否已初始化并可用
 bool sdcard_tf_is_ready(void);
 
