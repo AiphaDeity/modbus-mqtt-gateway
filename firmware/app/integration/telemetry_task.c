@@ -47,15 +47,17 @@ static int on_slave_telemetry(mb_slave_runtime_t *slave, void *ctx)
     /* 跳过没有有效数据的从站（刚上电或一直掉线） */
     if (!slave->data_valid || slave->valid_point == 0) return 0;
 
-    /* 1) 让 M1 把 raw reg 解析成物理量（名称/单位/已乘缩放） */
-    mb_parsed_point_t pts[MB_POINTS_PER_SLAVE];
+    /* 1) 让 M1 把 raw reg 解析成物理量（名称/单位/已乘缩放）。
+     *    buf 和 pts 都用 static：只有 telemetry 一个任务调本函数，
+     *    但栈上放 512B+ 缓冲会爆栈（snprintf %f 内部还要几百字节）。 */
+    static mb_parsed_point_t pts[MB_POINTS_PER_SLAVE];
     int npts = mb_pointmap_parse_slave(slave->telegram.u8id, pts);
     if (npts <= 0) return 0;   /* 没配点位表，跳过 */
 
     /* 2) 拼 JSON。示例：
      * {"g":"mb2mqtt_001","slave":1,"online":1,"pts":[{"n":"temp","v":25.3,"u":"C"},...]}
      */
-    char buf[PAYLOAD_MAX];
+    static char buf[PAYLOAD_MAX];
     int n = snprintf(buf, sizeof(buf),
         "{\"g\":\"mb2mqtt_001\",\"slave\":%u,\"online\":%u,\"pts\":[",
         slave->telegram.u8id, slave->is_online);
@@ -94,14 +96,15 @@ static int on_slave_telemetry(mb_slave_runtime_t *slave, void *ctx)
     if (st != osOK)
     {
         /* 队列满（离线太久+补传卡住）：丢一条，M3 会维护 dropped 计数 */
-        printf("[TEL] write queue full, drop seq=%llu slave=%u\r\n",
-               (unsigned long long)seq, slave->telegram.u8id);
+        printf("[TEL] write queue full, drop seq=%lu slave=%u\r\n",
+               (unsigned long)seq, slave->telegram.u8id);
     }
     else
     {
-        printf("[TEL] seq=%llu slave=%u online=%u pts=%d -> %s\r\n",
-               (unsigned long long)seq, slave->telegram.u8id,
-               slave->is_online, npts, buf);
+        /* 注：newlib-nano 不支持 %llu，seq 当前值 < 4G，用 %lu 打即可 */
+        printf("[TEL] seq=%lu slave=%u online=%u pts=%d -> %s\r\n",
+               (unsigned long)seq, (unsigned)slave->telegram.u8id,
+               (unsigned)slave->is_online, npts, buf);
     }
     return 0;   /* 0=继续遍历下一个从站 */
 }

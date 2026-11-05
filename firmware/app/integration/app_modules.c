@@ -15,7 +15,7 @@
 #define CONFIG_STACK_SIZE_BYTES  (512U)         /* M1 config 还没实现，占位 */
 #define MODBUS_STACK_SIZE_BYTES  (2U * 1024U)
 #define MQTT_STACK_SIZE_BYTES    (4U * 1024U)
-#define TELEMETRY_STACK_SIZE_BYTES (1536U)      /* snprintf 拼装，1.5K 够 */
+#define TELEMETRY_STACK_SIZE_BYTES (2560U)       /* snprintf + printf 栈开销大，2.5K */
 #define MONITOR_STACK_SIZE_BYTES (512U)         /* M4 monitor 还没实现，占位 */
 
 typedef AppModuleInitResult (*AppModuleInitFn)(void);
