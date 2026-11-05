@@ -11,12 +11,12 @@
 #include "mqtt_client.h"
 #include "telemetry_task.h"
 
-#define STORAGE_STACK_SIZE_BYTES (6U * 1024U)  /* FatFs + storage_record 至少 6KiB */
-#define CONFIG_STACK_SIZE_BYTES  (4U * 1024U)
+#define STORAGE_STACK_SIZE_BYTES (6U * 1024U)  /* FatFs + storage_record 至少 6KiB，不能再压 */
+#define CONFIG_STACK_SIZE_BYTES  (512U)         /* M1 config 还没实现，占位 */
 #define MODBUS_STACK_SIZE_BYTES  (2U * 1024U)
 #define MQTT_STACK_SIZE_BYTES    (4U * 1024U)
-#define TELEMETRY_STACK_SIZE_BYTES (2U * 1024U)  /* snprintf + JSON 拼装，2K 够 */
-#define MONITOR_STACK_SIZE_BYTES (2U * 1024U)
+#define TELEMETRY_STACK_SIZE_BYTES (1536U)      /* snprintf 拼装，1.5K 够 */
+#define MONITOR_STACK_SIZE_BYTES (512U)         /* M4 monitor 还没实现，占位 */
 
 typedef AppModuleInitResult (*AppModuleInitFn)(void);
 
