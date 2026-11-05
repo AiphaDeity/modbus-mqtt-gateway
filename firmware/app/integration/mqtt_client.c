@@ -41,9 +41,15 @@
 /* 下行命令订阅 topic */
 #define MQTT_CMD_TOPIC    "mb2mqtt_001/cmd"
 
-/* 收发缓冲：放静态区，不占 4KB 任务栈 */
-static uint8_t tx_buf[256];
+/* 收发缓冲：放静态区，不占 4KB 任务栈。
+ * tx_buf 要装 topic(≈20B) + payload(≤512B) + MQTT 头，给 640B */
+static uint8_t tx_buf[640];
 static uint8_t rx_buf[64];
+
+/* 连接状态 + 发送互斥锁：telemetry/replay 任务可并发调 MqttClient_Publish */
+static struct netconn *g_conn;          /* NULL=未连接 */
+static osMutexId_t     g_tx_mutex;
+static const osMutexAttr_t g_tx_mutex_attr = { .name = "mqtt_tx" };
 
 /* ---- MQTT 编码小工具： remaining length 用单字节（我们报文都 <127） ---- */
 static size_t mqtt_encode_header(uint8_t type_flags, const uint8_t *variable_and_payload, size_t vplen)
@@ -141,9 +147,52 @@ static uint16_t mqtt_recv_to_buf(struct netconn *conn)
   return rlen;
 }
 
+/* 线程安全的 PUBLISH（QoS0）：telemetry/replay 任务调。
+ * 直接把报文拼进 tx_buf，锁保护下 netconn_write。未连接返回 -1。 */
+int MqttClient_Publish(const char *topic, const uint8_t *payload, size_t plen)
+{
+    if (topic == NULL || payload == NULL || plen == 0) return -1;
+    if (g_conn == NULL) return -1;
+
+    osMutexAcquire(g_tx_mutex, osWaitForever);
+
+    size_t tlen = strlen(topic);
+    size_t vplen = 2 + tlen + plen;   /* 可变头：topic_len(2) + topic + payload */
+    /* remaining length 最多 4 字节编码 */
+    uint8_t rlbuf[4];
+    size_t rllen = 0;
+    size_t enc = vplen;
+    do {
+        uint8_t b = enc & 0x7F;
+        enc >>= 7;
+        if (enc > 0) b |= 0x80;
+        rlbuf[rllen++] = b;
+    } while (enc > 0 && rllen < 4);
+
+    /* 总长度 = fixed_header(1) + remaining_len(rllen) + vplen */
+    if (1 + rllen + vplen > sizeof(tx_buf)) {
+        osMutexRelease(g_tx_mutex);
+        return -2;
+    }
+
+    size_t off = 0;
+    tx_buf[off++] = 0x30;               /* PUBLISH QoS0 */
+    memcpy(&tx_buf[off], rlbuf, rllen); off += rllen;
+    tx_buf[off++] = (uint8_t)(tlen >> 8);
+    tx_buf[off++] = (uint8_t)(tlen & 0xFF);
+    memcpy(&tx_buf[off], topic, tlen); off += tlen;
+    memcpy(&tx_buf[off], payload, plen); off += plen;
+
+    err_t err = netconn_write(g_conn, tx_buf, off, NETCONN_COPY);
+
+    osMutexRelease(g_tx_mutex);
+    return (err == ERR_OK) ? 0 : -3;
+}
+
 AppModuleInitResult MqttClient_Init(void)
 {
-  /* 当前阶段没有硬件要配，直接 OK，任务自己等网络 */
+  /* 创建发送互斥锁 */
+  g_tx_mutex = osMutexNew(&g_tx_mutex_attr);
   return APP_MODULE_INIT_OK;
 }
 
@@ -225,6 +274,7 @@ void MqttClient_Task(void *argument)
       continue;
     }
     printf("[MQTT] CONNACK return code = %u (0=Accepted)\r\n", (unsigned)rx_buf[3]);
+    g_conn = conn;   /* 标记连接已建立，允许其他任务 publish */
 
     /* 4) PUBLISH status=online */
     pkglen = mqtt_build_publish(MQTT_STATUS_TOPIC, (const uint8_t *)"online", 6);
@@ -277,6 +327,7 @@ void MqttClient_Task(void *argument)
     }
 
     /* 走到这里说明连接异常，外层 3 秒后重连 */
+    g_conn = NULL;
     netconn_close(conn);
     netconn_delete(conn);
     osDelay(pdMS_TO_TICKS(3000));

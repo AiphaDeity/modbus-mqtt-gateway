@@ -25,6 +25,7 @@
 #include "mb_pointmap.h"
 #include "storage_m2.h"
 #include "storage_seq.h"
+#include "mqtt_client.h"
 #include "app_modules.h"
 
 /* 上报周期：Modbus 采集本身可能 1~2 秒一轮，这里 2 秒足够 */
@@ -101,10 +102,13 @@ static int on_slave_telemetry(mb_slave_runtime_t *slave, void *ctx)
     }
     else
     {
+        /* 5) 在线时直接 PUBLISH 到 broker（不等补传），失败也不阻塞离线缓存 */
+        int pr = MqttClient_Publish("mb2mqtt_001/telemetry",
+                                   (const uint8_t *)buf, (size_t)n);
         /* 注：newlib-nano 不支持 %llu，seq 当前值 < 4G，用 %lu 打即可 */
-        printf("[TEL] seq=%lu slave=%u online=%u pts=%d -> %s\r\n",
+        printf("[TEL] seq=%lu slave=%u online=%u pts=%d mqtt_pub=%d\r\n",
                (unsigned long)seq, (unsigned)slave->telegram.u8id,
-               (unsigned)slave->is_online, npts, buf);
+               (unsigned)slave->is_online, npts, pr);
     }
     return 0;   /* 0=继续遍历下一个从站 */
 }

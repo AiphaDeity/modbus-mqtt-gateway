@@ -12,6 +12,8 @@
 #define MQTT_CLIENT_H
 
 #include "app_modules.h"
+#include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -22,6 +24,10 @@ AppModuleInitResult MqttClient_Init(void);
 
 /* 任务入口：netconn connect -> CONNECT -> CONNACK -> PUBLISH status -> 挂起等待 */
 void MqttClient_Task(void *argument);
+
+/* 线程安全的 PUBLISH（QoS0）：其他任务（telemetry/replay）可调用。
+ * 未连接或写失败返回非 0。topic/payload 都在调用方缓冲里。 */
+int MqttClient_Publish(const char *topic, const uint8_t *payload, size_t plen);
 
 #ifdef __cplusplus
 }
