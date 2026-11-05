@@ -34,6 +34,14 @@
             }
         },
         {
+            "name": "BootSizeCheck",
+            "inherits": "BootDebug",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "MinSizeRel",
+                "CMAKE_C_FLAGS_MINSIZEREL": "-Os -g3 -DDEBUG"
+            }
+        },
+        {
             "name": "AppDebug",
             "inherits": "Debug",
             "cacheVariables": {
@@ -56,6 +64,10 @@
         {
             "name": "BootDebug",
             "configurePreset": "BootDebug"
+        },
+        {
+            "name": "BootSizeCheck",
+            "configurePreset": "BootSizeCheck"
         },
         {
             "name": "AppDebug",

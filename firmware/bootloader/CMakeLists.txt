@@ -46,6 +46,9 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/boot_jump.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/boot_app_flash.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/boot_package.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/boot_package_flash.c
 )
 
 # Add include paths
@@ -66,4 +69,31 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
     stm32cubemx
 
     # Add user defined libraries
+)
+
+# Temporary Mbed TLS size experiment
+set(BOOT_MBEDTLS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/mbedtls")
+
+target_sources(${CMAKE_PROJECT_NAME} PRIVATE
+    "${BOOT_MBEDTLS_DIR}/library/sha256.c"
+    "${BOOT_MBEDTLS_DIR}/library/aes.c"
+    "${BOOT_MBEDTLS_DIR}/library/gcm.c"
+    "${BOOT_MBEDTLS_DIR}/library/block_cipher.c"
+    "${BOOT_MBEDTLS_DIR}/library/ecdsa.c"
+    "${BOOT_MBEDTLS_DIR}/library/ecp.c"
+    "${BOOT_MBEDTLS_DIR}/library/ecp_curves.c"
+    "${BOOT_MBEDTLS_DIR}/library/bignum.c"
+    "${BOOT_MBEDTLS_DIR}/library/bignum_core.c"
+    "${BOOT_MBEDTLS_DIR}/library/bignum_mod.c"
+    "${BOOT_MBEDTLS_DIR}/library/bignum_mod_raw.c"
+    "${BOOT_MBEDTLS_DIR}/library/constant_time.c"
+    "${BOOT_MBEDTLS_DIR}/library/asn1parse.c"
+    "${BOOT_MBEDTLS_DIR}/library/asn1write.c"
+    "${BOOT_MBEDTLS_DIR}/library/platform_util.c"
+)
+target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
+    "${BOOT_MBEDTLS_DIR}/include"
+)
+target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
+    MBEDTLS_CONFIG_FILE=\"boot_mbedtls_config.h\"
 )

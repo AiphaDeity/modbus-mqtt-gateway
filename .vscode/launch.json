@@ -6,9 +6,14 @@
       "type": "cortex-debug",
       "request": "launch",
       "cwd": "${workspaceFolder}",
-      "executable": "${workspaceFolder}/build/BootDebug/firmware/bootloader/bootloader.elf",
+      //"executable": "${workspaceFolder}/build/BootDebug/firmware/bootloader/bootloader.elf",
+      //"loadFiles": [
+      //   "${workspaceFolder}/build/BootDebug/firmware/bootloader/bootloader.elf",
+      //   "${workspaceFolder}/build/AppDebug/firmware/app/modbus-mqtt-gateway.elf"
+      // ],
+      "executable": "${workspaceFolder}/build/BootSizeCheck/firmware/bootloader/bootloader.elf",
       "loadFiles": [
-        "${workspaceFolder}/build/BootDebug/firmware/bootloader/bootloader.elf",
+        "${workspaceFolder}/build/BootSizeCheck/firmware/bootloader/bootloader.elf",
         "${workspaceFolder}/build/AppDebug/firmware/app/modbus-mqtt-gateway.elf"
       ],
       "servertype": "openocd",
