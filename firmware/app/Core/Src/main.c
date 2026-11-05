@@ -32,6 +32,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
+#include "ethernet.h"   /* Day2：m2_ethernet_init() 声明（bsp/ethernet/ethernet.h） */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -107,13 +108,26 @@ int main(void)
   MX_SDIO_SD_Init();
   MX_FATFS_Init();
   /* USER CODE BEGIN 2 */
+  /* ★排障修复：Picolibc 的 stdout 默认是全缓冲的——printf 的内容会攒在缓冲区里，
+     缓冲区不满就不调 _write（串口），导致只有带 fflush 的 "Gateway boot" 能显示，
+     ethernet.c 里 connected/DHCP/static IP 等 printf 全部被吞。
+     这里把 stdout 设成"无缓冲"：每行 printf 立即送到串口，不再依赖 fflush。 */
+  setvbuf(stdout, NULL, _IONBF, 0);
   printf("Gateway boot\r\n");
-  fflush(stdout);
-
+  /* ★排障修复：osKernelInitialize 必须先于任何 os 对象创建（MX_FREERTOS_Init 会检查内核状态）。 */
+  osKernelInitialize();
+  /* ★★核心修复：网卡初始化【不能】放在这里！
+     m2_ethernet_init() 内部会调 tcpip_init / netif_add / sys_thread_new，
+     其中 ethernet.c 用 taskENTER_CRITICAL()/taskEXIT_CRITICAL() 包着建线程。
+     调度器启动前 port.c 的 uxCriticalNesting 初始值是哨兵值 0xAAAAAAAA，
+     一次 enter/exit 配平后它仍 ≠ 0 → BASEPRI 永远停在 0x50 不再恢复 →
+       ① 所有优先级 ≥5 的中断被屏蔽（TIM6(优先级15,实测IPR=0xF0) 也不再进中断 →
+          uwTick 停在 10，HAL_ETH_Start_IT 里的 HAL_Delay(1) 死循环）
+       ② ETH 接收中断(优先级5) 被屏蔽 → 收包线程永远收不到包 → PING 不可能通
+     所以网卡初始化移到了任务上下文（integration/app_entry.c 的 App_Entry 里）。 */
   /* USER CODE END 2 */
 
   /* Init scheduler */
-  osKernelInitialize();  /* Call init function for freertos objects (in cmsis_os2.c) */
   MX_FREERTOS_Init();
 
   /* Start scheduler */
