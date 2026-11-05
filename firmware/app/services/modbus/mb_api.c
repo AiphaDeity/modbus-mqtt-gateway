@@ -102,6 +102,8 @@ mb_status_e mb_take_slave_snapshot(uint8_t slave_id, mb_slave_snapshot_t *snap_o
     snap_out->data_valid = s->data_valid;
     snap_out->reg_addr   = s->telegram.u16RegAdd;
     snap_out->valid_point = s->valid_point;
+    snap_out->last_collect_tick = s->last_trigger_tick;
+    snap_out->collect_status    = s->collect_status;
 
     uint16_t copy_len = (s->valid_point > MB_REG_MAX_PER_SLAVE)
                         ? MB_REG_MAX_PER_SLAVE : s->valid_point;
