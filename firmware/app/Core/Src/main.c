@@ -21,6 +21,7 @@
 #include "cmsis_os.h"
 #include "dma.h"
 #include "eth.h"
+#include "fatfs.h"
 #include "i2c.h"
 #include "spi.h"
 #include "tim.h"
@@ -103,6 +104,7 @@ int main(void)
   MX_USART3_UART_Init();
   MX_TIM7_Init();
   MX_USART1_UART_Init();
+  MX_FATFS_Init();
   /* USER CODE BEGIN 2 */
   /* ★排障修复：Picolibc 的 stdout 默认是全缓冲的——printf 的内容会攒在缓冲区里，
      缓冲区不满就不调 _write（串口），导致只有带 fflush 的 "Gateway boot" 能显示，

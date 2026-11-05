@@ -40,6 +40,7 @@ add_subdirectory(Middlewares/LwIP)
 add_subdirectory(bsp)
 add_subdirectory(integration)
 add_subdirectory(services/modbus)
+add_subdirectory(services/storage)
 
 # Configure the application vector table offset.
 set(GATEWAY_APP_VECTOR_OFFSET "0x00000000" CACHE STRING "Application vector table offset")
@@ -60,6 +61,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined include paths
+    ${CMAKE_CURRENT_LIST_DIR}/common
 )
 
 # Add project symbols (macros)
