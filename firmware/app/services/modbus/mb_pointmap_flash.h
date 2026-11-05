@@ -24,7 +24,7 @@
 
 #include <stdint.h>
 #include "mb_pointmap.h"
-#include "modbus_app.h"
+#include "mb_api.h"
 
 /* ========= 对外 API ========= */
 

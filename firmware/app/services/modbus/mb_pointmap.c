@@ -7,11 +7,11 @@
  *  多字节寄存器拼接严格大端序：高寄存器在前（reg[i]<<16 | reg[i+1]）
  *  float32 通过 memcpy 走，规避严格别名规则。
  *
- *  本文件依赖 modbus_app.h（访问 slave_list / 锁 / cfg_change_cb）。
+ *  本文件依赖 mb_api.h（访问 slave_list / 锁 / cfg_change_cb）。
  */
 
 #include "mb_pointmap.h"
-#include "modbus_app.h"
+#include "mb_internal.h"
 #include <string.h>
 
 /* ========= 全局上报模式 ========= */
@@ -25,10 +25,12 @@ static mb_report_mode_t s_report_mode = MB_REPORT_PARSED;
  * @param reg_len  该从站有效寄存器数（做边界检查用）
  * @param idx      点位 reg_index（reg 内起始下标）
  * @param type     数据类型
+ * @param bit_idx  位号 0~15（仅 MB_DT_BIT 使用）
  * @return 换算前的原始值（int64_t 中间态，大类型能装下）
  */
 static double mb_pointmap_raw_value(const uint16_t *reg, uint16_t reg_len,
-                                    uint16_t idx, mb_data_type_t type)
+                                    uint16_t idx, mb_data_type_t type,
+                                    uint8_t bit_idx)
 {
     uint8_t need = mb_dt_reg_count[type];
     if (idx + need > reg_len)
@@ -43,6 +45,12 @@ static double mb_pointmap_raw_value(const uint16_t *reg, uint16_t reg_len,
 
         case MB_DT_INT16:
             return (double)(int16_t)reg[idx];
+
+        case MB_DT_BIT:
+            // 位提取：FC01/02 线圈打包字，或寄存器里的状态位
+            // Modbus 标准：线圈 N → 第 N/16 个字的 bit (N%16)，字节内 LSB 在前
+            if (bit_idx > 15) return 0.0;
+            return (double)((reg[idx] >> bit_idx) & 0x01);
 
         case MB_DT_UINT32:
             return (double)(((uint32_t)reg[idx] << 16) | reg[idx + 1]);
@@ -64,51 +72,41 @@ static double mb_pointmap_raw_value(const uint16_t *reg, uint16_t reg_len,
 }
 
 /* ========= 设置 / 获取 点位配置 ========= */
+
+/**
+ * @brief 设置点位表核心逻辑（不加锁，调用方必须已持 xSlaveCfgMutex）
+ */
+int mb_pointmap_set_slave_points_nolock(uint8_t slave_id, const mb_point_t *points)
+{
+    mb_handle_t *h = mb_handle_get();
+    if (h == NULL) return MB_HANDLE_STATUS_ERR;
+    if (points == NULL) return MB_BUILD_REQUEST_ERR;
+
+    mb_slave_runtime_t *s = mb_get_slave_runtime(slave_id);
+    if (s == NULL) return MB_SLAVE_NOT_FOUND_ERR;
+
+    memcpy(&s->points, points, sizeof(s->points));
+    return MB_STATUS_OK;
+}
+
+/**
+ * @brief 设置点位表（公开加锁版）
+ */
 int mb_pointmap_set_slave_points(uint8_t slave_id, const mb_point_t *points)
 {
-    if (points == NULL)
-    {
-        return MB_BUILD_REQUEST_ERR;
-    }
+    if (points == NULL) return MB_BUILD_REQUEST_ERR;
 
     mb_handle_t *h = mb_handle_get();
-    if (h == NULL)
-    {
-        return MB_HANDLE_STATUS_ERR;
-    }
+    if (h == NULL) return MB_HANDLE_STATUS_ERR;
 
     osMutexAcquire(h->xSlaveCfgMutex, osWaitForever);
-
-    mb_slave_runtime_t *s = NULL;
-    for (uint8_t i = 0; i < h->slave_max_num; i++)
-    {
-        mb_slave_runtime_t *cand = &h->slave_list[i];
-        if (cand->valid && cand->telegram.u8id == slave_id)
-        {
-            s = cand;
-            break;
-        }
-    }
-
-    if (s == NULL)
-    {
-        osMutexRelease(h->xSlaveCfgMutex);
-        return MB_SLAVE_NOT_FOUND_ERR;
-    }
-
-    // 拷贝点位表到从站（这里假设 mb_slave_runtime_t 已挂 mb_point_t points[] 成员）
-    // 编译时若该成员不存在会直接报错，提示去 modbus_app.h 加
-    memcpy(&s->points, points, sizeof(s->points));
-
+    int ret = mb_pointmap_set_slave_points_nolock(slave_id, points);
     osMutexRelease(h->xSlaveCfgMutex);
 
-    // 触发存储方持久化
-    if (h->cfg_change_cb)
-    {
-        h->cfg_change_cb(MB_CFG_CHANGE_UPDATE, slave_id, h->cfg_change_ctx);
-    }
+    if (ret == MB_STATUS_OK)
+        mb_fire_cfg_change(MB_CFG_CHANGE_UPDATE, slave_id);
 
-    return MB_STATUS_OK;
+    return ret;
 }
 
 int mb_pointmap_get_slave_points(uint8_t slave_id, mb_point_t *out)
@@ -189,7 +187,8 @@ int mb_pointmap_parse_slave(uint8_t slave_id, mb_parsed_point_t *out)
         if (!pt->valid) continue;
         if (pt->data_type >= MB_DT_MAX) continue;
 
-        double raw = mb_pointmap_raw_value(reg, reg_len, pt->reg_index, pt->data_type);
+        double raw = mb_pointmap_raw_value(reg, reg_len, pt->reg_index,
+                                           pt->data_type, pt->bit_index);
         float physical = (float)(raw * (double)pt->scale + (double)pt->offset);
 
         out[parsed_cnt].value     = physical;
@@ -209,12 +208,7 @@ int mb_pointmap_parse_slave(uint8_t slave_id, mb_parsed_point_t *out)
 void mb_pointmap_set_report_mode(mb_report_mode_t mode)
 {
     s_report_mode = mode;
-
-    mb_handle_t *h = mb_handle_get();
-    if (h != NULL && h->cfg_change_cb)
-    {
-        h->cfg_change_cb(MB_CFG_CHANGE_UPDATE, 0, h->cfg_change_ctx);
-    }
+    mb_fire_cfg_change(MB_CFG_CHANGE_GLOBAL, 0);   /* 全局配置变更，slave_id=0 */
 }
 
 mb_report_mode_t mb_pointmap_get_report_mode(void)
