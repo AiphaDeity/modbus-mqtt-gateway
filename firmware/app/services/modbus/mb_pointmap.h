@@ -49,13 +49,15 @@ typedef enum
     MB_DT_UINT32  = 2,   // 无符号 32 位（reg[0]<<16 | reg[1]） → 2 个 reg
     MB_DT_INT32   = 3,   // 有符号 32 位 → 2 个 reg
     MB_DT_FLOAT32 = 4,   // IEEE754 float → 2 个 reg
+    MB_DT_BIT     = 5,   // 位提取：(reg[reg_index] >> bit_index) & 1 → 1 个 reg
+                         //   用于 FC01/02 线圈打包字，或寄存器里的状态位
     MB_DT_MAX
 } mb_data_type_t;
 
 /**
  * @brief 数据类型对应的寄存器占用数（查表用）
  */
-static const uint8_t mb_dt_reg_count[MB_DT_MAX] = { 1, 1, 2, 2, 2 };
+static const uint8_t mb_dt_reg_count[MB_DT_MAX] = { 1, 1, 2, 2, 2, 1 };
 
 /* ========= 上报模式 ========= */
 typedef enum
@@ -75,6 +77,7 @@ typedef struct
     char     name[MB_POINT_NAME_MAX];            // 点位名称
     char     unit[MB_POINT_UNIT_MAX];            // 单位
     uint8_t  valid;                              // 0=空位，1=有效配置
+    uint8_t  bit_index;                          // 仅 MB_DT_BIT 用：位号 0~15（其它类型填 0）
 } mb_point_t;
 
 /* ========= 解析结果（供 MQTT 方读取） ========= */
