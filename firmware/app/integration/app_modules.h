@@ -20,6 +20,7 @@ typedef enum
   APP_MODULE_CONFIG,
   APP_MODULE_MODBUS,
   APP_MODULE_MQTT,
+  APP_MODULE_TELEMETRY,
   APP_MODULE_MONITOR,
   APP_MODULE_COUNT
 } AppModuleId;
@@ -79,12 +80,17 @@ AppModuleInitResult Config_Init(void);
 void Config_Task(void *argument);
 
 // Modbus 模块：M1，保留已经提供的任务名称
-AppModuleInitResult Modbus_Init(void);
+// 注意：M1 的 Modbus_Init 是 void(void)，不是 AppModuleInitResult
+void Modbus_Init(void);
 void vModbusPollTask(void *argument);
 
 // MQTT 模块：M2
 AppModuleInitResult Mqtt_Init(void);
 void Mqtt_Task(void *argument);
+
+// 遥测上报模块：M2（周期从 M1 拿数据，拼 JSON 投 M3 写队列）
+AppModuleInitResult Telemetry_Init(void);
+void Telemetry_Task(void *argument);
 
 // 诊断监督模块：M4
 AppModuleInitResult Monitor_Init(void);

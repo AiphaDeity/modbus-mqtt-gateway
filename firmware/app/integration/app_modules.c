@@ -9,14 +9,19 @@
 #include "main.h"
 #include "storage.h"
 #include "mqtt_client.h"
+#include "telemetry_task.h"
 
 #define STORAGE_STACK_SIZE_BYTES (6U * 1024U)  /* FatFs + storage_record 至少 6KiB */
 #define CONFIG_STACK_SIZE_BYTES  (4U * 1024U)
 #define MODBUS_STACK_SIZE_BYTES  (2U * 1024U)
 #define MQTT_STACK_SIZE_BYTES    (4U * 1024U)
+#define TELEMETRY_STACK_SIZE_BYTES (2U * 1024U)  /* snprintf + JSON 拼装，2K 够 */
 #define MONITOR_STACK_SIZE_BYTES (2U * 1024U)
 
 typedef AppModuleInitResult (*AppModuleInitFn)(void);
+
+/* M1 的 Modbus_Init 是 void(void)，包装成 AppModuleInitResult 返回 */
+static AppModuleInitResult modbus_init_wrapper(void);
 
 typedef struct
 {
@@ -41,12 +46,14 @@ _Alignas(8) static StackType_t storage_stack[STORAGE_STACK_SIZE_BYTES / sizeof(S
 _Alignas(8) static StackType_t config_stack[CONFIG_STACK_SIZE_BYTES / sizeof(StackType_t)];
 _Alignas(8) static StackType_t modbus_stack[MODBUS_STACK_SIZE_BYTES / sizeof(StackType_t)];
 _Alignas(8) static StackType_t mqtt_stack[MQTT_STACK_SIZE_BYTES / sizeof(StackType_t)];
+_Alignas(8) static StackType_t telemetry_stack[TELEMETRY_STACK_SIZE_BYTES / sizeof(StackType_t)];
 _Alignas(8) static StackType_t monitor_stack[MONITOR_STACK_SIZE_BYTES / sizeof(StackType_t)];
 
 static StaticTask_t storage_control_block;
 static StaticTask_t config_control_block;
 static StaticTask_t modbus_control_block;
 static StaticTask_t mqtt_control_block;
+static StaticTask_t telemetry_control_block;
 static StaticTask_t monitor_control_block;
 
 // CMSIS-RTOS2 的 stack_size 单位为字节；任务优先级数值越大越高
@@ -90,6 +97,16 @@ static const osThreadAttr_t mqtt_attributes =
   .priority = osPriorityNormal
 };
 
+static const osThreadAttr_t telemetry_attributes =
+{
+  .name = "telemetry",
+  .cb_mem = &telemetry_control_block,
+  .cb_size = sizeof(telemetry_control_block),
+  .stack_mem = telemetry_stack,
+  .stack_size = sizeof(telemetry_stack),
+  .priority = osPriorityBelowNormal
+};
+
 static const osThreadAttr_t monitor_attributes =
 {
   .name = "monitor",
@@ -120,12 +137,17 @@ static AppModuleSlot module_slots[APP_MODULE_COUNT] =
   },
   [APP_MODULE_MODBUS] =
   {
-    .init = Modbus_Init, .task = vModbusPollTask, .attributes = &modbus_attributes,
+    .init = modbus_init_wrapper, .task = vModbusPollTask, .attributes = &modbus_attributes,
     .result = APP_MODULE_INIT_NOT_READY, .task_state = APP_MODULE_TASK_NOT_STARTED
   },
   [APP_MODULE_MQTT] =
   {
-    .init = NULL/*MqttClient_Init*/, .task = NULL/*MqttClient_Task*/, .attributes = &mqtt_attributes,
+    .init = MqttClient_Init, .task = MqttClient_Task, .attributes = &mqtt_attributes,
+    .result = APP_MODULE_INIT_NOT_READY, .task_state = APP_MODULE_TASK_NOT_STARTED
+  },
+  [APP_MODULE_TELEMETRY] =
+  {
+    .init = Telemetry_Init, .task = Telemetry_Task, .attributes = &telemetry_attributes,
     .result = APP_MODULE_INIT_NOT_READY, .task_state = APP_MODULE_TASK_NOT_STARTED
   },
   [APP_MODULE_MONITOR] =
@@ -134,6 +156,12 @@ static AppModuleSlot module_slots[APP_MODULE_COUNT] =
     .result = APP_MODULE_INIT_NOT_READY, .task_state = APP_MODULE_TASK_NOT_STARTED
   }
 };
+
+static AppModuleInitResult modbus_init_wrapper(void)
+{
+  Modbus_Init();
+  return APP_MODULE_INIT_OK;
+}
 
 static bool modules_initialized;
 static bool modules_started;
