@@ -9,6 +9,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/storage_ctrllog.c
     ${CMAKE_CURRENT_LIST_DIR}/storage_record.c
     ${CMAKE_CURRENT_LIST_DIR}/storage_m2.c
+    ${CMAKE_CURRENT_LIST_DIR}/m3_selftest.c
 )
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}

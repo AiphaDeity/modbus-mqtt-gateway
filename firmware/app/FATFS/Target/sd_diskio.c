@@ -246,6 +246,7 @@ DRESULT SD_read(BYTE lun, BYTE *buff, DWORD sector, UINT count)
             break;
           }
         }
+
       }
     }
 #if defined(ENABLE_SCRATCH_BUFFER)

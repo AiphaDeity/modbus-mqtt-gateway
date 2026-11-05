@@ -105,4 +105,7 @@ void storage_record_maintenance(void);
 /* 是否已就绪（卡挂载成功） */
 bool storage_record_is_ready(void);
 
+/* 卸载（物理卡拔出时调用）— 关闭所有文件 + FatFs unmount */
+void storage_record_unmount(void);
+
 #endif /* STORAGE_RECORD_H */

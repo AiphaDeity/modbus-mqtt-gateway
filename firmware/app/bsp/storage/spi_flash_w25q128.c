@@ -51,6 +51,28 @@ static void flash_unlock(void)
 static void flash_cs_low(void)  { HAL_GPIO_WritePin(SPI_FLASH_CS_GPIO_Port, SPI_FLASH_CS_Pin, GPIO_PIN_RESET); }
 static void flash_cs_high(void) { HAL_GPIO_WritePin(SPI_FLASH_CS_GPIO_Port, SPI_FLASH_CS_Pin, GPIO_PIN_SET); }
 
+/*
+ * W25Q128 硬件复位（正确序列）：
+ *   1. Reset Enable  (0x66) — 必须先发此命令才能接受 Reset
+ *   2. Reset         (0x99) — 触发芯片复位
+ * 复位后芯片需要 tPOR（最大 50ms）才能响应命令，
+ * 调用方在 reset 返回后负责延时。
+ *
+ * 注意：本函数内部不加 SPI2 锁，由调用方负责。
+ */
+static void flash_hw_reset(void)
+{
+    uint8_t cmd = 0x66;   // Reset Enable
+    flash_cs_low();
+    (void)HAL_SPI_Transmit(&hspi2, &cmd, 1, 100);
+    flash_cs_high();
+
+    cmd = 0x99;           // Reset
+    flash_cs_low();
+    (void)HAL_SPI_Transmit(&hspi2, &cmd, 1, 100);
+    flash_cs_high();
+}
+
 // 发一个命令字节
 static HAL_StatusTypeDef flash_send_cmd(uint8_t cmd)
 {
@@ -99,12 +121,30 @@ HAL_StatusTypeDef spi_flash_w25q128_init(void)
         if (g_m3_spi2_mutex == NULL) return HAL_ERROR;
     }
 
-    // 读 JEDEC ID，确认芯片在线且型号正确
-    uint32_t id = spi_flash_w25q128_read_id();
-    // W25Q128 的 JEDEC ID = 0xEF4018，只判断厂家字节 0xEF 即可
-    if ((id & 0x0000FF) != 0xEF)
-        return HAL_ERROR;
-    return HAL_OK;
+    /*
+     * W25Q128 上电后需要 tPOR（最大 50ms）内部启动。
+     * 在 Storage_Init 阶段 MCU 刚启动几毫秒，Flash 还没 ready。
+     * 策略：先等 20ms 让 Flash 至少完成部分上电，
+     *       再发正确的硬件复位序列，每次复位后等 60ms，
+     *       最多重试 5 次。
+     */
+    HAL_Delay(20);   // 首次上电等待
+
+    const int max_retry = 5;
+    for (int attempt = 0; attempt < max_retry; attempt++) {
+        flash_lock();
+        flash_hw_reset();
+        flash_unlock();
+
+        HAL_Delay(60);   // 复位后等待 tPOR + 余量
+
+        uint32_t id = spi_flash_w25q128_read_id();
+        // JEDEC ID: (Manufacturer<<16) | (Type<<8) | Capacity
+        // W25Q128: Manufacturer=0xEF, 只检查高字节即可
+        if (((id >> 16) & 0xFF) == 0xEF)
+            return HAL_OK;
+    }
+    return HAL_ERROR;
 }
 
 uint32_t spi_flash_w25q128_read_id(void)
