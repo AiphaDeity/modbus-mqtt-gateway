@@ -11,6 +11,7 @@
 #include "storage_seq.h"
 #include "flash_partition.h"
 #include "spi_flash_w25q128.h"
+#include "cmsis_os2.h"
 #include <string.h>
 
 #define SEQ_MAGIC   0x53455131U  /* "SEQ1" */
@@ -32,6 +33,37 @@ static uint64_t s_current       = 0;   /* 当前可分配序号 */
 static uint64_t s_window_end    = 0;   /* 当前窗口结束（不含） */
 static bool     s_inited        = false;
 static int      s_newer         = -1;  /* 高水位所在副本索引 */
+
+/*
+ * 序列号级互斥：底层 SPI 访问已有总线锁，但"窗口预留 → 擦写 → 回读"
+ * 是一组复合操作，且 s_current++ 是读改写。多个任务并发 alloc 会拿到
+ * 重复序号，或用旧高水位互相覆盖，因此这里再加一把独立的锁。
+ */
+static osMutexId_t s_seq_mutex = NULL;
+
+static bool seq_mutex_init(void)
+{
+    if (s_seq_mutex != NULL) return true;
+
+    const osMutexAttr_t attr = {
+        .name      = "m3_seq",
+        .attr_bits = osMutexPrioInherit,
+        .cb_mem    = NULL,
+        .cb_size   = 0,
+    };
+    s_seq_mutex = osMutexNew(&attr);
+    return s_seq_mutex != NULL;
+}
+
+static void seq_lock(void)
+{
+    if (s_seq_mutex != NULL) (void)osMutexAcquire(s_seq_mutex, osWaitForever);
+}
+
+static void seq_unlock(void)
+{
+    if (s_seq_mutex != NULL) (void)osMutexRelease(s_seq_mutex);
+}
 
 static uint32_t crc32_calc(const uint8_t *data, uint32_t len)
 {
@@ -73,8 +105,14 @@ static HAL_StatusTypeDef copy_write(int idx, uint64_t next_reserved)
 HAL_StatusTypeDef storage_seq_init(void)
 {
     seq_meta_t meta_a, meta_b;
-    bool ok_a = copy_read(0, &meta_a);
-    bool ok_b = copy_read(1, &meta_b);
+    bool ok_a, ok_b;
+
+    if (!seq_mutex_init()) return HAL_ERROR;
+
+    seq_lock();
+
+    ok_a = copy_read(0, &meta_a);
+    ok_b = copy_read(1, &meta_b);
 
     s_newer = -1;
     if (ok_a && ok_b) {
@@ -100,16 +138,24 @@ HAL_StatusTypeDef storage_seq_init(void)
     /* 空设备：把初始高水位落下，避免下一次写入时两份都为空 */
     if (s_newer < 0) {
         HAL_StatusTypeDef st = copy_write(0, SEQ_FIRST_VALUE);
-        if (st != HAL_OK) return st;
+        if (st != HAL_OK) {
+            seq_unlock();
+            return st;
+        }
         s_newer = 0;
     }
 
+    seq_unlock();
     return HAL_OK;
 }
 
 HAL_StatusTypeDef storage_seq_alloc(uint64_t *seq_out)
 {
+    HAL_StatusTypeDef st;
+
     if (seq_out == NULL || !s_inited) return HAL_ERROR;
+
+    seq_lock();
 
     /* 窗口用完，预留下一批 */
     if (s_current >= s_window_end) {
@@ -118,17 +164,22 @@ HAL_StatusTypeDef storage_seq_alloc(uint64_t *seq_out)
         /* 接近最大值则停止生成，不回绕 */
         if (new_reserved < s_next_reserved ||
             new_reserved > UINT64_MAX - SEQ_RESERVE_BATCH) {
+            seq_unlock();
             return HAL_ERROR;
         }
 
         /* 先持久化新高水位：覆盖较旧副本 */
         int target = (s_newer < 0) ? 0 : (1 - s_newer);
-        HAL_StatusTypeDef st = copy_write(target, new_reserved);
-        if (st != HAL_OK) return st;
+        st = copy_write(target, new_reserved);
+        if (st != HAL_OK) {
+            seq_unlock();
+            return st;
+        }
 
         /* 回读校验，失败则不发放新窗口内的号 */
         seq_meta_t verify;
         if (!copy_read(target, &verify) || verify.next_reserved != new_reserved) {
+            seq_unlock();
             return HAL_ERROR;
         }
 
@@ -138,6 +189,7 @@ HAL_StatusTypeDef storage_seq_alloc(uint64_t *seq_out)
     }
 
     *seq_out = s_current++;
+    seq_unlock();
     return HAL_OK;
 }
 

@@ -186,13 +186,22 @@ HAL_StatusTypeDef spi_flash_w25q128_sector_erase(uint32_t addr)
     flash_lock();
 
     flash_cs_low();
-    flash_send_cmd(0x06);                    // 写使能
+    st = flash_send_cmd(0x06);               // 写使能
     flash_cs_high();
+    if (st != HAL_OK) {
+        flash_unlock();
+        return st;
+    }
 
+    /*
+     * 命令 + 地址必须看返回值。HAL_SPI_Transmit 是阻塞式，
+     * 返回即代表发送完成，不要再补一次零长度传输——HAL 对 Size==0
+     * 直接返回 HAL_ERROR，会让整个擦除路径永远报失败。
+     */
     flash_cs_low();
-    flash_send_cmd(0x20);                    // 扇区擦除
-    flash_send_addr(addr);
-    st = HAL_SPI_Transmit(&hspi2, NULL, 0, 100);  // 命令已发完
+    st = flash_send_cmd(0x20);               // 扇区擦除
+    if (st == HAL_OK)
+        st = flash_send_addr(addr);
     flash_cs_high();
 
     if (st != HAL_OK) {
@@ -212,13 +221,17 @@ HAL_StatusTypeDef spi_flash_w25q128_block64_erase(uint32_t addr)
     flash_lock();
 
     flash_cs_low();
-    flash_send_cmd(0x06);                    // 写使能
+    st = flash_send_cmd(0x06);               // 写使能
     flash_cs_high();
+    if (st != HAL_OK) {
+        flash_unlock();
+        return st;
+    }
 
     flash_cs_low();
-    flash_send_cmd(0xD8);                    // 64KB 块擦除
-    flash_send_addr(addr);
-    st = HAL_SPI_Transmit(&hspi2, NULL, 0, 100);
+    st = flash_send_cmd(0xD8);               // 64KB 块擦除
+    if (st == HAL_OK)
+        st = flash_send_addr(addr);
     flash_cs_high();
 
     if (st != HAL_OK) {

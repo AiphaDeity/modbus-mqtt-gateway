@@ -110,13 +110,28 @@ void m3_selftest_run(void)
         }
     }
 
-    /* 5. 序列号高水位 */
+    /*
+     * 5. 序列号：高水位 + 实际分配一次。
+     *    首次 alloc 必然走"窗口用完 → 擦除+写入+回读校验"路径，
+     *    这条路径只读高水位测不到，必须真调一次才能暴露写失败。
+     */
     {
-        uint64_t wm = storage_seq_get_high_watermark();
+        uint64_t wm  = storage_seq_get_high_watermark();
+        uint64_t seq = 0;
+        HAL_StatusTypeDef st = storage_seq_alloc(&seq);
 
-        snprintf(detail, sizeof(detail), "high_watermark=%llu",
-                 (unsigned long long)wm);
-        judge(wm >= SEQ_FIRST_VALUE ? SELF_PASS : SELF_FAIL, "Seq", detail);
+        if (st == HAL_OK) {
+            snprintf(detail, sizeof(detail),
+                     "high_watermark=%llu alloc=%llu wm_after=%llu",
+                     (unsigned long long)wm, (unsigned long long)seq,
+                     (unsigned long long)storage_seq_get_high_watermark());
+            judge(seq >= wm ? SELF_PASS : SELF_FAIL, "Seq", detail);
+        } else {
+            snprintf(detail, sizeof(detail),
+                     "alloc_failed st=%d high_watermark=%llu",
+                     (int)st, (unsigned long long)wm);
+            judge(SELF_FAIL, "Seq", detail);
+        }
     }
 
     /* 6. 持久时间下界（0 表示尚无参考值，首次上电正常） */
