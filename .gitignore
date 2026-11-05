@@ -25,3 +25,5 @@ CMakeUserPresets.json
 *.map
 *.bin
 *.hex
+firmware/app/build/
+烧录.bat
