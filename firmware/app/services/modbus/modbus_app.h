@@ -138,6 +138,9 @@ typedef struct
     uint16_t reg_addr;           // 寄存器起始地址
     uint16_t valid_point;        // 有效数据长度
     uint16_t data[MB_REG_MAX_PER_SLAVE];  // 数据快照（拷贝而非指针）
+
+    uint32_t   last_collect_tick;          // 最后一次采集（成功或失败）的 tick
+    mb_errot_t collect_status;             // 最后一次采集结果（ERR_OK_QUERY 等）
 } mb_slave_snapshot_t;
 
 /**
@@ -189,7 +192,6 @@ typedef struct
     mb_cfg_change_cb_t  cfg_change_cb; // 配置变更回调（存储模块注册）
     void              *cfg_change_ctx; // 回调上下文指针
 
-    osSemaphoreId_t xNewFrameNotifySem;
     osMutexId_t xSlaveDataMutex;       // 数据缓存读写互斥（modbus写 / mqtt读快照）
     osMutexId_t xSlaveCfgMutex;         // 从站列表增删改互斥
 } mb_handle_t;

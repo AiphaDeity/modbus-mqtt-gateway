@@ -165,7 +165,6 @@ static void mb_poll_wait_ack(void)
             slave->fail_count = 0;
             slave->consecutive_fail = 0;
             slave->is_online = 1;
-            slave->collect_status = 1;
 
             mb_handle->state = MB_STATE_IDLE;
             mb_handle->waiting_slave = NULL;

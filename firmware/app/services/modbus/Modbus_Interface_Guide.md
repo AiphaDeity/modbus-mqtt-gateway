@@ -161,6 +161,9 @@ typedef struct
     uint16_t reg_addr;                      // 寄存器起始地址
     uint16_t valid_point;                   // 有效长度
     uint16_t data[MB_REG_MAX_PER_SLAVE];    // 原始寄存器拷贝
+
+    uint32_t   last_collect_tick;           // 最后一次采集（成功或失败）的 tick
+    mb_errot_t collect_status;              // 最后一次采集结果（ERR_OK_QUERY 等）
 } mb_slave_snapshot_t;
 ```
 

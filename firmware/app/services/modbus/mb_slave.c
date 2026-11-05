@@ -38,9 +38,6 @@ mb_status_e mb_handle_init(void)
     }
     memset(mb_handle->slave_list, 0, sizeof(mb_slave_runtime_t) * mb_handle->slave_max_num);
 
-    mb_handle->xNewFrameNotifySem = osSemaphoreNew(1, 0, NULL);
-    if (mb_handle->xNewFrameNotifySem == NULL) goto fail;
-
     mb_handle->xSlaveDataMutex = osMutexNew(NULL);
     if (mb_handle->xSlaveDataMutex == NULL) goto fail;
 
