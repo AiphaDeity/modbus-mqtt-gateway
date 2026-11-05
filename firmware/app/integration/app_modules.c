@@ -7,10 +7,10 @@
 #include "task.h"
 #include "cmsis_os2.h"
 #include "main.h"
+#include "storage.h"
+#include "mqtt_client.h"
 
-
-
-#define STORAGE_STACK_SIZE_BYTES (4U * 1024U)
+#define STORAGE_STACK_SIZE_BYTES (8U * 1024U)  /* FatFs + storage_record 至少 6KiB，留余量到 8KiB */
 #define CONFIG_STACK_SIZE_BYTES  (4U * 1024U)
 #define MODBUS_STACK_SIZE_BYTES  (2U * 1024U)
 #define MQTT_STACK_SIZE_BYTES    (4U * 1024U)
@@ -110,7 +110,7 @@ static AppModuleSlot module_slots[APP_MODULE_COUNT] =
 {
   [APP_MODULE_STORAGE] =
   {
-    .init = NULL, .task = NULL, .attributes = &storage_attributes,
+    .init = Storage_Init, .task = Storage_Task, .attributes = &storage_attributes,
     .result = APP_MODULE_INIT_NOT_READY, .task_state = APP_MODULE_TASK_NOT_STARTED
   },
   [APP_MODULE_CONFIG] =
@@ -125,7 +125,7 @@ static AppModuleSlot module_slots[APP_MODULE_COUNT] =
   },
   [APP_MODULE_MQTT] =
   {
-    .init = NULL, .task = NULL, .attributes = &mqtt_attributes,
+    .init = NULL/*MqttClient_Init*/, .task = NULL/*MqttClient_Task*/, .attributes = &mqtt_attributes,
     .result = APP_MODULE_INIT_NOT_READY, .task_state = APP_MODULE_TASK_NOT_STARTED
   },
   [APP_MODULE_MONITOR] =

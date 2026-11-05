@@ -68,7 +68,9 @@
 #define configTICK_RATE_HZ                       ((TickType_t)1000)
 #define configMAX_PRIORITIES                     ( 56 )
 #define configMINIMAL_STACK_SIZE                 ((uint16_t)128)
-#define configTOTAL_HEAP_SIZE                    ((size_t)15360)
+/* 20KB：M3 的 M2↔M3 值传递队列（写 8×536B + 应答 1×~4.4KB ≈ 9KB），
+ * 合并 M2 的 LwIP 后 SRAM 已满，留 ~11KB 余量并让出 4KB 给静态区 */
+#define configTOTAL_HEAP_SIZE                    ((size_t)20480)
 #define configMAX_TASK_NAME_LEN                  ( 16 )
 #define configUSE_TRACE_FACILITY                 1
 #define configUSE_16_BIT_TICKS                   0
@@ -153,7 +155,10 @@ See http://www.FreeRTOS.org/RTOS-Cortex-M3-M4.html. */
 /* Normal assert() semantics without relying on the provision of an assert.h
 header file. */
 /* USER CODE BEGIN 1 */
-#define configASSERT( x ) if ((x) == 0) {taskDISABLE_INTERRUPTS(); for( ;; );}
+/* ★排障改造：原来断言失败只是关中断死循环，完全看不出是哪个断言；
+   现在改调 vAssertCalled（实现在 freertos.c 里 printf 出文件名和行号） */
+void vAssertCalled(const char *pcFile, unsigned long ulLine);
+#define configASSERT( x ) if ((x) == 0) { vAssertCalled(__FILE__, __LINE__); }
 /* USER CODE END 1 */
 
 /* Definitions that map the FreeRTOS port interrupt handlers to their CMSIS
@@ -163,6 +168,13 @@ standard names. */
 
 /* IMPORTANT: After 10.3.1 update, Systick_Handler comes from NVIC (if SYS timebase = systick), otherwise from cmsis_os2.c */
 
+/* 本工程时基分工（★不要乱改）：
+   - HAL 时基 = TIM6（stm32f4xx_hal_timebase_tim.c），TIM6 中断里喂 HAL_IncTick()
+   - FreeRTOS 心跳 = SysTick，由 cmsis_os2.c 的默认 SysTick_Handler 喂 xPortSysTickHandler()
+   两者互不干扰，所以这里必须保持 0。
+   若改成 1 再由 stm32f4xx_it.c 自己写 SysTick_Handler 并调 HAL_IncTick()，
+   uwTick 会被 TIM6 + SysTick 双份递增，所有 HAL 超时失真。
+   （历史教训见 LWIP_PING排障记录_修正版.md） */
 #define USE_CUSTOM_SYSTICK_HANDLER_IMPLEMENTATION 0
 
 /* USER CODE BEGIN Defines */

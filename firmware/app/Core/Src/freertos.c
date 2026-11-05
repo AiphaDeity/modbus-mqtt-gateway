@@ -26,6 +26,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "app_entry.h"
+#include <stdio.h>      /* ★排障用：hook 里直接 printf 报线索 */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -78,7 +79,8 @@ void vApplicationMallocFailedHook(void);
 void vApplicationStackOverflowHook(xTaskHandle xTask, signed char *pcTaskName)
 {
   (void)xTask;
-  (void)pcTaskName;
+  /* ★排障：先打印是哪个任务爆栈，再进 Error_Handler（原来的实现直接进死循环，啥也看不到） */
+  printf("\r\n[HOOK] STACK OVERFLOW task=%s\r\n", (pcTaskName != NULL) ? (char *)pcTaskName : "?");
   Error_Handler();
    /* Run time stack overflow checking is performed if
    configCHECK_FOR_STACK_OVERFLOW is defined to 1 or 2. This hook function is
@@ -89,6 +91,8 @@ void vApplicationStackOverflowHook(xTaskHandle xTask, signed char *pcTaskName)
 /* USER CODE BEGIN 5 */
 void vApplicationMallocFailedHook(void)
 {
+  /* ★排障：打印剩余堆大小（15KB 的 heap 一旦耗尽就会走到这里） */
+  printf("\r\n[HOOK] MALLOC FAILED freeHeap=%u\r\n", (unsigned)xPortGetFreeHeapSize());
   Error_Handler();
    /* vApplicationMallocFailedHook() will only be called if
    configUSE_MALLOC_FAILED_HOOK is set to 1 in FreeRTOSConfig.h. It is a hook
@@ -102,6 +106,17 @@ void vApplicationMallocFailedHook(void)
    provide information on how the remaining heap might be fragmented). */
 }
 /* USER CODE END 5 */
+
+/* ★排障用：configASSERT 失败时被调用（FreeRTOSConfig.h 里改成调这个），
+   把断言所在的源文件和行号打印出来，避免"一黑到底"看不出问题 */
+void vAssertCalled(const char *pcFile, unsigned long ulLine)
+{
+  __disable_irq();
+  printf("\r\n[ASSERT] %s:%lu\r\n", pcFile, ulLine);
+  for (;;)
+  {
+  }
+}
 
 /**
   * @brief  FreeRTOS initialization

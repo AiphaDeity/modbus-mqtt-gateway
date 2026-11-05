@@ -46,16 +46,21 @@ void MX_SDIO_SD_Init(void)
   hsd.Init.BusWide = SDIO_BUS_WIDE_1B;
   hsd.Init.HardwareFlowControl = SDIO_HARDWARE_FLOW_CONTROL_DISABLE;
   hsd.Init.ClockDiv = 0;
+  /* USER CODE BEGIN SDIO_Init 2 */
+  /*
+   * CubeMX 对 SDIO 生成的 init 函数只填 Init 结构体，
+   * 不会自动调用 HAL_SD_Init()（这一点跟 SPI/I2C 不同）。
+   * 必须显式调一次 HAL_SD_Init 才能触发 MspInit（GPIO/DMA/IRQ）
+   * 并使能 SDIO 外设。
+   *
+   * 关于 BusWide：先固定在 1-bit 模式（PC8-DAT0 + PD2-CMD + PC12-CK）。
+   * 如果后续验证 DAT1~DAT3（PC9~PC11）真的接了硬件并工作稳定，
+   * 再切到 SDIO_BUS_WIDE_4B 提升性能。
+   */
   if (HAL_SD_Init(&hsd) != HAL_OK)
   {
     Error_Handler();
   }
-  if (HAL_SD_ConfigWideBusOperation(&hsd, SDIO_BUS_WIDE_4B) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN SDIO_Init 2 */
-
   /* USER CODE END SDIO_Init 2 */
 
 }

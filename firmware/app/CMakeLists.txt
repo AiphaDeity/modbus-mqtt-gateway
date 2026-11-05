@@ -36,15 +36,16 @@ add_executable(${CMAKE_PROJECT_NAME})
 
 # Add STM32CubeMX generated sources
 add_subdirectory(cmake/stm32cubemx)
+add_subdirectory(Middlewares/LwIP)
+add_subdirectory(bsp)
+add_subdirectory(integration)
+add_subdirectory(services/modbus)
+add_subdirectory(services/storage)
+
 # Configure the application vector table offset.
 set(GATEWAY_APP_VECTOR_OFFSET "0x00000000" CACHE STRING "Application vector table offset")
 
 target_compile_definitions(STM32_Drivers PRIVATE USER_VECT_TAB_ADDRESS VECT_TAB_OFFSET=${GATEWAY_APP_VECTOR_OFFSET})
-
-add_subdirectory(integration)
-add_subdirectory(bsp)
-add_subdirectory(services/modbus)
-
 
 
 # Link directories setup
@@ -60,6 +61,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined include paths
+    ${CMAKE_CURRENT_LIST_DIR}/common
 )
 
 # Add project symbols (macros)
@@ -73,6 +75,17 @@ list(REMOVE_ITEM CMAKE_C_IMPLICIT_LINK_LIBRARIES ob)
 # Add linked libraries
 target_link_libraries(${CMAKE_PROJECT_NAME}
     stm32cubemx
+    lwip
+    m2_ethernet
 
     # Add user defined libraries
+    modbus
+)
+
+
+# ========== POST_BUILD：编译elf成功之后自动执行的命令 ==========
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_OBJCOPY} -O ihex $<TARGET_FILE:${PROJECT_NAME}> ${PROJECT_NAME}.hex   # elf转hex
+    COMMAND ${CMAKE_OBJCOPY} -O binary $<TARGET_FILE:${PROJECT_NAME}> ${PROJECT_NAME}.bin # elf转bin
+    COMMAND ${CMAKE_SIZE} $<TARGET_FILE:${PROJECT_NAME}>  # 打印Flash、RAM占用大小
 )
