@@ -84,9 +84,9 @@ extern ETH_TxPacketConfig TxConfig;                  /* Tx 包公共配置（Att
 #define IFNAME0 's'
 #define IFNAME1 't'
 
-/* 零拷贝 Rx 池的缓冲个数：必须 ≥ DMA Rx 描述符数（ETH_RX_DESC_CNT=4），
-   否则 DMA 收满一轮后没有新缓冲可填。给 10 个留余量 */
-#define ETH_RX_BUFFER_CNT           10
+/* 零拷贝 Rx 池的缓冲个数：必须 ≥ DMA Rx 描述符数（ETH_RX_DESC_CNT=4）。
+   原 10 个是例程给 Web 服务器留的，我们单 MQTT 连接 6 个够（省 4×1568≈6KB） */
+#define ETH_RX_BUFFER_CNT           6
 
 /* ★以太网最小帧长补齐（60 字节 = 14 帧头 + 46 负载，FCS 由 MAC 另加 4 字节 → 线上 64 字节）
    lwIP 发的 ARP 应答/请求只有 42 字节（14 头 + 28 ARP），短于以太网最小帧长 64。
