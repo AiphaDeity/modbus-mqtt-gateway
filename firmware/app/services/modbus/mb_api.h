@@ -1,5 +1,5 @@
-#ifndef __MODBUS_APP_H__
-#define __MODBUS_APP_H__
+#ifndef __MB_API_H__
+#define __MB_API_H__
 #include <stdint.h>
 #include "modbus.h"
 #include "mb_pointmap.h"
@@ -58,9 +58,10 @@ typedef struct mb_slave_runtime mb_slave_runtime_t;
 typedef enum
 {
     MB_CFG_CHANGE_ADD     = 0,   // 新增从站
-    MB_CFG_CHANGE_UPDATE  = 1,   // 更新已有从站配置（ID 重复时）
+    MB_CFG_CHANGE_UPDATE  = 1,   // 更新已有从站配置 / 从站点位表变更
     MB_CFG_CHANGE_DELETE  = 2,   // 删除从站
-    MB_CFG_CHANGE_RELOAD  = 3,   // 批量重载（上电时调用 mb_handle_init + 逐个 add 之前）
+    MB_CFG_CHANGE_RELOAD  = 3,   // 批量重载完成（上电时 mb_config_batch_end 触发）
+    MB_CFG_CHANGE_GLOBAL  = 4,   // 全局配置变更（上报模式、重载通知等，slave_id=0）
 } mb_cfg_change_reason_t;
 
 /**
@@ -99,8 +100,18 @@ typedef enum
     MB_BUILD_REQUEST_ERR,   // 构建请求帧失败
     MB_SEND_REQUEST_ERR,   // 发送请求帧发送失败
     MB_QUEUE_FULL_ERR,     // 外部写请求队列满
-    MB_NOT_SUPPORT_FC_ERR, // 不支持的功能码（只接受 FC6/FC16）
+    MB_NOT_SUPPORT_FC_ERR, // 不支持的功能码
+    MB_WAIT_TIMEOUT_ERR,  // 同步等待写结果超时
 } mb_status_e;
+
+/**
+ * @brief 统一配置操作类型（mb_apply_slave_config 使用）
+ */
+typedef enum
+{
+    MB_CFG_OP_UPSERT = 0,   // 新增或更新从站：cfg 必填；points 可选（NULL = 不动点位表）
+    MB_CFG_OP_DELETE = 1,   // 删除从站：cfg / points 均忽略（点位表随之失效）
+} mb_cfg_op_t;
 
 /**
  * @brief 外部写请求消息体
@@ -133,10 +144,11 @@ typedef struct
 typedef struct
 {
     uint8_t  slave_id;           // 从站地址
+    uint8_t  func_code;          // 功能码（FC01/02=data[] 为线圈打包字；FC03/04=寄存器值）
     uint8_t  is_online;          // 在线状态（poll 成功置 1，超时置 0）
     uint8_t  data_valid;         // 数据新鲜度（1=本次周期 poll 成功；0=无新数据）
     uint16_t reg_addr;           // 寄存器起始地址
-    uint16_t valid_point;        // 有效数据长度
+    uint16_t valid_point;        // 有效长度（FC01/02=打包字数 ceil(N/16)；FC03/04=寄存器数 N）
     uint16_t data[MB_REG_MAX_PER_SLAVE];  // 数据快照（拷贝而非指针）
 
     uint32_t   last_collect_tick;          // 最后一次采集（成功或失败）的 tick
@@ -194,6 +206,8 @@ typedef struct
 
     osMutexId_t xSlaveDataMutex;       // 数据缓存读写互斥（modbus写 / mqtt读快照）
     osMutexId_t xSlaveCfgMutex;         // 从站列表增删改互斥
+
+    uint8_t cb_suppress;               // 非 0 = 抑制配置回调（统一接口内部合并多次变更为一次）
 } mb_handle_t;
 
 
@@ -206,6 +220,28 @@ mb_status_e mb_poll_slave(void);
 mb_status_e mb_add_slave(modbus_t *cfg);
 mb_slave_runtime_t* mb_get_slave_runtime(uint8_t slave_id);
 mb_status_e mb_delete_slave(uint8_t slave_id);
+
+/**
+ * @brief 统一配置入口（MQTT / Web 平台下发推荐用这一个）
+ *
+ *  MQTT 解析完 JSON 后只调这一个函数，内部自动分派：
+ *    - UPSERT：cfg 非 NULL → mb_add_slave；points 非 NULL → mb_pointmap_set_slave_points
+ *              两个都传 = 新增节点 + 点位表一步完成
+ *              只传 points = 仅更新点位表（从站必须已存在）
+ *    - DELETE：按 slave_id 删除从站（点位表随之失效）
+ *
+ *  多次变更合并为一次 cfg_change_cb 回调，存储方只写一次 Flash。
+ *
+ * @param op       MB_CFG_OP_UPSERT / MB_CFG_OP_DELETE
+ * @param slave_id 目标从站地址（UPSERT 时强制覆盖 cfg->u8id，防呆）
+ * @param cfg      从站协议配置；DELETE 或仅改点位表时传 NULL
+ * @param points   点位表（整表 32 项，空位 valid=0）；不改点位时传 NULL
+ * @return MB_STATUS_OK 成功；MB_SLAVE_NOT_FOUND_ERR 从站不存在；MB_BUILD_REQUEST_ERR 参数非法
+ */
+mb_status_e mb_apply_slave_config(mb_cfg_op_t op,
+                                  uint8_t slave_id,
+                                  const modbus_t *cfg,
+                                  const mb_point_t *points);
 
 /**
  * @brief 获取 Modbus 模块总句柄（用于 MQTT 遍历从站列表、Flash 持久化等外部模块）
@@ -225,22 +261,27 @@ mb_handle_t* mb_handle_get(void);
 void mb_set_config_change_cb(mb_cfg_change_cb_t cb, void *ctx);
 
 /**
- * @brief 外部注入写请求（FC6 或 FC16）
+ * @brief 外部注入写请求（FC5 / FC6 / FC15 / FC16）
  *
  *  由 MQTT 任务/配置管理任务调用，请求会投入队列，
  *  poll 任务在 IDLE 状态优先取出，用 ModbusQueryInject 头插发送。
  *
  * @param slave_id       目标从站 (1~247)
  * @param func_code      MB_FC_WRITE_REGISTER(6) / MB_FC_WRITE_MULTIPLE_REGISTERS(16)
- * @param reg_addr       起始寄存器地址
- * @param reg_count      FC6 固定传 1；FC16 传写入数量 (≤ MB_REG_MAX_PER_SLAVE)
+ *                       MB_FC_WRITE_COIL(5) / MB_FC_WRITE_MULTIPLE_COILS(15)
+ *                       线圈写时 write_values 传 0/1（FC15 内部打包为 bit 字）
+ * @param reg_addr       起始寄存器/线圈地址（协议地址，直达从站）
+ * @param reg_count      FC5/FC6 强制为 1；FC15/FC16 传写入数量 (≤ MB_REG_MAX_PER_SLAVE)
  * @param write_values   要写入的值数组（直接拷贝，无指针生命周期问题）
  * @param result_sem     可选：调用者传入信号量，写完成后 poll 任务 release，
  *                       调用者用 osSemaphoreAcquire 同步等待结果；
  *                       传 NULL 表示异步，不通知
  * @param result_err_out 可选：调用者传入 mb_errot_t*，写完成后填入结果，
  *                       配合 result_sem 使用；传 NULL 忽略
- * @return MB_STATUS_OK 成功投递；MB_QUEUE_FULL_ERR 队列满；MB_NOT_SUPPORT_FC_ERR 功能码不支持
+ * @param result_timeout_ms  同步等待超时（ms），仅当 result_sem != NULL 时生效；
+ *                           传 0 = 永久等待（兼容旧行为）；建议传 2000~5000
+ * @return MB_STATUS_OK 成功投递；MB_QUEUE_FULL_ERR 队列满；
+ *         MB_NOT_SUPPORT_FC_ERR 功能码不支持；MB_WAIT_TIMEOUT_ERR 同步等待超时
  */
 mb_status_e mb_inject_write(uint8_t slave_id,
                             uint8_t func_code,
@@ -248,7 +289,8 @@ mb_status_e mb_inject_write(uint8_t slave_id,
                             uint16_t reg_count,
                             const uint16_t *write_values,
                             osSemaphoreId_t result_sem,
-                            mb_errot_t *result_err_out);
+                            mb_errot_t *result_err_out,
+                            uint32_t result_timeout_ms);
 
 /* ============= MQTT 方 / 存储方 统一接口 ============= */
 
@@ -283,6 +325,20 @@ mb_status_e mb_take_slave_snapshot(uint8_t slave_id, mb_slave_snapshot_t *snap_o
  *  本函数会触发一次 MB_CFG_CHANGE_RELOAD 回调，让存储方完成最后的收尾（如 CRC 校验）。
  */
 void mb_notify_reload_complete(void);
+
+/**
+ * @brief 批量配置开始（上电加载 / 平台批量下发时使用）
+ *
+ *  调用后所有 mb_apply_slave_config / mb_add_slave 等触发的回调被抑制，
+ *  直到 mb_config_batch_end() 才统一触发一次 MB_CFG_CHANGE_RELOAD。
+ *  N 个从站上电加载：0 次 ADD 回调 + 1 次 RELOAD 回调。
+ */
+void mb_config_batch_begin(void);
+
+/**
+ * @brief 批量配置结束：解除抑制并触发一次 RELOAD 回调
+ */
+void mb_config_batch_end(void);
 
 
 #endif

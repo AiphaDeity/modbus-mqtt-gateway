@@ -158,7 +158,24 @@ static void mb_poll_wait_ack(void)
             MB_LOGI("read ok: slave=%d, reg0=%d", slave->telegram.u8id, slave->telegram.u16reg[0]);
 
             osMutexAcquire(mb_handle->xSlaveDataMutex, osWaitForever);
-            slave->valid_point = slave->telegram.u16CoilsNo;
+            // FC01/02 读线圈/离散输入：N 个 bit 打包成 ceil(N/16) 个 uint16
+            // FC03/04 读寄存器：N 个寄存器 = N 个 uint16
+            if (slave->telegram.u8fct == MB_FC_READ_COILS ||
+                slave->telegram.u8fct == MB_FC_READ_DISCRETE_INPUT)
+            {
+                slave->valid_point = (slave->telegram.u16CoilsNo + 15U) / 16U;
+                // get_FC1 按字节填充，N%16!=0 时最后一个打包字的高位是上轮残留，掩码清掉
+                uint8_t rem = (uint8_t)(slave->telegram.u16CoilsNo % 16U);
+                if (rem != 0U)
+                {
+                    slave->reg_data_buf[slave->valid_point - 1U] &=
+                        (uint16_t)((1U << rem) - 1U);
+                }
+            }
+            else
+            {
+                slave->valid_point = slave->telegram.u16CoilsNo;
+            }
             slave->data_valid = 1;
             osMutexRelease(mb_handle->xSlaveDataMutex);
 
