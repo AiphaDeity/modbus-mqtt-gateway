@@ -51,14 +51,14 @@ static int on_slave_telemetry(mb_slave_runtime_t *slave, void *ctx)
     /* 1) 让 M1 把 raw reg 解析成物理量（名称/单位/已乘缩放）。
      *    buf 和 pts 都用 static：只有 telemetry 一个任务调本函数，
      *    但栈上放 512B+ 缓冲会爆栈（snprintf %f 内部还要几百字节）。 */
-    static mb_parsed_point_t pts[MB_POINTS_PER_SLAVE];
+    static mb_parsed_point_t pts[MB_POINTS_PER_SLAVE] __attribute__((section(".ccmram")));
     int npts = mb_pointmap_parse_slave(slave->telegram.u8id, pts);
     if (npts <= 0) return 0;   /* 没配点位表，跳过 */
 
     /* 2) 拼 JSON。示例：
      * {"g":"mb2mqtt_001","slave":1,"online":1,"pts":[{"n":"temp","v":25.3,"u":"C"},...]}
      */
-    static char buf[PAYLOAD_MAX];
+    static char buf[PAYLOAD_MAX] __attribute__((section(".ccmram")));
     int n = snprintf(buf, sizeof(buf),
         "{\"g\":\"mb2mqtt_001\",\"slave\":%u,\"online\":%u,\"pts\":[",
         slave->telegram.u8id, slave->is_online);

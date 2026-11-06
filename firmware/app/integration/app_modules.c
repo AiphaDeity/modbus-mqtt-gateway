@@ -42,12 +42,14 @@ typedef struct
  * DMA 缓冲仍须满足对应外设的长度、对齐和生命周期要求。
  * 栈按 Cortex-M4 FreeRTOS 端口要求对齐到 8 字节。
  */
-_Alignas(8) static StackType_t storage_stack[STORAGE_STACK_SIZE_BYTES / sizeof(StackType_t)];
-_Alignas(8) static StackType_t config_stack[CONFIG_STACK_SIZE_BYTES / sizeof(StackType_t)];
-_Alignas(8) static StackType_t modbus_stack[MODBUS_STACK_SIZE_BYTES / sizeof(StackType_t)];
-_Alignas(8) static StackType_t mqtt_stack[MQTT_STACK_SIZE_BYTES / sizeof(StackType_t)];
-_Alignas(8) static StackType_t telemetry_stack[TELEMETRY_STACK_SIZE_BYTES / sizeof(StackType_t)];
-_Alignas(8) static StackType_t monitor_stack[MONITOR_STACK_SIZE_BYTES / sizeof(StackType_t)];
+/* 任务栈全部挪到 CCMRAM：栈是 CPU 独占访问（中断切换/函数调用），不被任何 DMA 碰。
+ * 64KB CCMRAM 现在 0 占用，正好装下全部 ~15.5KB 栈，给普通 SRAM 腾地方。 */
+_Alignas(8) static StackType_t storage_stack[STORAGE_STACK_SIZE_BYTES / sizeof(StackType_t)]  __attribute__((section(".ccmram")));
+_Alignas(8) static StackType_t config_stack[CONFIG_STACK_SIZE_BYTES / sizeof(StackType_t)]  __attribute__((section(".ccmram")));
+_Alignas(8) static StackType_t modbus_stack[MODBUS_STACK_SIZE_BYTES / sizeof(StackType_t)]  __attribute__((section(".ccmram")));
+_Alignas(8) static StackType_t mqtt_stack[MQTT_STACK_SIZE_BYTES / sizeof(StackType_t)]  __attribute__((section(".ccmram")));
+_Alignas(8) static StackType_t telemetry_stack[TELEMETRY_STACK_SIZE_BYTES / sizeof(StackType_t)]  __attribute__((section(".ccmram")));
+_Alignas(8) static StackType_t monitor_stack[MONITOR_STACK_SIZE_BYTES / sizeof(StackType_t)]  __attribute__((section(".ccmram")));
 
 static StaticTask_t storage_control_block;
 static StaticTask_t config_control_block;

@@ -42,9 +42,10 @@
 #define MQTT_CMD_TOPIC    "mb2mqtt_001/cmd"
 
 /* 收发缓冲：放静态区，不占 4KB 任务栈。
- * tx_buf 要装 topic(≈20B) + payload(≤512B) + MQTT 头，给 640B */
-static uint8_t tx_buf[640];
-static uint8_t rx_buf[64];
+ * tx_buf 要装 topic(≈20B) + payload(≤512B) + MQTT 头，给 640B
+ * 挪到 CCMRAM（纯 CPU 暂存，netconn_write 会 memcpy 走，本身不被 DMA 碰） */
+static uint8_t tx_buf[640] __attribute__((section(".ccmram")));
+static uint8_t rx_buf[64]  __attribute__((section(".ccmram")));
 
 /* 连接状态 + 发送互斥锁：telemetry/replay 任务可并发调 MqttClient_Publish */
 static struct netconn *g_conn;          /* NULL=未连接 */
