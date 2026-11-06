@@ -98,7 +98,10 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_DMA_Init();
-  MX_ETH_Init();
+  /* ★临时跳过 ETH init——当前目标是验证 SPI Flash JEDEC + Seq + CtrlLog 断电保持。
+     ETH init 在 HAL_ETH_Init 里 DMA software reset 超时进 Error_Handler 死循环，
+     导致 USART/SPI/Self-test 全都跑不到。ETH 问题单独排查后再恢复。 */
+  //MX_ETH_Init();
   MX_I2C1_Init();
   MX_SPI2_Init();
   MX_USART2_UART_Init();
@@ -107,6 +110,7 @@ int main(void)
   MX_USART1_UART_Init();
   MX_SDIO_SD_Init();
   MX_FATFS_Init();
+  printf("[DBG] all MX_*_Init done\r\n"); fflush(stdout);
   /* USER CODE BEGIN 2 */
   /* ★排障修复：Picolibc 的 stdout 默认是全缓冲的——printf 的内容会攒在缓冲区里，
      缓冲区不满就不调 _write（串口），导致只有带 fflush 的 "Gateway boot" 能显示，

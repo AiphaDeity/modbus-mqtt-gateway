@@ -68,9 +68,10 @@
 #define configTICK_RATE_HZ                       ((TickType_t)1000)
 #define configMAX_PRIORITIES                     ( 56 )
 #define configMINIMAL_STACK_SIZE                 ((uint16_t)128)
-/* 20KB：M3 的 M2↔M3 值传递队列（写 8×536B + 应答 1×~4.4KB ≈ 9KB），
- * 合并 M2 的 LwIP 后 SRAM 已满，留 ~11KB 余量并让出 4KB 给静态区 */
-#define configTOTAL_HEAP_SIZE                    ((size_t)20480)
+/* 16KB：LwIP MEM_SIZE 砍到 12KB 后，heap 从 12KB 涨回 16KB。
+ * 两者此消彼长，.bss 总量不变。16KB 够 ModbusInit + 3 个 mutex +
+ * FreeRTOS timer daemon + 后续可能的 MQTT 资源。 */
+#define configTOTAL_HEAP_SIZE                    ((size_t)16384)
 #define configMAX_TASK_NAME_LEN                  ( 16 )
 #define configUSE_TRACE_FACILITY                 1
 #define configUSE_16_BIT_TICKS                   0

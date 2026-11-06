@@ -3,6 +3,7 @@
 #if M3_SELFTEST_ENABLE
 
 #include <stdio.h>
+#include <string.h>
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -41,6 +42,16 @@ static void ctrllog_count_cb(const ctrllog_record_t *rec, void *user)
 {
     (void)rec;
     (*(uint32_t *)user)++;
+}
+
+/* 统计带固定测试 payload 的记录数（断电保持验证用） */
+#define CTRLLOG_TEST_PAYLOAD  "CTLG_SELFTEST_v1"
+static void ctrllog_test_count_cb(const ctrllog_record_t *rec, void *user)
+{
+    const char *p = CTRLLOG_TEST_PAYLOAD;
+    size_t plen = strlen(p);
+    if (rec->payload_len == plen && memcmp(rec->payload, p, plen) == 0)
+        (*(uint32_t *)user)++;
 }
 
 void m3_selftest_run(void)
@@ -144,14 +155,59 @@ void m3_selftest_run(void)
         judge(floor_v == 0 ? SELF_WARN : SELF_PASS, "TimeFloor", detail);
     }
 
-    /* 7. 控制日志：遍历双区统计可读记录数 */
+    /*
+     * 7. 控制日志：真实写入一次 + 断电保持验证。
+     *    用固定 payload 标记测试记录，dedup_key 用当前 boot 分配到的
+     *    seq（每次 boot 唯一，避免被去重跳过）。
+     *
+     *    before  = 本轮写入前已有的测试记录数
+     *    after   = 本轮写完后的测试记录数
+     *      after == before + 1  → 本轮写入 OK
+     *      before >= 1          → 上一轮 boot 写的记录重启后仍在 → 断电保持 OK
+     */
     {
-        uint32_t n = 0;
-        HAL_StatusTypeDef st = storage_ctrllog_foreach(ctrllog_count_cb, &n);
+        uint32_t before = 0, after = 0;
 
-        snprintf(detail, sizeof(detail), "records=%lu scan=%s",
-                 (unsigned long)n, (st == HAL_OK) ? "ok" : "err");
-        judge(st == HAL_OK ? SELF_PASS : SELF_FAIL, "CtrlLog", detail);
+        storage_ctrllog_foreach(ctrllog_test_count_cb, &before);
+
+        uint64_t my_seq = 0;
+        if (storage_seq_alloc(&my_seq) != HAL_OK) {
+            snprintf(detail, sizeof(detail), "alloc_seq_failed high_wm=%llu",
+                     (unsigned long long)storage_seq_get_high_watermark());
+            judge(SELF_FAIL, "CtrlLog", detail);
+        } else {
+            bool dup = false;
+            HAL_StatusTypeDef st = storage_ctrllog_append(
+                CTRLLOG_STREAM_GENERIC, my_seq,
+                CTRLLOG_TEST_PAYLOAD, strlen(CTRLLOG_TEST_PAYLOAD),
+                &dup);
+
+            storage_ctrllog_foreach(ctrllog_test_count_cb, &after);
+
+            uint32_t total = 0;
+            storage_ctrllog_foreach(ctrllog_count_cb, &total);
+
+            int level;
+            const char *ret_str;
+            if (st == HAL_OK && after == before + 1) {
+                if (before >= 1) {
+                    ret_str = "OK";              /* 上轮 boot 的记录重启后仍在 */
+                    level = SELF_PASS;
+                } else {
+                    ret_str = "write+verify";    /* 首次 boot，写入路径 OK */
+                    level = SELF_PASS;
+                }
+            } else {
+                ret_str = (st == HAL_OK) ? "lost_after_write" : "write_failed";
+                level = SELF_FAIL;
+            }
+
+            snprintf(detail, sizeof(detail),
+                     "before=%lu after=%lu retention=%s total=%lu dup=%d",
+                     (unsigned long)before, (unsigned long)after,
+                     ret_str, (unsigned long)total, dup ? 1 : 0);
+            judge(level, "CtrlLog", detail);
+        }
     }
 
     /* 8. 就绪位快照，与 App 的判定口径对齐 */

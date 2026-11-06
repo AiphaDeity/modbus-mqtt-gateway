@@ -49,10 +49,11 @@
    否则 DMA 和协议栈读写可能出问题 */
 #define MEM_ALIGNMENT               4
 
-/* ★协议栈堆内存大小：16KB
+/* ★协议栈堆内存大小：12KB
    lwip 的动态分配（mem_malloc）都从这块堆走，TCP 发送缓冲等大块内存也在这。
-   例程原值 16KB（F407 够跑 TCP/UDP/DHCP），不够时看编译期 LWIP_MEM 统计再加 */
-#define MEM_SIZE                    (16*1024)
+   跟 FreeRTOS heap 此消彼长：MEM_SIZE 砍 4KB → configTOTAL_HEAP_SIZE 涨 4KB，
+   .bss 总量不变。MQTT 客户端 TCP 发送缓冲走 FreeRTOS heap，lwip 这边够 DHCP/UDP/TCPIP mailbox 就行 */
+#define MEM_SIZE                    (12*1024)
 
 /* 内存池数量（MEMP_NUM_xxx = 每种对象预分配的个数，编译期固定）：
    例程原值，对应 F407 上"同时 4 个 TCP + 2 个监听 + 20 个收包缓冲"的典型用量 */

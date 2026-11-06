@@ -20,6 +20,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "eth.h"
 #include "string.h"
+#include <stdio.h>
 
 ETH_DMADescTypeDef  DMARxDscrTab[ETH_RX_DESC_CNT]; /* Ethernet Rx DMA Descriptors */
 ETH_DMADescTypeDef  DMATxDscrTab[ETH_TX_DESC_CNT]; /* Ethernet Tx DMA Descriptors */
@@ -64,8 +65,13 @@ void MX_ETH_Init(void)
 
   if (HAL_ETH_Init(&heth) != HAL_OK)
   {
+    printf("[ETH] HAL_ETH_Init FAILED error=0x%08lX gState=%u\r\n",
+           (unsigned long)heth.ErrorCode, (unsigned)heth.gState);
+    fflush(stdout);
     Error_Handler();
   }
+  printf("[ETH] HAL_ETH_Init OK gState=%u\r\n", (unsigned)heth.gState);
+  fflush(stdout);
 
   memset(&TxConfig, 0 , sizeof(ETH_TxPacketConfig));
   TxConfig.Attributes = ETH_TX_PACKETS_FEATURES_CSUM | ETH_TX_PACKETS_FEATURES_CRCPAD;

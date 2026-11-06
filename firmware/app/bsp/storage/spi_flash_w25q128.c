@@ -136,7 +136,8 @@ HAL_StatusTypeDef spi_flash_w25q128_init(void)
         flash_hw_reset();
         flash_unlock();
 
-        HAL_Delay(60);   // 复位后等待 tPOR + 余量
+        /* 复位后等待 tPOR + 余量（W25Q128 最大 50ms），多留余量确保稳定 */
+        HAL_Delay(200);
 
         uint32_t id = spi_flash_w25q128_read_id();
         // JEDEC ID: (Manufacturer<<16) | (Type<<8) | Capacity

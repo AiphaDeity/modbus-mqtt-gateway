@@ -13,6 +13,7 @@
 #include "spi_flash_w25q128.h"
 #include "cmsis_os2.h"
 #include <string.h>
+#include <stdio.h>
 
 #define SEQ_MAGIC   0x53455131U  /* "SEQ1" */
 
@@ -95,11 +96,19 @@ static HAL_StatusTypeDef copy_write(int idx, uint64_t next_reserved)
     meta.next_reserved = next_reserved;
     meta.crc32         = crc32_calc((const uint8_t *)&meta, SEQ_CRC_LEN);
 
+    printf("[SEQ] copy_write idx=%d addr=0x%06lX new_resv=0x%08lX%08lX\r\n",
+           idx, (unsigned long)s_copy_addr[idx],
+           (unsigned long)(next_reserved >> 32), (unsigned long)(next_reserved));
+    fflush(stdout);
+
     HAL_StatusTypeDef st = spi_flash_w25q128_sector_erase(s_copy_addr[idx]);
+    printf("[SEQ] erase st=%d\r\n", (int)st); fflush(stdout);
     if (st != HAL_OK) return st;
 
-    return spi_flash_w25q128_write(s_copy_addr[idx], (const uint8_t *)&meta,
+    st = spi_flash_w25q128_write(s_copy_addr[idx], (const uint8_t *)&meta,
                                     sizeof(meta));
+    printf("[SEQ] write st=%d\r\n", (int)st); fflush(stdout);
+    return st;
 }
 
 HAL_StatusTypeDef storage_seq_init(void)
@@ -112,7 +121,11 @@ HAL_StatusTypeDef storage_seq_init(void)
     seq_lock();
 
     ok_a = copy_read(0, &meta_a);
+    printf("[SEQ] init read A: ok=%d magic=0x%08lX crc=0x%08lX\r\n", ok_a,
+           (unsigned long)meta_a.magic, (unsigned long)meta_a.crc32); fflush(stdout);
     ok_b = copy_read(1, &meta_b);
+    printf("[SEQ] init read B: ok=%d magic=0x%08lX crc=0x%08lX\r\n", ok_b,
+           (unsigned long)meta_b.magic, (unsigned long)meta_b.crc32); fflush(stdout);
 
     s_newer = -1;
     if (ok_a && ok_b) {
@@ -153,9 +166,18 @@ HAL_StatusTypeDef storage_seq_alloc(uint64_t *seq_out)
 {
     HAL_StatusTypeDef st;
 
-    if (seq_out == NULL || !s_inited) return HAL_ERROR;
+    if (seq_out == NULL || !s_inited) {
+        printf("[SEQ] alloc early_fail seq_out=%p inited=%d\r\n", (void*)seq_out, s_inited);
+        fflush(stdout);
+        return HAL_ERROR;
+    }
 
     seq_lock();
+
+    printf("[SEQ] alloc enter s_current=0x%08lX%08lX s_window_end=0x%08lX%08lX\r\n",
+           (unsigned long)(s_current >> 32), (unsigned long)s_current,
+           (unsigned long)(s_window_end >> 32), (unsigned long)s_window_end);
+    fflush(stdout);
 
     /* 窗口用完，预留下一批 */
     if (s_current >= s_window_end) {
@@ -164,21 +186,35 @@ HAL_StatusTypeDef storage_seq_alloc(uint64_t *seq_out)
         /* 接近最大值则停止生成，不回绕 */
         if (new_reserved < s_next_reserved ||
             new_reserved > UINT64_MAX - SEQ_RESERVE_BATCH) {
+            printf("[SEQ] alloc overflow\r\n"); fflush(stdout);
             seq_unlock();
             return HAL_ERROR;
         }
 
         /* 先持久化新高水位：覆盖较旧副本 */
         int target = (s_newer < 0) ? 0 : (1 - s_newer);
+        printf("[SEQ] window_end reached, target=%d new_reserved=0x%08lX%08lX\r\n",
+               target, (unsigned long)(new_reserved >> 32), (unsigned long)new_reserved);
+        fflush(stdout);
         st = copy_write(target, new_reserved);
         if (st != HAL_OK) {
+            printf("[SEQ] copy_write failed st=%d\r\n", (int)st); fflush(stdout);
             seq_unlock();
             return st;
         }
 
         /* 回读校验，失败则不发放新窗口内的号 */
         seq_meta_t verify;
-        if (!copy_read(target, &verify) || verify.next_reserved != new_reserved) {
+        if (!copy_read(target, &verify)) {
+            printf("[SEQ] copy_read verify FAIL (CRC/magic mismatch)\r\n"); fflush(stdout);
+            seq_unlock();
+            return HAL_ERROR;
+        }
+        if (verify.next_reserved != new_reserved) {
+            printf("[SEQ] verify mismatch expect=0x%08lX%08lX got=0x%08lX%08lX\r\n",
+                   (unsigned long)(new_reserved>>32),(unsigned long)new_reserved,
+                   (unsigned long)(verify.next_reserved>>32),(unsigned long)verify.next_reserved);
+            fflush(stdout);
             seq_unlock();
             return HAL_ERROR;
         }
@@ -189,6 +225,8 @@ HAL_StatusTypeDef storage_seq_alloc(uint64_t *seq_out)
     }
 
     *seq_out = s_current++;
+    printf("[SEQ] alloc ok seq=0x%08lX%08lX\r\n", (unsigned long)(*seq_out>>32), (unsigned long)*seq_out);
+    fflush(stdout);
     seq_unlock();
     return HAL_OK;
 }

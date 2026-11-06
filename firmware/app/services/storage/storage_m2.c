@@ -8,6 +8,10 @@
  *   3) 回执：ack 水位推进 → storage_record_ack_upto
  *
  * 全部消息为值传递：M2 put 返回后栈上缓冲即可复用，无生命周期约束。
+ *
+ * ★ 关键设计：四个队列的控制块 + buffer 全部用静态数组（.bss），
+ *   不走 pvPortMalloc。否则 s_write_q（8×532B）+ s_resp_q（1×4.3KB）
+ *   就吃 ~8.6KB heap，加上 M1/MQTT 资源和碎片，20KB heap 必然顶不住。
  */
 
 #include "storage_m2.h"
@@ -25,12 +29,31 @@ static osMessageQueueId_t s_ack_q     = NULL;   /* 元素：storage_ack_t（值�
 /* 应答组装缓冲：填好后值拷贝入队列，随后即可重填 */
 static storage_fetch_resp_t s_resp_buf;
 
+/*
+ * 每个 queue 的静态存储：size 按 "控制块(≈128B) + 对齐(4) + depth×item_size"
+ * 估算，用 _Alignas(8) 对齐到 8 字节（FreeRTOS port 要求）。
+ */
+#define QCB_SIZE(depth, item)  (128U + ((depth) * (item)))
+
+_Alignas(8) static uint8_t s_write_q_cb[ QCB_SIZE(STORAGE_M2_WRITE_Q_DEPTH,
+                                                  sizeof(storage_write_req_t)) ];
+_Alignas(8) static uint8_t s_fetch_q_cb[ QCB_SIZE(STORAGE_M2_FETCH_Q_DEPTH,
+                                                  sizeof(storage_fetch_req_t)) ];
+_Alignas(8) static uint8_t s_resp_q_cb [ QCB_SIZE(1,
+                                                  sizeof(storage_fetch_resp_t)) ];
+_Alignas(8) static uint8_t s_ack_q_cb  [ QCB_SIZE(STORAGE_M2_ACK_Q_DEPTH,
+                                                  sizeof(storage_ack_t)) ];
+
 void storage_m2_init(void)
 {
-    static const osMessageQueueAttr_t attr_write = { .name = "m3_write_q" };
-    static const osMessageQueueAttr_t attr_fetch = { .name = "m3_fetch_q" };
-    static const osMessageQueueAttr_t attr_resp  = { .name = "m3_resp_q"  };
-    static const osMessageQueueAttr_t attr_ack   = { .name = "m3_ack_q"   };
+    static const osMessageQueueAttr_t attr_write = {
+        .name = "m3_write_q", .cb_mem = s_write_q_cb, .cb_size = sizeof(s_write_q_cb) };
+    static const osMessageQueueAttr_t attr_fetch = {
+        .name = "m3_fetch_q", .cb_mem = s_fetch_q_cb, .cb_size = sizeof(s_fetch_q_cb) };
+    static const osMessageQueueAttr_t attr_resp = {
+        .name = "m3_resp_q",  .cb_mem = s_resp_q_cb,  .cb_size = sizeof(s_resp_q_cb) };
+    static const osMessageQueueAttr_t attr_ack = {
+        .name = "m3_ack_q",   .cb_mem = s_ack_q_cb,   .cb_size = sizeof(s_ack_q_cb) };
 
     s_write_q = osMessageQueueNew(STORAGE_M2_WRITE_Q_DEPTH,
                                   sizeof(storage_write_req_t), &attr_write);
