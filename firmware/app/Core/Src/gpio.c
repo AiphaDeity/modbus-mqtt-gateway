@@ -62,7 +62,7 @@ void MX_GPIO_Init(void)
   GPIO_InitStruct.Pin = SPI_FLASH_CS_Pin|SPI_IMU_CS_Pin|ETH_NRST_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;   /* CS 类引脚需要干净边沿 */
   HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
 
   /*Configure GPIO pin : RS485_DIR_Pin */

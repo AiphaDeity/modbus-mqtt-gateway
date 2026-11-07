@@ -26,8 +26,24 @@ static osMessageQueueId_t s_fetch_q   = NULL;   /* 元素：storage_fetch_req_t�
 static osMessageQueueId_t s_resp_q    = NULL;   /* 元素：storage_fetch_resp_t（~4.3KB 值，深度 1） */
 static osMessageQueueId_t s_ack_q     = NULL;   /* 元素：storage_ack_t（值） */
 
+/*
+ * ============================================================================
+ * ★ RAM 优化：以下 5 块存储合计约 13.3KB，整体搬到 CCMRAM。
+ *
+ *   F407 有 64KB CCM（0x10000000），只能被 CPU 访问、不能 DMA。本工程
+ *   此前 CCM 占用为 0，完全空着。这 5 块是纯软件队列存储——只被
+ *   osMessageQueuePut/Get 的内核 memcpy 读写，不涉及任何 DMA，
+ *   所以放进 CCM 对功能零影响，却能把 13.3KB 从 128KB SRAM 里让出来。
+ *
+ *   ⚠️ 本工程 startup_stm32f407xx.s 没有实现 .ccmram 段的拷贝/清零循环，
+ *      CCM 里的变量上电是随机值，因此必须在 storage_m2_init() 里手动 memset。
+ *      任意一块漏清零 → 队列控制块带垃圾值 → osMessageQueueNew 行为异常。
+ * ============================================================================
+ */
+#define M3_CCM  __attribute__((section(".ccmram"), used))
+
 /* 应答组装缓冲：填好后值拷贝入队列，随后即可重填 */
-static storage_fetch_resp_t s_resp_buf;
+M3_CCM static storage_fetch_resp_t s_resp_buf;
 
 /*
  * 每个 queue 的静态存储：size 按 "控制块(≈128B) + 对齐(4) + depth×item_size"
@@ -35,17 +51,27 @@ static storage_fetch_resp_t s_resp_buf;
  */
 #define QCB_SIZE(depth, item)  (128U + ((depth) * (item)))
 
-_Alignas(8) static uint8_t s_write_q_cb[ QCB_SIZE(STORAGE_M2_WRITE_Q_DEPTH,
+_Alignas(8) M3_CCM static uint8_t s_write_q_cb[ QCB_SIZE(STORAGE_M2_WRITE_Q_DEPTH,
                                                   sizeof(storage_write_req_t)) ];
-_Alignas(8) static uint8_t s_fetch_q_cb[ QCB_SIZE(STORAGE_M2_FETCH_Q_DEPTH,
+_Alignas(8) M3_CCM static uint8_t s_fetch_q_cb[ QCB_SIZE(STORAGE_M2_FETCH_Q_DEPTH,
                                                   sizeof(storage_fetch_req_t)) ];
-_Alignas(8) static uint8_t s_resp_q_cb [ QCB_SIZE(1,
+_Alignas(8) M3_CCM static uint8_t s_resp_q_cb [ QCB_SIZE(1,
                                                   sizeof(storage_fetch_resp_t)) ];
-_Alignas(8) static uint8_t s_ack_q_cb  [ QCB_SIZE(STORAGE_M2_ACK_Q_DEPTH,
+_Alignas(8) M3_CCM static uint8_t s_ack_q_cb  [ QCB_SIZE(STORAGE_M2_ACK_Q_DEPTH,
                                                   sizeof(storage_ack_t)) ];
 
 void storage_m2_init(void)
 {
+    /*
+     * CCM 段不被 startup 清零（见上方说明），这里必须逐块手动清零，
+     * 否则队列控制块和存储区带随机值。
+     */
+    memset(&s_resp_buf,   0, sizeof(s_resp_buf));
+    memset(s_write_q_cb,  0, sizeof(s_write_q_cb));
+    memset(s_fetch_q_cb,  0, sizeof(s_fetch_q_cb));
+    memset(s_resp_q_cb,   0, sizeof(s_resp_q_cb));
+    memset(s_ack_q_cb,    0, sizeof(s_ack_q_cb));
+
     static const osMessageQueueAttr_t attr_write = {
         .name = "m3_write_q", .cb_mem = s_write_q_cb, .cb_size = sizeof(s_write_q_cb) };
     static const osMessageQueueAttr_t attr_fetch = {

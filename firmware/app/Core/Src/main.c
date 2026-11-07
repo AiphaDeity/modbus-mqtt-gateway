@@ -111,6 +111,22 @@ int main(void)
   MX_SDIO_SD_Init();
   MX_FATFS_Init();
   printf("[DBG] all MX_*_Init done\r\n"); fflush(stdout);
+
+  /* ★排障：打印本次复位原因（掉电/外部复位/软件/看门狗），打印后清标志 */
+  {
+    uint32_t csr = RCC->CSR;
+    printf("[BOOT] reset: POR=%d BOR=%d PIN=%d SW=%d IWDG=%d WWDG=%d LPWR=%d CSR=0x%08lX\r\n",
+           (csr & RCC_CSR_PORRSTF)  ? 1 : 0,
+           (csr & RCC_CSR_BORRSTF)  ? 1 : 0,
+           (csr & RCC_CSR_PINRSTF)  ? 1 : 0,
+           (csr & RCC_CSR_SFTRSTF)  ? 1 : 0,
+           (csr & RCC_CSR_IWDGRSTF) ? 1 : 0,
+           (csr & RCC_CSR_WWDGRSTF) ? 1 : 0,
+           (csr & RCC_CSR_LPWRRSTF) ? 1 : 0,
+           (unsigned long)csr);
+    fflush(stdout);
+    __HAL_RCC_CLEAR_RESET_FLAGS();
+  }
   /* USER CODE BEGIN 2 */
   /* ★排障修复：Picolibc 的 stdout 默认是全缓冲的——printf 的内容会攒在缓冲区里，
      缓冲区不满就不调 _write（串口），导致只有带 fflush 的 "Gateway boot" 能显示，

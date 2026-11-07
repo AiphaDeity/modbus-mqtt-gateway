@@ -103,23 +103,31 @@ static HAL_StatusTypeDef slot_erase(int idx)
 
 /* ---------- 启动时选择运行槽 ---------- */
 
+/* 启动时扫三个槽，挑出"代次最大且校验完整"的那个为运行槽 */
 static void config_select_running(void)
 {
+    // 最佳槽下标，-1 表示还没找到
     int best_idx = -1;
+    // 最佳槽的代次号，用于比较大小
     uint32_t best_gen = 0;
 
+    // 遍历 A/B/C 三个槽
     for (int i = 0; i < 3; i++) {
+        // 跳过校验未通过（CRC 错误、长度异常）的槽
         if (!slot_is_complete(i)) continue;
 
+        // 读取该槽头部，拿 generation 字段
         config_slot_header_t hdr;
         if (slot_read_header(i, &hdr) != HAL_OK) continue;
 
+        // 第一次遇到完整槽或代次更大时，更新最佳
         if (best_idx == -1 || hdr.generation > best_gen) {
             best_idx = i;
             best_gen = hdr.generation;
         }
     }
 
+    // 写回全局运行槽标记，若无完整槽则保持 -1
     s_r_slot = best_idx;
     s_r_gen  = best_gen;
 }
@@ -128,16 +136,22 @@ static void config_select_running(void)
 
 HAL_StatusTypeDef storage_config_open(storage_config_reader_t *rd)
 {
+    // 入参校验
     if (rd == NULL) return HAL_ERROR;
 
+    // 检查有没有成功选出配置槽，如果还没选到，就重新执行一次三槽校验选槽，做一次兜底重试
     if (s_r_slot < 0) {
         config_select_running();
     }
-    if (s_r_slot < 0) return HAL_ERROR;   /* 无有效配置 */
 
+    // 三槽都无完整配置，交由上层进入维护模式
+    if (s_r_slot < 0) return HAL_ERROR;
+
+    // 重读头部，避免描述符沿用旧的长度/CRC
     config_slot_header_t hdr;
     if (slot_read_header(s_r_slot, &hdr) != HAL_OK) return HAL_ERROR;
 
+    // 填充只读描述符：槽号定位数据、代次记录配置版本
     rd->slot_idx   = (uint32_t)s_r_slot;
     rd->generation = hdr.generation;
     rd->total_len  = hdr.json_length;
