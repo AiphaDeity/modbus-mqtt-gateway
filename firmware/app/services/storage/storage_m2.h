@@ -16,9 +16,9 @@
  */
 
 #define STORAGE_M2_WRITE_Q_DEPTH    8
-#define STORAGE_M2_FETCH_Q_DEPTH    4
+#define STORAGE_M2_FETCH_Q_DEPTH    1   /* 单在途协议：M2 发一个 fetch_req 等一个 fetch_resp，depth=1 够 */
 #define STORAGE_M2_ACK_Q_DEPTH      8
-#define STORAGE_M2_FETCH_BATCH_MAX  8
+#define STORAGE_M2_FETCH_BATCH_MAX  10
 
 /* 4.1 M2 → M3：写入一条待持久化记录（离线缓存）。值传递，put 即拷贝 */
 typedef struct {
@@ -32,7 +32,7 @@ typedef struct {
 /* 4.2 M2 → M3：补传拉取请求 */
 typedef struct {
     uint32_t req_id;                /* M2 生成，匹配请求/应答 */
-    uint16_t max_count;             /* ≤8 */
+    uint16_t max_count;             /* ≤10 */
 } storage_fetch_req_t;
 
 /* 4.3 M3 → M2：补传数据应答（单在途，req_id 匹配） */

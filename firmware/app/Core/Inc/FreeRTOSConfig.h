@@ -68,10 +68,10 @@
 #define configTICK_RATE_HZ                       ((TickType_t)1000)
 #define configMAX_PRIORITIES                     ( 56 )
 #define configMINIMAL_STACK_SIZE                 ((uint16_t)128)
-/* 16KB：LwIP MEM_SIZE 砍到 12KB 后，heap 从 12KB 涨回 16KB。
- * 两者此消彼长，.bss 总量不变。16KB 够 ModbusInit + 3 个 mutex +
- * FreeRTOS timer daemon + 后续可能的 MQTT 资源。 */
-#define configTOTAL_HEAP_SIZE                    ((size_t)16384)
+/* 32KB：LWIP netconn/pbuf + M2↔M3 值传递队列（fetch_resp depth=1 ≈ 5.3KB + write 8×536B ≈ 4.3KB）
+ * + IPC 对象。24KB 实测 MALLOC FAILED（freeHeap=4920），depth=4→1 省 15.9KB 后仍需 32KB 留足余量。
+ * 任务栈全在 CCMRAM，不占此堆。MEM_SIZE 12KB(lwipopts) + heap 32KB，SRAM 128KB 装得下。 */
+#define configTOTAL_HEAP_SIZE                    ((size_t)32768)
 #define configMAX_TASK_NAME_LEN                  ( 16 )
 #define configUSE_TRACE_FACILITY                 1
 #define configUSE_16_BIT_TICKS                   0
