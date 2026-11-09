@@ -51,6 +51,7 @@ static uint64_t s_last_seq  = 0;   /* 最近一次 append 的 seq（含失败尝
 static uint64_t s_ack_wm    = 0;   /* ack 水位：seq ≤ wm 已上传，可复用 */
 static uint32_t s_dropped   = 0;   /* 未 ack 即被覆盖/写失败的条数 */
 static uint32_t s_gen       = 0;   /* 环状态代数（双副本取较大者） */
+static int      s_rstate_newer = 0; /* 当前较新的环状态副本索引(0/1)，由 state_load 恢复 */
 
 /* 补传读游标：下次 fetch 从这里开始，避免每次从最旧段重扫。
  * 语义是「第一条未 ack 记录的位置」——只在 ack 推进到该记录时才前移，
@@ -314,8 +315,6 @@ static bool state_unpack(const uint8_t *buf, ring_state_t *st)
 /* 立即落盘环状态（写 gen 较旧的副本） */
 static void state_store_now(void)
 {
-    static int s_newer = 0;   /* 较新副本索引，掉电丢失后两份等价，任选 */
-
     ring_state_t st = {
         .gen        = s_gen + 1U,
         .cur_seg    = s_cur_seg,
@@ -330,18 +329,28 @@ static void state_store_now(void)
     uint8_t buf[RSTATE_SIZE];
     state_pack(buf, &st);
 
-    int target = (s_newer == 0) ? 1 : 0;
+    int target = (s_rstate_newer == 0) ? 1 : 0;
     const uint32_t addr[2] = { FLASH_RING_STATE_A_ADDR, FLASH_RING_STATE_B_ADDR };
 
+    bool ok = false;
     if (spi_flash_w25q128_sector_erase(addr[target]) == HAL_OK) {
         if (spi_flash_w25q128_write(addr[target], buf, sizeof(buf)) == HAL_OK) {
-            s_newer = target;
+            s_rstate_newer = target;
             s_gen   = st.gen;
+            ok = true;
         }
     }
 
-    s_state_dirty = false;
-    s_appends_since = 0;
+    /*
+     * 只有写成功才清 dirty。原实现无条件清，一旦擦除/写入失败，
+     * 这块状态就再不会被重试 —— ack 水位、cur_seg 会永久停在旧值，
+     * 直到下一次段切换才可能被救回来。
+     */
+    if (ok) {
+        s_state_dirty   = false;
+        s_appends_since = 0;
+    }
+    /* 失败时也要刷新时间戳，否则 maintenance 每轮都会重试 */
     s_last_persist_tick = HAL_GetTick();
 }
 
@@ -366,6 +375,7 @@ static bool state_load(ring_state_t *out)
     if (sel < 0) return false;
 
     *out = st[sel];
+    s_rstate_newer = sel;   /* 让 state_store_now 下一次写"较旧的那份" */
     return true;
 }
 

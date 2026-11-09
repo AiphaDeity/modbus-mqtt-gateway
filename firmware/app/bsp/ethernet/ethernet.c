@@ -143,6 +143,16 @@ int32_t m2_ethernet_init(void)
   if (g_m2_eth_inited)
     return ETH_OK;                        /* 已初始化过，直接返回（幂等） */
 
+  /* ★排障临时守卫：如果 HAL_ETH_Init 没跑（heth.gState 不是 READY/STARTED），
+     说明 ETH 硬件时钟/GPIO/IRQ 都没配好，调 HAL_ETH_ReadPHYRegister 会死循环。
+     跳过整个 m2_ethernet_init，等 MX_ETH_Init 问题修好后再恢复。 */
+  if (heth.gState == HAL_ETH_STATE_RESET || heth.gState == HAL_ETH_STATE_ERROR)
+  {
+    printf("[ETH] skip m2_ethernet_init: heth.gState=%u (MX_ETH_Init not ready)\r\n", (unsigned)heth.gState);
+    fflush(stdout);
+    return ETH_ERR_CONFIG;
+  }
+
   /* 1. 初始化 tcpip 内核
      ★ 这一句内部创建了 lwip 的核心线程 tcpip_thread（名字 "lwip_thread"，栈 1280 字 = 5KB）。
        注意本工程 sys_arch.c 里 LWIP_FREERTOS_THREAD_STACKSIZE_IS_STACKWORDS=1，

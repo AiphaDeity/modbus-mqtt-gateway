@@ -1,8 +1,20 @@
+/*
+ * M3 上板自检：Storage_Task 起来后跑一次，把 8 项状态打到日志串口。
+ *
+ * 只做只读检查（序列号和 CtrlLog 两项会真写一次，用来验证写通路和断电保持）。
+ *
+ * 这里的内容是"给别人看的结论"：每项判断 PASS/WARN/FAIL 并打印依据。
+ * 排查用的分层探测（SPI2 状态、PCA9555、深掉电、逐段读 JEDEC）不在本文件，
+ * 在 m3_flash_probe.c，由 CMake 的 M3_ENABLE_FLASH_PROBE 控制是否编译，
+ * 默认关闭 —— 所以正常读这个文件不会被 200 行诊断代码打断。
+ */
+
 #include "m3_selftest.h"
 
 #if M3_SELFTEST_ENABLE
 
 #include <stdio.h>
+#include <string.h>
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -16,8 +28,21 @@
 #include "storage_record.h"
 #include "app_readiness.h"
 
+#if M3_ENABLE_FLASH_PROBE
+#include "m3_flash_probe.h"
+#endif
+
 #define SELF_JEDEC_ID   0xEF4018U   /* W25Q128：厂家 0xEF + 容量 0x18 */
 #define SELF_MIN_YEAR   2024U       /* 低于此年视为 RTC 未校时 */
+
+/*
+ * 关于 64 位数字的打印：
+ *   本工程用的是 newlib-nano 的 printf，不支持 %llu —— 会原样打出 "lu"，
+ *   日志里看到的 last_seq=lu 就是这个原因，不是值为空。
+ *   序列号从 1001 起、每 1024 才落盘一次，一台设备整个生命周期也远不到
+ *   2^32，所以这里统一按 32 位打印。真要打满 64 位，得在链接选项里加
+ *   -u _printf_long_long，那会增大代码体积，不值得。
+ */
 
 enum { SELF_FAIL = 0, SELF_WARN = 1, SELF_PASS = 2 };
 
@@ -43,6 +68,16 @@ static void ctrllog_count_cb(const ctrllog_record_t *rec, void *user)
     (*(uint32_t *)user)++;
 }
 
+/* 统计带固定测试 payload 的记录数（断电保持验证用） */
+#define CTRLLOG_TEST_PAYLOAD  "CTLG_SELFTEST_v1"
+static void ctrllog_test_count_cb(const ctrllog_record_t *rec, void *user)
+{
+    const char *p = CTRLLOG_TEST_PAYLOAD;
+    size_t plen = strlen(p);
+    if (rec->payload_len == plen && memcmp(rec->payload, p, plen) == 0)
+        (*(uint32_t *)user)++;
+}
+
 void m3_selftest_run(void)
 {
     char detail[96];
@@ -51,7 +86,15 @@ void m3_selftest_run(void)
 
     printf("\r\n===== M3 SELF TEST =====\r\n");
 
-    /* 1. SPI Flash：JEDEC ID 必须是 0xEF4018 */
+#if M3_ENABLE_FLASH_PROBE
+    /* 排障模式：先跑分层探测（D0~D5），再跑下面的结论项。
+     * 打开方式见 m3_flash_probe.h。 */
+    m3_flash_probe_run();
+#endif
+
+    /* 1. SPI Flash：JEDEC ID 必须是 0xEF4018
+     *    0xEF=Winbond、0x40=SPI NOR、0x18=24 位地址即 16MB。
+     *    这是整条 SPI 链路最简单的验证：不需要地址、不需要擦写。 */
     {
         uint32_t id = spi_flash_w25q128_read_id();
 
@@ -89,11 +132,11 @@ void m3_selftest_run(void)
 
         storage_record_stats(&pending, &dropped);
         snprintf(detail, sizeof(detail),
-                 "ready=%d pending=%lu dropped=%lu last_seq=%llu",
+                 "ready=%d pending=%lu dropped=%lu last_seq=%lu",
                  ready ? 1 : 0,
                  (unsigned long)pending,
                  (unsigned long)dropped,
-                 (unsigned long long)storage_record_last_seq());
+                 (unsigned long)(uint32_t)storage_record_last_seq());
         judge(ready ? SELF_PASS : SELF_FAIL, "TF Record", detail);
     }
 
@@ -122,36 +165,89 @@ void m3_selftest_run(void)
 
         if (st == HAL_OK) {
             snprintf(detail, sizeof(detail),
-                     "high_watermark=%llu alloc=%llu wm_after=%llu",
-                     (unsigned long long)wm, (unsigned long long)seq,
-                     (unsigned long long)storage_seq_get_high_watermark());
+                     "high_watermark=%lu alloc=%lu wm_after=%lu",
+                     (unsigned long)(uint32_t)wm, (unsigned long)(uint32_t)seq,
+                     (unsigned long)(uint32_t)storage_seq_get_high_watermark());
             judge(seq >= wm ? SELF_PASS : SELF_FAIL, "Seq", detail);
         } else {
             snprintf(detail, sizeof(detail),
-                     "alloc_failed st=%d high_watermark=%llu",
-                     (int)st, (unsigned long long)wm);
+                     "alloc_failed st=%d high_watermark=%lu",
+                     (int)st, (unsigned long)(uint32_t)wm);
             judge(SELF_FAIL, "Seq", detail);
         }
     }
 
-    /* 6. 持久时间下界（0 表示尚无参考值，首次上电正常） */
+    /*
+     * 6. 持久时间下界（0 表示尚无参考值，首次上电正常）
+     *
+     *    trusted 的语义容易被日志误读：storage_timefloor_trusted() 在
+     *    floor==0 时返回 true，因为全新设备没有基准值，不能凭空否定时间。
+     *    所以 floor=0 和 trusted=1 同时出现不是矛盾，这里显式标出
+     *    "(no-baseline)"，避免看日志的人以为判定写错了。
+     */
     {
         uint32_t floor_v = storage_timefloor_get();
         uint32_t now     = storage_get_unix_time();
 
-        snprintf(detail, sizeof(detail), "floor=%lu trusted=%d",
-                 (unsigned long)floor_v, storage_timefloor_trusted(now) ? 1 : 0);
+        snprintf(detail, sizeof(detail), "floor=%lu trusted=%d%s",
+                 (unsigned long)floor_v, storage_timefloor_trusted(now) ? 1 : 0,
+                 (floor_v == 0) ? "(no-baseline)" : "");
         judge(floor_v == 0 ? SELF_WARN : SELF_PASS, "TimeFloor", detail);
     }
 
-    /* 7. 控制日志：遍历双区统计可读记录数 */
+    /*
+     * 7. 控制日志：真实写入一次 + 断电保持验证。
+     *    用固定 payload 标记测试记录，dedup_key 用当前 boot 分配到的
+     *    seq（每次 boot 唯一，避免被去重跳过）。
+     *
+     *    before  = 本轮写入前已有的测试记录数
+     *    after   = 本轮写完后的测试记录数
+     *      after == before + 1  → 本轮写入 OK
+     *      before >= 1          → 上一轮 boot 写的记录重启后仍在 → 断电保持 OK
+     */
     {
-        uint32_t n = 0;
-        HAL_StatusTypeDef st = storage_ctrllog_foreach(ctrllog_count_cb, &n);
+        uint32_t before = 0, after = 0;
 
-        snprintf(detail, sizeof(detail), "records=%lu scan=%s",
-                 (unsigned long)n, (st == HAL_OK) ? "ok" : "err");
-        judge(st == HAL_OK ? SELF_PASS : SELF_FAIL, "CtrlLog", detail);
+        storage_ctrllog_foreach(ctrllog_test_count_cb, &before);
+
+        uint64_t my_seq = 0;
+        if (storage_seq_alloc(&my_seq) != HAL_OK) {
+            snprintf(detail, sizeof(detail), "alloc_seq_failed high_wm=%lu",
+                     (unsigned long)(uint32_t)storage_seq_get_high_watermark());
+            judge(SELF_FAIL, "CtrlLog", detail);
+        } else {
+            bool dup = false;
+            HAL_StatusTypeDef st = storage_ctrllog_append(
+                CTRLLOG_STREAM_GENERIC, my_seq,
+                CTRLLOG_TEST_PAYLOAD, strlen(CTRLLOG_TEST_PAYLOAD),
+                &dup);
+
+            storage_ctrllog_foreach(ctrllog_test_count_cb, &after);
+
+            uint32_t total = 0;
+            storage_ctrllog_foreach(ctrllog_count_cb, &total);
+
+            int level;
+            const char *ret_str;
+            if (st == HAL_OK && after == before + 1) {
+                if (before >= 1) {
+                    ret_str = "OK";              /* 上轮 boot 的记录重启后仍在 */
+                    level = SELF_PASS;
+                } else {
+                    ret_str = "write+verify";    /* 首次 boot，写入路径 OK */
+                    level = SELF_PASS;
+                }
+            } else {
+                ret_str = (st == HAL_OK) ? "lost_after_write" : "write_failed";
+                level = SELF_FAIL;
+            }
+
+            snprintf(detail, sizeof(detail),
+                     "before=%lu after=%lu retention=%s total=%lu dup=%d",
+                     (unsigned long)before, (unsigned long)after,
+                     ret_str, (unsigned long)total, dup ? 1 : 0);
+            judge(level, "CtrlLog", detail);
+        }
     }
 
     /* 8. 就绪位快照，与 App 的判定口径对齐 */

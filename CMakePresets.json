@@ -41,6 +41,13 @@
                 "GATEWAY_APP_LINKER_SCRIPT": "${sourceDir}/firmware/app/STM32F407xx_APP.ld",
                 "GATEWAY_APP_VECTOR_OFFSET": "0x00010000"
             }
+        },
+        {
+            "name": "M3Test",
+            "inherits": "Debug",
+            "cacheVariables": {
+                "GATEWAY_ENABLE_M2": "OFF"
+            }
         }
         
     ],
@@ -60,6 +67,10 @@
         {
             "name": "AppDebug",
             "configurePreset": "AppDebug"
+        },
+        {
+            "name": "M3Test",
+            "configurePreset": "M3Test"
         }
     ]
 }

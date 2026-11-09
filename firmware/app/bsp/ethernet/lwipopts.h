@@ -49,10 +49,11 @@
    否则 DMA 和协议栈读写可能出问题 */
 #define MEM_ALIGNMENT               4
 
-/* ★协议栈堆内存大小：8KB（Day3 裁剪）
-   原来例程 16KB 是给多 TCP + Web 服务器用的。我们只跑 1 个 MQTT 连接，
-   TCP 发送缓冲从这里分，8KB 够发 2 段 MSS（≈2.9KB）+ DHCP 临时用。 */
-#define MEM_SIZE                    (8*1024)
+/* ★协议栈堆内存大小：12KB
+   lwip 的动态分配（mem_malloc）都从这块堆走，TCP 发送缓冲等大块内存也在这。
+   与 FreeRTOS heap(32KB) 独立。MQTT 客户端 TCP 发送缓冲走 FreeRTOS heap，
+   lwip 这边够 DHCP/UDP/TCPIP mailbox 就行。SRAM 128KB 装得下 MEM_SIZE 12KB + heap 32KB。 */
+#define MEM_SIZE                    (12*1024)
 
 /* 内存池数量（Day3 裁剪：单 MQTT 连接够用） */
 #define MEMP_NUM_PBUF               6     /* 原 15：原始 pbuf，只给 IP 分片用，6 够 */

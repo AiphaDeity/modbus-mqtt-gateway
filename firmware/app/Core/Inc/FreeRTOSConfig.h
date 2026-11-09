@@ -69,8 +69,8 @@
 #define configMAX_PRIORITIES                     ( 56 )
 #define configMINIMAL_STACK_SIZE                 ((uint16_t)128)
 /* 32KB：LWIP netconn/pbuf + M2↔M3 值传递队列（fetch_resp depth=1 ≈ 5.3KB + write 8×536B ≈ 4.3KB）
- * + IPC 对象。24KB 实测 MALLOC FAILED（freeHeap=4920），32KB 留足余量。
- * 任务栈全在 CCMRAM，不占此堆。 */
+ * + IPC 对象。24KB 实测 MALLOC FAILED（freeHeap=4920），depth=4→1 省 15.9KB 后仍需 32KB 留足余量。
+ * 任务栈全在 CCMRAM，不占此堆。MEM_SIZE 12KB(lwipopts) + heap 32KB，SRAM 128KB 装得下。 */
 #define configTOTAL_HEAP_SIZE                    ((size_t)32768)
 #define configMAX_TASK_NAME_LEN                  ( 16 )
 #define configUSE_TRACE_FACILITY                 1

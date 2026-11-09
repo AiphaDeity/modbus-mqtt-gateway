@@ -24,6 +24,12 @@ _Static_assert(sizeof(timefloor_record_t) == 12, "timefloor_record_t must be 12 
 
 #define TIMEFLOOR_CRC_LEN (sizeof(timefloor_record_t) - sizeof(uint32_t))
 
+/* 下界时间的 sanity check：必须 >= 2020-01-01 00:00:00 UTC (1,577,836,800)，
+ * 否则即便 CRC/magic 正确也视为无效记录。防止写入截断导致 time_floor=0
+ * 或不合理值被当成有效下界。
+ */
+#define TIMEFLOOR_MIN_VALID_UNIX  1577836800u
+
 static const uint32_t s_copy_addr[2] = { FLASH_TIME_FLOOR_A_ADDR, FLASH_TIME_FLOOR_B_ADDR };
 
 static uint32_t s_floor = 0;
@@ -74,6 +80,12 @@ HAL_StatusTypeDef storage_timefloor_init(void)
 
     s_newer = -1;
     s_floor = 0;
+
+    /* 二次筛选：CRC/magic 通过后，再校验 time_floor 的合理性。
+     * 写入截断、非法时间戳都可能产生 "CRC 对但值不合法" 的记录。
+     */
+    ok_a = ok_a && rec_a.time_floor >= TIMEFLOOR_MIN_VALID_UNIX;
+    ok_b = ok_b && rec_b.time_floor >= TIMEFLOOR_MIN_VALID_UNIX;
 
     if (ok_a && ok_b) {
         s_newer = (rec_a.time_floor >= rec_b.time_floor) ? 0 : 1;
