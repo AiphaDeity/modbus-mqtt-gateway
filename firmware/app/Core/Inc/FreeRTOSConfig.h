@@ -68,10 +68,10 @@
 #define configTICK_RATE_HZ                       ((TickType_t)1000)
 #define configMAX_PRIORITIES                     ( 56 )
 #define configMINIMAL_STACK_SIZE                 ((uint16_t)128)
-/* 24KB：M3 的 M2↔M3 值传递队列（写 8×536B + 应答 1×~4.4KB ≈ 9KB）。
- * 注：M3 主分支压到 20KB，但实测 20KB 会 MALLOC FAILED；
- * M2 侧已把 config/monitor 占位栈压到 512B 腾出 SRAM，故保 24KB。 */
-#define configTOTAL_HEAP_SIZE                    ((size_t)24576)
+/* 32KB：LWIP netconn/pbuf + M2↔M3 值传递队列（fetch_resp depth=1 ≈ 5.3KB + write 8×536B ≈ 4.3KB）
+ * + IPC 对象。24KB 实测 MALLOC FAILED（freeHeap=4920），32KB 留足余量。
+ * 任务栈全在 CCMRAM，不占此堆。 */
+#define configTOTAL_HEAP_SIZE                    ((size_t)32768)
 #define configMAX_TASK_NAME_LEN                  ( 16 )
 #define configUSE_TRACE_FACILITY                 1
 #define configUSE_16_BIT_TICKS                   0

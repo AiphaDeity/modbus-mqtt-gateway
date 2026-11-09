@@ -51,4 +51,12 @@ typedef struct
 } app_config_t;
 #pragma pack(pop)
 
+/* ===== 对外读写接口（app_config.c 实现） ===== */
+/* 填入出厂默认配置（magic/version/字段默认值） */
+void AppConfig_GetDefault(app_config_t *cfg);
+/* 获取当前生效配置指针（只读）；未加载时返回默认配置 */
+const app_config_t *AppConfig_Get(void);
+/* 覆盖当前配置（内存拷贝，不落 Flash；持久化由 M3 负责） */
+void AppConfig_Set(const app_config_t *cfg);
+
 #endif /* APP_CONFIG_H */

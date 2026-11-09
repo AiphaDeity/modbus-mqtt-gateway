@@ -75,7 +75,7 @@ extern ETH_TxPacketConfig TxConfig;                  /* Tx 包公共配置（Att
 #define LAN8720_IDR2_VAL            ((uint16_t)0xC0F1) /* IDR2 值：LAN8720A 低 16 位 */
 
 #ifndef PHY_LINKED_STATUS
-#define PHY_LINKED_STATUS           ((uint16_t)0x0004) /* BSR bit2=1：链路已建立（网线插好且对端活着） */
+#define PHY_LINKED_STATUS           ((uint16_t)0x4000) /* BSR bit14=1：链路已建立（LAN8720 数据手册） */
 #endif
 #define BMCR_SOFT_RESET             ((uint16_t)0x8000) /* BMCR bit15=1：软复位（写 1 触发，完成后硬件自动清零） */
 #define BMCR_AUTONEGO_EN            ((uint16_t)0x1000) /* BMCR bit12=1：使能自动协商（自动定速率/双工） */

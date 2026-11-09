@@ -80,7 +80,7 @@ static uint8_t g_lwip_dhcp_state = LWIP_DHCP_OFF;   /* 当前 DHCP 状态（全�
 
 /* DHCP 最大尝试次数：超过这个数还拿不到 IP 就放弃，回落静态 IP。
    例程原值 10（约 10 秒），太小容易被路由器慢启动误杀，太大等太久 */
-#define LWIP_MAX_DHCP_TRIES     10
+#define LWIP_MAX_DHCP_TRIES     2   /* ★调试临时改小：直连PC无DHCP服务器，快速超时回落静态IP。正式环境恢复10。 */
 
 /* ================= 三、线程配置（照例程） ================= */
 /* 链接线程：优先级 3，栈 128*6=768 字（单位是"字"=4 字节，即 3KB）。
@@ -115,6 +115,7 @@ static void lwip_comm_default_ip_set(__lwip_dev *lwipx)
   uint8_t host = (uint8_t)((u & 0xFFU) ^ ((u >> 8) & 0xFFU));
   if (host < 2)   host = 2;
   if (host > 254) host = 254;
+  host = 124;  /* ★调试临时固定：直连PC无DHCP服务器，回落到已知IP(192.168.2.124)方便验证MQTT。正式环境删此行恢复UID派生。 */
 
   lwipx->remoteip[0] = 192; lwipx->remoteip[1] = 168; lwipx->remoteip[2] = 0;   lwipx->remoteip[3] = 120;
   lwipx->ip[0]       = 192; lwipx->ip[1]       = 168; lwipx->ip[2]       = 2;    lwipx->ip[3]       = host;
@@ -306,7 +307,8 @@ static void lwip_link_thread(void *argument)
 #if LWIP_DHCP
         g_lwip_dhcp_state = LWIP_DHCP_LINK_DOWN;  /* 通知 DHCP 线程停止申请 */
 #endif
-        HAL_ETH_Stop(&heth);        /* ★停掉 ETH 硬件：DMA 停止，不再接收新帧（HAL 寄存器操作，本线程可做） */
+        /* ★不调HAL_ETH_Stop：实测Stop后再Start_IT导致TX DMA描述符状态不一致，板子发TX但网络收不到。
+           MAC从low_level_init的Start_IT起一直跑，链路down只停netif层即可，PHY物理断开后MAC自然收不到包。 */
         /* 下面 3 个都是改 netif 状态的 API，必须经 netifapi 投递到 tcpip_thread 执行，
            不能在链接线程里直接 netif_set_down/netif_set_link_down（评审指出的线程安全问题） */
         netifapi_netif_set_down(netif);
@@ -320,7 +322,8 @@ static void lwip_link_thread(void *argument)
       if (g_lwipdev.link_status == LWIP_LINK_OFF)  /* 之前是断的 → 现在好了，要"重新启动" */
       {
         g_lwipdev.link_status = LWIP_LINK_ON;   /* 记录已链接 */
-        HAL_ETH_Start_IT(&heth);    /* ★重启 ETH：DMA + 接收中断都开，恢复收包 */
+        /* ★不调HAL_ETH_Start_IT：MAC已在low_level_init时启动，重复Start_IT会搞坏TX DMA描述符。
+           链路up时只需恢复netif层状态，PHY链路恢复后包自动传上来。 */
         netifapi_netif_set_up(netif);        /* 同样走 tcpip_thread */
         netifapi_netif_set_link_up(netif);
       }
@@ -419,6 +422,10 @@ static void lwip_dhcp_process(void *pvParameters)
               IP4_ADDR(&snm, g_lwipdev.netmask[0], g_lwipdev.netmask[1], g_lwipdev.netmask[2], g_lwipdev.netmask[3]);
               IP4_ADDR(&sgw, g_lwipdev.gateway[0], g_lwipdev.gateway[1], g_lwipdev.gateway[2], g_lwipdev.gateway[3]);
               netifapi_netif_set_addr(netif, &sip, &snm, &sgw);
+              /* ★DHCP超时回落后netif的ARP/接口状态可能不一致（DHCP期间IP=0.0.0.0导致ARP表脏），
+                 先down再up强制LWIP清ARP缓存、重新初始化接口、发gratuitous ARP，否则PC ping不通。 */
+              netifapi_netif_set_down(netif);
+              netifapi_netif_set_up(netif);
             }
             printf("Static IP: %d.%d.%d.%d / %d.%d.%d.%d / gw %d.%d.%d.%d\r\n",
                    g_lwipdev.ip[0], g_lwipdev.ip[1], g_lwipdev.ip[2], g_lwipdev.ip[3],
