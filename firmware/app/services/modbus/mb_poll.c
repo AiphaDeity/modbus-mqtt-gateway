@@ -12,6 +12,8 @@
 #include "main.h"
 #include "mb_pointmap.h"
 #include <stdio.h>
+#include "modbus_test.c"
+
 
 /* ========= 全局变量定义（mb_internal.h 里 extern 给其他文件）========= */
 modbusHandler_t hModbusMaster;
@@ -20,6 +22,16 @@ mb_handle_t *mb_handle = NULL;
 extern UART_HandleTypeDef huart3;
 #define MODBUS_RS485_UART  &huart3
 
+/* 接收链路诊断计数（定义在 UARTCallback.c） */
+// extern volatile uint32_t mb_dbg_rx_bytes;
+// extern volatile uint32_t mb_dbg_uart_err;
+// extern volatile uint32_t mb_dbg_uart_err_cnt;
+
+/* ========= 测试用例入口（定义在 modbus_test.c）========= */
+extern void test_add_three_slaves(void);
+extern void test_read_snapshot(void);
+extern void test_parse_points(void);
+extern void test_write_operations(void);
 /* ========= 内部静态函数 ========= */
 
 /**
@@ -55,6 +67,9 @@ static uint8_t mb_poll_idle(void)
 
     // ========== 2. 正常读轮询 ==========
     uint32_t now = osKernelGetTickCount();
+    mb_slave_runtime_t *best_slave = NULL;
+    uint32_t best_age = 0;
+
     for (uint8_t i = 0; i < mb_handle->slave_max_num; i++)
     {
         mb_slave_runtime_t *slave = &mb_handle->slave_list[i];
@@ -69,14 +84,23 @@ static uint8_t mb_poll_idle(void)
         // 采集周期
         if ((now - slave->last_trigger_tick) < slave->telegram.collect_interval_ms) continue;
 
-        mb_handle->waiting_slave = slave;
-        mb_handle->waiting_is_write = 0;
-        slave->last_trigger_tick = now;
-        mb_handle->state = MB_STATE_TX;
-        return 1;
+        // 在"已到期"的从站里选最久没采集的那个：
+        // 若按数组顺序遇到第一个就返回，排在前面的快周期从站会把后面的从站饿死
+        uint32_t age = now - slave->last_trigger_tick;
+        if (best_slave == NULL || age > best_age)
+        {
+            best_slave = slave;
+            best_age = age;
+        }
     }
 
-    return 0;
+    if (best_slave == NULL) return 0;
+
+    mb_handle->waiting_slave = best_slave;
+    mb_handle->waiting_is_write = 0;
+    best_slave->last_trigger_tick = now;
+    mb_handle->state = MB_STATE_TX;
+    return 1;
 }
 
 static void mb_poll_tx(void)
@@ -108,7 +132,16 @@ static void mb_poll_tx(void)
 
     if (osMessageQueueGetCount(hModbusMaster.QueueTelegramHandle) >= MAX_TELEGRAMS)
     {
-        MB_LOGW("queue full, skip slave %d", slave->telegram.u8id);
+        /* 队列满 = master 任务没在取帧，打印现场便于定位（只在此异常时输出） */
+        MB_LOGW("queue full, skip slave %d | q=%u master=%d libstate=%d in=%u err=%u rx=%u uart=%d",
+                slave->telegram.u8id,
+                (unsigned int)osMessageQueueGetCount(hModbusMaster.QueueTelegramHandle),
+                (int)eTaskGetState((TaskHandle_t)hModbusMaster.myTaskModbusAHandle),
+                (int)hModbusMaster.i8state,
+                (unsigned int)hModbusMaster.u16InCnt,
+                (unsigned int)hModbusMaster.u16errCnt,
+                (unsigned int)hModbusMaster.xBufferRX.u8available,
+                (int)HAL_UART_GetState(hModbusMaster.port));
         mb_handle->state = MB_STATE_IDLE;
         mb_handle->waiting_slave = NULL;
         return;
@@ -120,7 +153,25 @@ static void mb_poll_tx(void)
 
 static void mb_poll_wait_ack(void)
 {
-    uint32_t notify_val = ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    /* 等应答前必须保证 RX 中断是开的：HAL 一旦遇到 ORE/FE/NE 会关掉 RXNEIE，
+     * 如果没人重启，本轮和之后所有应答都会被丢弃（现场表现就是
+     * rxneie=0 + 每帧都 1200ms 超时）。这里做一次兜底重启。 */
+    if (hModbusMaster.xTypeHW == USART_HW &&
+        hModbusMaster.port->RxState == HAL_UART_STATE_READY &&
+        (hModbusMaster.port->Instance->CR1 & USART_CR1_RXNEIE) == 0U)
+    {
+        HAL_UART_Receive_IT(hModbusMaster.port, &hModbusMaster.dataRX, 1);
+    }
+
+    // 限时等待：正常完成通知只可能是错误码（-8..-11），0 表示"没收到任何通知"
+    uint32_t notify_val = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(TIMEOUT_MODBUS + 200U));
+    if (notify_val == 0U)
+    {
+        // master 侧卡住（发送/中断异常）时，这里绝不能无限阻塞，按超时处理并复位状态机
+        MB_LOGE("wait_ack: no notify in %u ms, force TIMEOUT",
+                (unsigned int)(TIMEOUT_MODBUS + 200U));
+        notify_val = (uint32_t)(int32_t)ERR_TIME_OUT;
+    }
     mb_errot_t err = (mb_errot_t)(int32_t)notify_val;
 
     // ========== 写请求应答 ==========
@@ -192,6 +243,12 @@ static void mb_poll_wait_ack(void)
             slave->is_online = 0;
             slave->fail_count++;
 
+            MB_LOGW("TIMEOUT slave=%d fc=%d addr=%u qty=%u, fail_count=%d | rxneie=%d rxstate=%d",
+                    slave->telegram.u8id, slave->telegram.u8fct,
+                    slave->telegram.u16RegAdd, slave->telegram.u16CoilsNo, slave->fail_count,
+                    (int)((huart3.Instance->CR1 & USART_CR1_RXNEIE) != 0),
+                    (int)huart3.RxState);
+
             if (slave->fail_count <= slave->telegram.retry_cnt)
             {
                 mb_handle->state = MB_STATE_TX;
@@ -227,13 +284,13 @@ static void mb_poll_err(void)
  */
 void Modbus_Init(void)
 {
-    MB_LOGE("Modbus初始化");
+    MB_LOGI("Modbus初始化");
 
     // 填充主站配置
     hModbusMaster.uModbusType = MB_MASTER;
     hModbusMaster.port         = MODBUS_RS485_UART;
     hModbusMaster.u8id         = 0;   // 主站 ID 强制为 0
-    hModbusMaster.EN_Port      = RS485_DIR_GPIO_Port;
+    hModbusMaster.EN_Port      = RS485_DIR_GPIO_Port;  // 485模块自动切换，无需 DE/RE 控制
     hModbusMaster.EN_Pin       = RS485_DIR_Pin;
     hModbusMaster.xTypeHW      = USART_HW;
     hModbusMaster.u16timeOut   = TIMEOUT_MODBUS;
@@ -250,15 +307,18 @@ void Modbus_Init(void)
  */
 void vModbusPollTask(void *argument)
 {
+    //test_add_three_slaves();
     for (;;)
     {
         mb_poll_slave();
-
-        // 只有 IDLE 且无事可做时才 delay；WAIT_ACK 内部已 block
         if (mb_handle->idle_no_work)
         {
             osDelay(1);
         }
+
+        //test_read_snapshot();
+        //test_parse_points();
+        //test_write_operations();
     }
 }
 

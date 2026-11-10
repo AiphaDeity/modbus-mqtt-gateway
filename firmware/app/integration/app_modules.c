@@ -129,7 +129,7 @@ static AppModuleSlot module_slots[APP_MODULE_COUNT] =
 {
   [APP_MODULE_STORAGE] =
   {
-    .init = Storage_Init, .task = Storage_Task, .attributes = &storage_attributes,
+    .init = NULL/*Storage_Init*/, .task = NULL/*Storage_Task*/, .attributes = &storage_attributes,
     .result = APP_MODULE_INIT_NOT_READY, .task_state = APP_MODULE_TASK_NOT_STARTED
   },
   [APP_MODULE_CONFIG] =
@@ -144,12 +144,12 @@ static AppModuleSlot module_slots[APP_MODULE_COUNT] =
   },
   [APP_MODULE_MQTT] =
   {
-    .init = MqttClient_Init, .task = MqttClient_Task, .attributes = &mqtt_attributes,
+    .init = NULL/*MqttClient_Init*/, .task = NULL/*MqttClient_Task*/, .attributes = &mqtt_attributes,
     .result = APP_MODULE_INIT_NOT_READY, .task_state = APP_MODULE_TASK_NOT_STARTED
   },
   [APP_MODULE_TELEMETRY] =
   {
-    .init = Telemetry_Init, .task = Telemetry_Task, .attributes = &telemetry_attributes,
+    .init = NULL/*Telemetry_Init*/, .task = NULL/*Telemetry_Task*/, .attributes = &telemetry_attributes,
     .result = APP_MODULE_INIT_NOT_READY, .task_state = APP_MODULE_TASK_NOT_STARTED
   },
   [APP_MODULE_MONITOR] =

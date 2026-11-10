@@ -43,6 +43,9 @@ set(GATEWAY_APP_LINKER_SCRIPT "${CMAKE_CURRENT_LIST_DIR}/../STM32F407xx_FLASH.ld
 set(CMAKE_EXE_LINKER_FLAGS "${TARGET_FLAGS}")
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -T \"${GATEWAY_APP_LINKER_SCRIPT}\"")
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} --specs=nano.specs")
+# newlib-nano 默认不链接浮点格式化代码，printf("%f") 会输出空白；
+# 显式拉入 _printf_float，否则日志里的浮点点位值全是空的。
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -u _printf_float")
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-Map=${CMAKE_PROJECT_NAME}.map -Wl,--gc-sections")
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--print-memory-usage")
 set(TOOLCHAIN_LINK_LIBRARIES "m")

@@ -41,7 +41,7 @@ void test_add_three_slaves(void)
     /* -------------------- 1 号从站：读线圈（FC01） --------------------
      * 地址 0，读 8 位（8 个线圈打包到 reg_data_buf[0] 的低 8 位）
      */
-    modbus_t cfg1 = {
+    static modbus_t cfg1 = {
         .u8id               = 1,
         .u8fct              = MB_FC_READ_COILS,       // FC01
         .u16RegAdd          = 0,
@@ -54,7 +54,7 @@ void test_add_three_slaves(void)
     };
 
     // 线圈点位表：8 个线圈 → 全部在 reg[0]，bit_index = 线圈下标
-    mb_point_t points1[MB_POINTS_PER_SLAVE] = {0};
+    static mb_point_t points1[MB_POINTS_PER_SLAVE] = {0};
     for (int i = 0; i < 8; i++)
     {
         points1[i].valid       = 1;
@@ -74,7 +74,7 @@ void test_add_three_slaves(void)
     /* -------------------- 2 号从站：读保持寄存器（FC03） --------------------
      * 地址 0，读 2 个寄存器
      */
-    modbus_t cfg2 = {
+    static modbus_t cfg2 = {
         .u8id               = 2,
         .u8fct              = MB_FC_READ_REGISTERS,    // FC03
         .u16RegAdd          = 0,
@@ -86,7 +86,7 @@ void test_add_three_slaves(void)
         .retry_cnt          = 2,
     };
 
-    mb_point_t points2[MB_POINTS_PER_SLAVE] = {0};
+    static mb_point_t points2[MB_POINTS_PER_SLAVE] = {0};
     points2[0].valid       = 1;
     points2[0].reg_index   = 0;
     points2[0].data_type   = MB_DT_UINT16;
@@ -110,7 +110,7 @@ void test_add_three_slaves(void)
     /* -------------------- 3 号从站：读输入寄存器（FC04） --------------------
      * 地址 0，读 2 个寄存器（第二个拼 32 位）
      */
-    modbus_t cfg3 = {
+    static modbus_t cfg3 = {
         .u8id               = 3,
         .u8fct              = MB_FC_READ_INPUT_REGISTER,  // FC04
         .u16RegAdd          = 0,
@@ -122,7 +122,7 @@ void test_add_three_slaves(void)
         .retry_cnt          = 0,
     };
 
-    mb_point_t points3[MB_POINTS_PER_SLAVE] = {0};
+    static mb_point_t points3[MB_POINTS_PER_SLAVE] = {0};
     points3[0].valid       = 1;
     points3[0].reg_index   = 0;
     points3[0].data_type   = MB_DT_INT16;             // 有符号
@@ -224,6 +224,43 @@ void test_parse_points(void)
     MB_LOGI("====== test_parse_points END ======");
 }
 
+/* =========================================================
+ * 测试用 3.5：写操作验证（FC05 写线圈 / FC06 写保持寄存器）
+ * ========================================================= */
+
+void test_write_operations(void)
+{
+    static uint8_t  done      = 0;
+    static uint32_t start_tick = 0;
+
+    if (done) return;
+
+    if (start_tick == 0)
+        start_tick = osKernelGetTickCount();
+
+    /* 等系统先跑几轮读轮询，再投写请求，便于观察"写抢占读" */
+    if ((osKernelGetTickCount() - start_tick) < 10000U)
+        return;
+
+    MB_LOGI("====== test_write_operations START ======");
+
+    /* ---------- id=4：写单线圈（FC05），线圈 0 = ON ---------- */
+    uint16_t coil_val = 1;   /* 1=ON, 0=OFF；库内自动转 0xFF00/0x0000 */
+    mb_status_e r1 = mb_inject_write(4, MB_FC_WRITE_COIL,
+                                     0, 1, &coil_val,
+                                     NULL, NULL, 0);
+    MB_LOGI("  inject FC05 slave4 coil0=ON ret=%d", r1);
+
+    /* ---------- id=5：写单保持寄存器（FC06），地址 0 = 0x1234 ---------- */
+    uint16_t reg_val = 0x1234;
+    mb_status_e r2 = mb_inject_write(5, MB_FC_WRITE_REGISTER,
+                                     0, 1, &reg_val,
+                                     NULL, NULL, 0);
+    MB_LOGI("  inject FC06 slave5 reg0=0x%04X ret=%d", reg_val, r2);
+
+    done = 1;
+    MB_LOGI("====== test_write_operations END (poll will log write OK/FAIL) ======");
+}
 
 /* =========================================================
  * 测试用 4：删除 + 再加回来（验证 RAM 状态机正确）
