@@ -49,22 +49,24 @@
    否则 DMA 和协议栈读写可能出问题 */
 #define MEM_ALIGNMENT               4
 
-/* ★协议栈堆内存大小：16KB
+/* ★协议栈堆内存大小：12KB
    lwip 的动态分配（mem_malloc）都从这块堆走，TCP 发送缓冲等大块内存也在这。
-   例程原值 16KB（F407 够跑 TCP/UDP/DHCP），不够时看编译期 LWIP_MEM 统计再加 */
-#define MEM_SIZE                    (16*1024)
+   与 FreeRTOS heap(32KB) 独立。MQTT 客户端 TCP 发送缓冲走 FreeRTOS heap，
+   lwip 这边够 DHCP/UDP/TCPIP mailbox 就行。SRAM 128KB 装得下 MEM_SIZE 12KB + heap 32KB。 */
+#define MEM_SIZE                    (12*1024)
 
-/* 内存池数量（MEMP_NUM_xxx = 每种对象预分配的个数，编译期固定）：
-   例程原值，对应 F407 上"同时 4 个 TCP + 2 个监听 + 20 个收包缓冲"的典型用量 */
-#define MEMP_NUM_PBUF               15
-#define MEMP_NUM_UDP_PCB            4
-#define MEMP_NUM_TCP_PCB            4
-#define MEMP_NUM_TCP_PCB_LISTEN     2
-#define MEMP_NUM_TCP_SEG            150   /* TCP 分段缓冲（150 段，配合 TCP_WND 用） */
-#define MEMP_NUM_SYS_TIMEOUT        6     /* 系统超时回调槽位（tcp/arp/dhcp/igmp 等要注册超时） */
+/* 内存池数量（Day3 裁剪：单 MQTT 连接够用） */
+#define MEMP_NUM_PBUF               6     /* 原 15：原始 pbuf，只给 IP 分片用，6 够 */
+#define MEMP_NUM_UDP_PCB            2     /* 原 4：DHCP 占 1 个，留 1 个余量 */
+#define MEMP_NUM_TCP_PCB            2     /* 原 4：MQTT 只占 1 个，留 1 个余量 */
+#define MEMP_NUM_TCP_PCB_LISTEN     0     /* 原 2：我们不做 TCP 服务器，关掉 */
+#define MEMP_NUM_TCP_SEG            32    /* 原 150：TCP 分段缓冲，32 段够发小 JSON */
+#define MEMP_NUM_SYS_TIMEOUT        6     /* 原 6：arp/dhcp/tcp 等超时槽位，不动 */
 
 /* ---------- Pbuf 选项 ---------- */
-#define PBUF_POOL_SIZE              20    /* pbuf 池个数（收包缓冲，配下面单块大小） */
+/* 原 20 是给多连接收包池。我们单 TCP + MQTT，8 个 pbuf 足够。
+   省 12 × 1514B ≈ 18KB */
+#define PBUF_POOL_SIZE              8
 /* ★单块 pbuf 大小 = TCP_MSS(1460) + 40(IP+TCP头) + 链路层头尾 ≈ 1514，
    正好装得下一个完整以太网帧。LWIP_MEM_ALIGN_SIZE 按 4 对齐 */
 #define PBUF_POOL_BUFSIZE           LWIP_MEM_ALIGN_SIZE(TCP_MSS+40+PBUF_LINK_ENCAPSULATION_HLEN+PBUF_LINK_HLEN)
@@ -72,12 +74,13 @@
 /* ---------- TCP 选项 ---------- */
 #define LWIP_TCP                    1     /* 开 TCP（以后 MQTT 走 TCP） */
 #define TCP_TTL                     255   /* TCP 报文 TTL=255（最大，本地网无所谓） */
-#define TCP_QUEUE_OOSEQ             0     /* ★不缓存乱序到达的 TCP 段
-   省内存：F407 内存有限，乱序缓存很吃内存，0 = 乱序段直接丢弃由 TCP 重传机制兜底 */
-#define TCP_MSS                     (1500 - 40)  /* ★最大段大小 = MTU 1500 - IP头20 - TCP头20 = 1460 */
-#define TCP_SND_BUF                 (11*TCP_MSS) /* 发送缓冲 11 段 ≈ 16KB（一个完整 MSS 窗口） */
-#define TCP_SND_QUEUELEN            (8*TCP_SND_BUF/TCP_MSS)  /* 发送队列长度（可排队 8 个缓冲窗口） */
-#define TCP_WND                     (20*TCP_MSS) /* 接收窗口 20 段 ≈ 29KB（对方能连发这么多不用等 ACK） */
+#define TCP_QUEUE_OOSEQ             0     /* 不缓存乱序段，省内存 */
+#define TCP_MSS                     (1500 - 40)  /* 最大段大小 = 1460 */
+/* 原 11×MSS=16KB 发送缓冲，我们只发 200B JSON，2×MSS=2.9KB 够 */
+#define TCP_SND_BUF                 (2*TCP_MSS)
+#define TCP_SND_QUEUELEN            (4*TCP_SND_BUF/TCP_MSS)
+/* 原 20×MSS=29KB 接收窗口，我们只收 broker 的 PINGRESP/命令包，4×MSS=5.8KB 够 */
+#define TCP_WND                     (4*TCP_MSS)
 
 /* ---------- ICMP（★ping 必须，不开 ping 不通） ---------- */
 #define LWIP_ICMP                   1
@@ -120,36 +123,28 @@
   #define CHECKSUM_CHECK_TCP        1
 #endif
 
-/* ---------- API：带 OS 用 Netconn + Socket ---------- */
-/* ★LWIP_NETCONN=1：提供 netconn API（lwip 的高级线程安全 API，例程 TCP 客户端用它）
-   LWIP_SOCKET=1：提供类 BSD socket API（以后 MQTT 客户端库一般用 socket）
-   两个都开：以后 Day3 MQTT 移植时不挑库 */
+/* ---------- API：带 OS 用 Netconn（不用 socket） ---------- */
+/* LWIP_NETCONN=1：netconn API，我们 MQTT 客户端直接用它 */
 #define LWIP_NETCONN                1
-#define LWIP_SOCKET                 1
-/* LWIP_NETIF_API=1：开 netifapi_* 系列（netif_set_up/down/link/set_addr、dhcp_start/stop 的
-   线程安全封装）。带 OS 且 LWIP_TCPIP_CORE_LOCKING=0 时，别的任务要改 netif 状态必须走它，
-   函数体才会编进 lwip 库（评审要求：链路/DHCP 线程不能直接动 netif）。 */
+/* LWIP_SOCKET=0：不用 BSD socket API，省代码省内存（我们 netconn 手写 MQTT） */
+#define LWIP_SOCKET                 0
+/* LWIP_NETIF_API=1：netifapi_* 线程安全封装，链路/DHCP 要用 */
 #define LWIP_NETIF_API              1
 
-/* ---------- 操作系统选项（线程配置，例程原值） ---------- */
-/* 默认邮箱大小（netconn/socket 层的收包邮箱容量，10 条消息缓存） */
-#define DEFAULT_UDP_RECVMBOX_SIZE       10
-#define DEFAULT_TCP_RECVMBOX_SIZE       10
-#define DEFAULT_ACCEPTMBOX_SIZE         10
-/* 默认线程栈：1KB（sys_arch 会把"字节"换算成 FreeRTOS 的"字"） */
+/* ---------- 操作系统选项（Day3 裁剪） ---------- */
+/* 邮箱大小：原 10，单连接 4 够 */
+#define DEFAULT_UDP_RECVMBOX_SIZE       4
+#define DEFAULT_TCP_RECVMBOX_SIZE       4
+#define DEFAULT_ACCEPTMBOX_SIZE         4
+/* 默认线程栈：1KB */
 #define DEFAULT_THREAD_STACKSIZE        1024
 
-/* ★tcpip 内核线程配置：
-   名字 "lwip_thread"、邮箱 8 条、优先级 = configMAX_PRIORITIES-2（最高档，但留 2 级给更关键的中断级任务）。
-   所有协议栈处理都在这线程里，优先级必须高于业务线程。
-   ★栈的单位陷阱：本工程 sys_arch.c 里 LWIP_FREERTOS_THREAD_STACKSIZE_IS_STACKWORDS=1，
-   即 sys_thread_new 的 stacksize 按"字"（4 字节）算，不是字节！
-   所以这里写 1280 字 = 5KB（lwip 注释里的"2048 字节"在本工程实际是 8KB，太吃 heap） */
+/* tcpip 内核线程 */
 #define TCPIP_THREAD_NAME              "lwip_thread"
 #define TCPIP_THREAD_STACKSIZE          1280
-#define TCPIP_MBOX_SIZE                 8
+#define TCPIP_MBOX_SIZE                 4     /* 原 8，裁剪一半 */
 #define TCPIP_THREAD_PRIO               (configMAX_PRIORITIES - 2)
-#define LWIP_SO_RCVTIMEO                1   /* 允许 socket 接收设超时（以后 MQTT 库轮询用得到） */
+#define LWIP_SO_RCVTIMEO                1   /* netconn 收超时要用 */
 
 /* ---------- 调试 ---------- */
 #define LWIP_DEBUG                      LWIP_DBG_OFF   /* ★关闭 lwip 内部调试打印（否则串口刷屏） */

@@ -36,7 +36,9 @@ add_executable(${CMAKE_PROJECT_NAME})
 
 # Add STM32CubeMX generated sources
 add_subdirectory(cmake/stm32cubemx)
-add_subdirectory(Middlewares/LwIP)
+if(GATEWAY_ENABLE_M2)
+    add_subdirectory(Middlewares/LwIP)
+endif()
 add_subdirectory(bsp)
 add_subdirectory(integration)
 add_subdirectory(services/modbus)
@@ -66,7 +68,8 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
 
 # Add project symbols (macros)
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
-    # Add user defined symbols
+    # M2 开关，供 app_entry.c 等源码裁剪以太网初始化
+    GATEWAY_ENABLE_M2=$<BOOL:${GATEWAY_ENABLE_M2}>
 )
 
 # Remove wrong libob.a library dependency when using cpp files
@@ -75,12 +78,14 @@ list(REMOVE_ITEM CMAKE_C_IMPLICIT_LINK_LIBRARIES ob)
 # Add linked libraries
 target_link_libraries(${CMAKE_PROJECT_NAME}
     stm32cubemx
-    lwip
-    m2_ethernet
 
     # Add user defined libraries
     modbus
 )
+
+if(GATEWAY_ENABLE_M2)
+    target_link_libraries(${CMAKE_PROJECT_NAME} lwip m2_ethernet)
+endif()
 
 
 # ========== POST_BUILD：编译elf成功之后自动执行的命令 ==========

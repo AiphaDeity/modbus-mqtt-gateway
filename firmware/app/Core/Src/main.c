@@ -97,22 +97,42 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_USART1_UART_Init();
+  setvbuf(stdout, NULL, _IONBF, 0);
+  printf("boot: USART1 OK, before DMA\r\n");
   MX_DMA_Init();
+  printf("boot: DMA OK, before ETH\r\n");
   MX_ETH_Init();
+  printf("boot: ETH OK\r\n");
   MX_I2C1_Init();
+  printf("boot: I2C1 OK\r\n");
   MX_SPI2_Init();
+  printf("boot: SPI2 OK\r\n");
   MX_USART2_UART_Init();
   MX_USART3_UART_Init();
   MX_TIM7_Init();
-  MX_USART1_UART_Init();
   MX_SDIO_SD_Init();
+  printf("boot: SDIO OK\r\n");
   MX_FATFS_Init();
+  printf("boot: FATFS OK\r\n");
+  printf("[DBG] all MX_*_Init done\r\n"); fflush(stdout);
+
+  /* ★排障：打印本次复位原因（掉电/外部复位/软件/看门狗），打印后清标志 */
+  {
+    uint32_t csr = RCC->CSR;
+    printf("[BOOT] reset: POR=%d BOR=%d PIN=%d SW=%d IWDG=%d WWDG=%d LPWR=%d CSR=0x%08lX\r\n",
+           (csr & RCC_CSR_PORRSTF)  ? 1 : 0,
+           (csr & RCC_CSR_BORRSTF)  ? 1 : 0,
+           (csr & RCC_CSR_PINRSTF)  ? 1 : 0,
+           (csr & RCC_CSR_SFTRSTF)  ? 1 : 0,
+           (csr & RCC_CSR_IWDGRSTF) ? 1 : 0,
+           (csr & RCC_CSR_WWDGRSTF) ? 1 : 0,
+           (csr & RCC_CSR_LPWRRSTF) ? 1 : 0,
+           (unsigned long)csr);
+    fflush(stdout);
+    __HAL_RCC_CLEAR_RESET_FLAGS();
+  }
   /* USER CODE BEGIN 2 */
-  /* ★排障修复：Picolibc 的 stdout 默认是全缓冲的——printf 的内容会攒在缓冲区里，
-     缓冲区不满就不调 _write（串口），导致只有带 fflush 的 "Gateway boot" 能显示，
-     ethernet.c 里 connected/DHCP/static IP 等 printf 全部被吞。
-     这里把 stdout 设成"无缓冲"：每行 printf 立即送到串口，不再依赖 fflush。 */
-  setvbuf(stdout, NULL, _IONBF, 0);
   printf("Gateway boot\r\n");
   /* ★排障修复：osKernelInitialize 必须先于任何 os 对象创建（MX_FREERTOS_Init 会检查内核状态）。 */
   osKernelInitialize();

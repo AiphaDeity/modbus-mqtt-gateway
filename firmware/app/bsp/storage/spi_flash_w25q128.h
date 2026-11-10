@@ -49,4 +49,13 @@ HAL_StatusTypeDef spi_flash_w25q128_write(uint32_t addr, const uint8_t *buf, uin
 // 等待写入完成（轮询忙位，有超时保护）
 HAL_StatusTypeDef spi_flash_w25q128_wait_ready(uint32_t timeout_ms);
 
+/*
+ * 【临时诊断】读状态寄存器，用于定位“写入返回成功但回读校验失败”。
+ * SR1(0x05)：bit0 BUSY，bit1 WEL，bit2..4 BP0..2，bit7 SRP0
+ * SR2(0x35)：bit0 SRP1
+ * 定位完成后可删除这两个函数。
+ */
+uint8_t spi_flash_w25q128_read_sr1(void);
+uint8_t spi_flash_w25q128_read_sr2(void);
+
 #endif /* SPI_FLASH_W25Q128_H */

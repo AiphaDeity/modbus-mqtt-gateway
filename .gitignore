@@ -25,3 +25,9 @@ CMakeUserPresets.json
 *.map
 *.bin
 *.hex
+firmware/app/build/
+firmware/bootloader/build/
+烧录.bat
+
+# IDE 工作区文件（TRAE / VS Code 自动生成，误放出现在源码目录时不要提交）
+*.code-workspace

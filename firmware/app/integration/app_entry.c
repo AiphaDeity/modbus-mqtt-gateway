@@ -3,7 +3,9 @@
 #include "app_readiness.h"
 #include "cmsis_os2.h"
 #include "main.h"
+#if GATEWAY_ENABLE_M2
 #include "ethernet.h"   /* m2_ethernet_init()：以太网/LwIP 初始化入口 */
+#endif
 #include <stdio.h>      /* printf：网络初始化失败时记录最小错误信息（不阻塞业务） */
 
 
@@ -16,6 +18,7 @@ void App_Entry(void *argument)
 {
   (void)argument;
 
+#if GATEWAY_ENABLE_M2
   /* ★网卡初始化必须在【任务上下文】里做，不能放回 main.c 的 osKernelStart 之前：
      m2_ethernet_init 内部的 taskENTER_CRITICAL()/taskEXIT_CRITICAL() 在调度器启动前
      会因 uxCriticalNesting 哨兵值(0xAAAAAAAA)配不平，把 BASEPRI 永久锁在 0x50，
@@ -40,6 +43,7 @@ void App_Entry(void *argument)
       printf("[App] m2_ethernet_init 最终失败：网络保持未就绪，继续装配其他模块\r\n");
     }
   }
+#endif /* GATEWAY_ENABLE_M2 */
 
   if (!App_ReadinessInit())
   {

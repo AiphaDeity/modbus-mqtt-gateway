@@ -170,10 +170,12 @@ uint32_t rtc_sd3078_to_unix(const rtc_datetime_t *dt)
     for (y = 2000; y < dt->year; y++) {
         days += ((y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)) ? 366 : 365;
     }
-    // 本年累计天数（简化版，未完全处理闰年 2 月，生产版可查表）
+    // 本年累计天数。闰年 2 月要按 29 天算，否则 3 月起会少算 1 天
     const int mdays[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
+    int leap_day = ((dt->year % 4 == 0 && dt->year % 100 != 0) ||
+                    (dt->year % 400 == 0)) ? 1 : 0;
     for (int m = 0; m < dt->month - 1; m++)
-        days += mdays[m];
+        days += mdays[m] + ((m == 1) ? leap_day : 0);
     days += (dt->day - 1);
 
     return (uint32_t)days * 86400U

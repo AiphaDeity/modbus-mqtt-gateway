@@ -80,7 +80,10 @@ void EXTI3_IRQHandler(void)
 
 AppModuleInitResult Storage_Init(void)
 {
-    /* 1. 创建 I2C1 总线互斥锁 */
+    /* 1. 创建 I2C1 总线互斥锁 
+    * 作用：I2C1是共享总线，SD3078、AHT20、INA226、PCA9555多个外设共用这条总线
+    * RTOS下多个任务同时访问I2C会出现总线冲突、数据错乱，所以用互斥锁保证同一时刻只有一个任务操作I2C1
+    */
     const osMutexAttr_t mutex_attr = {
         .name = "i2c1_mtx",
         .attr_bits = 0,
@@ -155,7 +158,7 @@ void Storage_Task(void *argument)
      * 按块调用 storage_config_read_chunk() 读取。
      */
     storage_config_reader_t cfg_rd;
-    (void)storage_config_open(&cfg_rd);
+    (void)storage_config_open(&cfg_rd);//打开配置，选择运行槽0，传入句柄指针
 
     // 启动时用当前 RTC 时间推进持久下界（不足阈值时内部自动跳过）
     uint32_t now = storage_get_unix_time();

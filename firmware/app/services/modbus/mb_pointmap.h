@@ -30,9 +30,9 @@
 #include <stdbool.h>
 
 /* ========= 常量 ========= */
-#define MB_POINT_NAME_MAX   16   // 点位名称最大长度（含 '\0'）
+#define MB_POINT_NAME_MAX   8   // 点位名称最大长度（含 '\0'）
 #define MB_POINT_UNIT_MAX    8   // 单位最大长度
-#define MB_POINTS_PER_SLAVE 32   // 每个从站最多 32 个点位
+#define MB_POINTS_PER_SLAVE 16   // 每个从站最多 16 个点位
                                  // （等于 MB_REG_MAX_PER_SLAVE，最多覆盖所有寄存器）
 
 /* ========= 数据类型枚举 ========= */

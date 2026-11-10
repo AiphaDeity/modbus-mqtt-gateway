@@ -10,5 +10,12 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/storage/sdcard_tf.c
 )
 
+# 以太网头文件路径始终保留（main.c 会 include ethernet.h），库本身按 M2 开关决定是否编译
+target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/ethernet
+)
+
 # Day2: 以太网 BSP 子模块（LAN8720A + LwIP 移植层）
-add_subdirectory(ethernet)
+if(GATEWAY_ENABLE_M2)
+    add_subdirectory(ethernet)
+endif()
