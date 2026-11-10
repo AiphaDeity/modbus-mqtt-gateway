@@ -2,18 +2,16 @@
 #include "main.h"
 #include "usart.h"
 
-// 普通 SRAM 的起点和末端后一地址；初始 MSP 允许等于末端后一地址
-#define BOOT_SRAM_START_ADDRESS 0x20000000U
+// 普通SRAM首64B为复位邮箱；栈指针须位于其后，允许等于SRAM末端后一地址。
+#define BOOT_SRAM_START_ADDRESS 0x20000040U
 #define BOOT_SRAM_END_ADDRESS   0x20020000U
 // 候选应用 Flash 区间：[0x08010000, 0x08080000)，起点同时为向量表基址
 #define BOOT_APP_START_ADDRESS  0x08010000U
 #define BOOT_APP_END_ADDRESS    0x08080000U
 
 /*
- * 在跳转前关闭当前 Bootloader 使用的串口，并恢复系统时钟配置。
- * 由跳转入口在中断和 HAL 滴答仍正常运行时调用，供 RCC 超时判断使用。
- * 全部成功返回 true，任一步失败返回 false；失败时可能已关闭部分硬件，
- * 不保证 USART1 仍可打印，也不在这里恢复已经清理的硬件。
+ * 关闭串口并恢复复位时钟配置，须在 HAL 滴答仍运行时调用。
+ * 失败可能已关闭部分硬件，不恢复外设，也不保证串口仍可输出。
  */
 static bool Boot_DeinitHardware(void)
 {
@@ -33,9 +31,8 @@ static bool Boot_DeinitHardware(void)
 }
 
 /*
- * 在硬件清理完成后停止 SysTick，关闭普通外设中断并清除挂起状态。
- * 仅供裸机主线程的跳转流程调用；返回时可屏蔽中断仍被屏蔽，
- * 后续不得再执行依赖 HAL 滴答的等待，最终由 Boot_EnterApp 恢复中断。
+ * 硬件清理后停止 SysTick，关闭外设中断并清除挂起状态。
+ * 返回时中断仍屏蔽，禁止再等待 HAL 滴答；最终交接时恢复中断。
  */
 static void Boot_StopInterrupts(void)
 {
@@ -85,12 +82,7 @@ static void Boot_EnterApp(uint32_t initial_sp, uint32_t reset_vector)
   );
 }
 
-/*
- * 检查向量表中的两个 32 位值：initial_sp 为初始 MSP，reset_vector 为复位向量。
- * MSP 的范围和对齐、入口的 Thumb 标记及地址范围全部满足时返回 true，
- * 任一条件不满足返回 false；本函数不访问硬件、不改变传入的值。
- * 只验证当前普通 SRAM 和候选应用区的地址约束，不验证固件完整性或认证。
- */
+// 检查 MSP 范围/对齐及 Thumb 入口地址，不检查固件认证或完整性。
 bool Boot_IsAppVectorValid(uint32_t initial_sp, uint32_t reset_vector)
 {
   // 栈向低地址增长，初始 MSP 允许等于 SRAM 末端
@@ -124,11 +116,7 @@ bool Boot_IsAppVectorValid(uint32_t initial_sp, uint32_t reset_vector)
 }
 
 
-/*
- * 从固定应用基址读取初始 MSP 和复位向量，返回地址约束检查结果。
- * 每个向量项占 4 字节；const 禁止通过该指针写入，volatile 保留实际读取。
- * 本函数只检查向量表，不清理硬件，也不执行跳转。
- */
+// 从固定 App 基址读取 MSP 和复位向量，仅返回地址约束检查结果。
 bool Boot_CheckAppVector(void)
 {
   uint32_t initial_sp = *(volatile const uint32_t *)BOOT_APP_START_ADDRESS;
@@ -138,11 +126,9 @@ bool Boot_CheckAppVector(void)
 
 
 /*
- * 尝试从当前裸机 Bootloader 跳转到固定地址的应用，成功后不返回。
- * 由 main 在特权线程上下文、中断和 HAL 滴答正常时调用；
- * BASEPRI、FAULTMASK 须保持复位值 0，应用镜像在检查和交接期间不得改写。
- * 向量检查或硬件清理失败返回 false，调用方停止交接；硬件可能已部分关闭。
- * 当前阶段不验证固件完整性或认证，不作为安全升级的最终放行依据。
+ * 清理硬件后从特权线程跳转 App，成功不返回；须先完成包认证及最终放行检查。
+ * 调用时中断和 HAL 滴答正常，BASEPRI/FAULTMASK 为 0，镜像在交接期间不可改写。
+ * 向量或清理失败返回 false，此时部分硬件可能已关闭。
  */
 bool Boot_JumpToApp(void)
 {

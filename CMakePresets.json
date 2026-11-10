@@ -28,7 +28,7 @@
         {
             "name": "BootDebug",
             "inherits": "Debug",
-            "toolchainFile":"${sourceDir}/firmware/bootloader/cmake/gcc-arm-none-eabi.cmake",
+            "toolchainFile": "${sourceDir}/firmware/bootloader/cmake/gcc-arm-none-eabi.cmake",
             "cacheVariables": {
                 "GATEWAY_FIRMWARE": "bootloader"
             }
@@ -38,7 +38,23 @@
             "inherits": "BootDebug",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "MinSizeRel",
-                "CMAKE_C_FLAGS_MINSIZEREL": "-Os -g3 -DDEBUG"
+                "CMAKE_C_FLAGS_MINSIZEREL": "-Os -g3"
+            }
+        },
+        {
+            "name": "BootReceiveTest",
+            "inherits": "BootSizeCheck",
+            "cacheVariables": {
+                "CMAKE_C_FLAGS_MINSIZEREL": "-Os -g3 -DDEBUG",
+                "BOOT_PACKAGE_RECEIVE_TEST": "ON",
+                "BOOT_FLASH_READ_DIAGNOSTIC": "ON"
+            }
+        },
+        {
+            "name": "BootRecoveryTest",
+            "inherits": "BootReceiveTest",
+            "cacheVariables": {
+                "BOOT_FLASH_READ_DIAGNOSTIC": "OFF"
             }
         },
         {
@@ -57,7 +73,6 @@
                 "GATEWAY_ENABLE_M2": "OFF"
             }
         }
-        
     ],
     "buildPresets": [
         {
@@ -75,6 +90,14 @@
         {
             "name": "BootSizeCheck",
             "configurePreset": "BootSizeCheck"
+        },
+        {
+            "name": "BootReceiveTest",
+            "configurePreset": "BootReceiveTest"
+        },
+        {
+            "name": "BootRecoveryTest",
+            "configurePreset": "BootRecoveryTest"
         },
         {
             "name": "AppDebug",

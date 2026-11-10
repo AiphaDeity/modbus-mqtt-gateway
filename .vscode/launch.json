@@ -2,6 +2,23 @@
   "version": "0.2.0",
   "configurations": [
     {
+      "name": "BootReceiveTest - read-only Flash diagnostic",
+      "type": "cortex-debug",
+      "request": "launch",
+      "cwd": "${workspaceFolder}",
+      "executable": "${workspaceFolder}/build/BootReceiveTest/firmware/bootloader/bootloader.elf",
+      "loadFiles": [
+        "${workspaceFolder}/build/BootReceiveTest/firmware/bootloader/bootloader.elf"
+      ],
+      "servertype": "openocd",
+      "serverpath": "${input:openocdExecutable}",
+      "armToolchainPath": "${input:armToolchainBin}",
+      "searchDir": ["${input:openocdScripts}"],
+      "configFiles": ["${input:probeConfig}", "target/stm32f4x.cfg"],
+      "openOCDLaunchCommands": ["adapter speed 1000", "reset_config none"],
+      "runToEntryPoint": "main"
+    },
+    {
       "name": "STM32F407 OpenOCD",
       "type": "cortex-debug",
       "request": "launch",

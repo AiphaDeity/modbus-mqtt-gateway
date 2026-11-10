@@ -24,11 +24,21 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "boot_watchdog.h"
 #include <stdio.h>
 #include <string.h>
 #include "boot_app_flash.h"
 #include "boot_package_flash.h"
+#include "boot_upgrade_state.h"
+#include "boot_trial.h"
+#include "boot_recovery.h"
+#include "boot_package_receive.h"
+#include "boot_install.h"
+#include "upgrade_trust.h"
 #include "boot_jump.h"
+#if defined(BOOT_PACKAGE_RECEIVE_TEST)
+#include "boot_test_keys.h"
+#endif
 #include "mbedtls/sha256.h"
 #include "mbedtls/ecdsa.h"
 #include "mbedtls/gcm.h"
@@ -41,6 +51,11 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define BOOT_STARTUP_TIMEOUT_MS 15000U
+#define BOOT_FLASH_TEST_TIMEOUT_MS 10000U
+#if defined(DEBUG) || defined(BOOT_PACKAGE_RECEIVE_TEST)
+#define BOOT_STARTUP_DIAGNOSTICS 1
+#endif
 
 /* USER CODE END PD */
 
@@ -68,6 +83,18 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+// 长操作返回后统一检查，监督失败不得转入回退、收包或App交接继续执行。
+static void Boot_ResetIfWatchdogFailed(const char *stage)
+{
+  if (Boot_WatchdogFailed())
+  {
+    printf("WDG supervision expired stage=%s; reset\r\n", stage);
+    __DSB();
+    NVIC_SystemReset();
+  }
+}
+
+#if defined(BOOT_STARTUP_DIAGNOSTICS)
 // 启动时用 Mbed TLS 附带的 NIST 向量检查认证解密和标签篡改拒绝。
 static void Boot_TestGcm(void)
 {
@@ -129,7 +156,7 @@ static void Boot_TestGcm(void)
   uint8_t plaintext[sizeof(ciphertext)]; 
   mbedtls_gcm_context context;
 
-  mbedtls_gcm_init(&context);  // 构造上下文
+  mbedtls_gcm_init(&context);
   int result = mbedtls_gcm_setkey(&context, MBEDTLS_CIPHER_ID_AES, key, 256U);
   if (result == 0)
   {
@@ -137,7 +164,7 @@ static void Boot_TestGcm(void)
                                      NULL, 0U, tag, sizeof(tag), ciphertext, plaintext);
   }
 
-  if (result != 0)  // 正向：有效标签 → 应解密成功且明文匹配
+  if (result != 0)
   {
     printf("GCM valid tag test failed (%d)\r\n", result);
   }
@@ -148,7 +175,7 @@ static void Boot_TestGcm(void)
   else
   {
     printf("GCM valid tag accepted, plaintext matched\r\n");
-    tag[0] ^= 1U;  //// 反向：翻转标签一个比特 → 必须被拒
+    tag[0] ^= 1U;  // 翻转标签一位，检查认证是否拒绝篡改。
     result = mbedtls_gcm_auth_decrypt(&context, sizeof(ciphertext), iv, sizeof(iv),
                                      NULL, 0U, tag, sizeof(tag), ciphertext, plaintext);
     if (result == MBEDTLS_ERR_GCM_AUTH_FAILED)
@@ -201,35 +228,11 @@ static void Boot_TestEcdsa(void)
     0xF3U, 0xE9U, 0x00U, 0xDBU, 0xB9U, 0xAFU, 0xF4U, 0x06U,
     0x4DU, 0xC4U, 0xABU, 0x2FU, 0x84U, 0x3AU, 0xCDU, 0xA8U,
   };
-  mbedtls_ecp_group group;  // 曲线参数对象（SECP256R1 曲线）
-  mbedtls_ecp_point public_key;  // 曲线上的点对象（公钥）
-  mbedtls_mpi r;  // 大整数对象（256 位 r、s）
-  mbedtls_mpi s;
-  int result;
-
-  mbedtls_ecp_group_init(&group);  // 加载 P-256 曲线参数
-  mbedtls_ecp_point_init(&public_key);  // 把 65 字节公钥读进 point 对象
-  mbedtls_mpi_init(&r);  // 把大端字节读进大数 r
-  mbedtls_mpi_init(&s);  
-
-  result = mbedtls_ecp_group_load(&group, MBEDTLS_ECP_DP_SECP256R1);
-  if (result == 0)
-  {
-    result = mbedtls_ecp_point_read_binary(&group, &public_key,
-                                          public_key_bytes, sizeof(public_key_bytes));
-  }
-  if (result == 0)
-  {
-    result = mbedtls_mpi_read_binary(&r, signature_r, sizeof(signature_r));
-  }
-  if (result == 0)
-  {
-    result = mbedtls_mpi_read_binary(&s, signature_s, sizeof(signature_s));
-  }
-  if (result == 0)
-  {
-    result = mbedtls_ecdsa_verify(&group, digest, sizeof(digest), &public_key, &r, &s);
-  }
+  // 自测与真实包走同一分段实现，保留错误码以区分篡改拒绝和内部故障。
+  uint8_t signature[64];
+  memcpy(signature, signature_r, sizeof(signature_r));
+  memcpy(signature + sizeof(signature_r), signature_s, sizeof(signature_s));
+  int result = Boot_PackageVerifyDigestResult(digest, signature, public_key_bytes);
 
   if (result == 0)
   {
@@ -237,7 +240,7 @@ static void Boot_TestEcdsa(void)
 
     // 反向测试：篡改必须被拒绝
     digest[0] ^= 1U;
-    result = mbedtls_ecdsa_verify(&group, digest, sizeof(digest), &public_key, &r, &s);
+    result = Boot_PackageVerifyDigestResult(digest, signature, public_key_bytes);
     if (result == MBEDTLS_ERR_ECP_VERIFY_FAILED)
     {
       printf("ECDSA modified digest rejected\r\n");
@@ -252,12 +255,10 @@ static void Boot_TestEcdsa(void)
     printf("ECDSA valid signature test failed (%d)\r\n", result);
   }
 
-  mbedtls_mpi_free(&s);
-  mbedtls_mpi_free(&r);
-  mbedtls_ecp_point_free(&public_key);
-  mbedtls_ecp_group_free(&group);
 }
 
+
+#endif
 
 #if defined(DEBUG)
 // 对空白扇区 7 做一次擦除、写入、读回和清理测试。
@@ -331,6 +332,14 @@ int main(void)
 
   /* USER CODE BEGIN Init */
 
+  // 复位标志每次Boot消费一次，冷启动/外部复位不接受残留确认消息。
+  uint32_t reset_flags = RCC->CSR;
+  bool software_reset = ((reset_flags & RCC_CSR_SFTRSTF) != 0U)
+                     && ((reset_flags & (RCC_CSR_PORRSTF | RCC_CSR_BORRSTF
+                                        | RCC_CSR_IWDGRSTF | RCC_CSR_WWDGRSTF)) == 0U);
+  Boot_TrialBegin((volatile uint32_t *)UPGRADE_MAILBOX_ADDRESS, software_reset);
+  __HAL_RCC_CLEAR_RESET_FLAGS();
+
   /* USER CODE END Init */
 
   /* Configure the system clock */
@@ -346,7 +355,26 @@ int main(void)
   MX_SPI2_Init();
   /* USER CODE BEGIN 2 */
 
-  // 用固定输入 "abc" 检查 SHA-256 是否接通。
+#if !defined(BOOT_FLASH_READ_DIAGNOSTIC)
+  // 基础外设就绪后启狗，覆盖后续诊断、升级和串口维护。
+  if (!Boot_WatchdogStart())
+  {
+    Error_Handler();
+  }
+  uint32_t boot_started_ms = HAL_GetTick();
+  printf("WDG active before startup diagnostics\r\n");
+#endif
+
+  // 发送唤醒命令退出 Flash 深度掉电模式，不修改存储内容。
+  uint8_t wake_command = 0xABU;
+  HAL_GPIO_WritePin(SPI_FLASH_CS_GPIO_Port, SPI_FLASH_CS_Pin, GPIO_PIN_RESET);
+  HAL_StatusTypeDef wake_status = HAL_SPI_Transmit(&hspi2, &wake_command, 1U, 10U);
+  HAL_GPIO_WritePin(SPI_FLASH_CS_GPIO_Port, SPI_FLASH_CS_Pin, GPIO_PIN_SET);
+  HAL_Delay(1U);
+  printf("Flash wake: HAL status=%u\r\n", (unsigned int)wake_status);
+
+#if defined(BOOT_STARTUP_DIAGNOSTICS)
+  // 输出固定输入 "abc" 的 SHA-256，供启动诊断核对。
   const uint8_t sha_input[] = {'a', 'b', 'c'};
   uint8_t sha_digest[32];
 
@@ -366,24 +394,44 @@ int main(void)
 
 
   Boot_TestEcdsa();
+#if !defined(BOOT_FLASH_READ_DIAGNOSTIC)
+  // 完成一个诊断阶段后报告进展，仍沿用整组15s起点。
+  if (!Boot_WatchdogProgress(boot_started_ms, BOOT_STARTUP_TIMEOUT_MS))
+  {
+    Boot_ResetIfWatchdogFailed("startup-ecdsa");
+    Error_Handler();
+  }
+#endif
   Boot_TestGcm();
-
-  uint8_t tx[4] = {0x9FU,0x00U,0x00U,0x00U};
-  uint8_t rx[4] = {0U};
-
-  // 拉低片选，发送命令并继续提供三个字节的时钟。
-  HAL_GPIO_WritePin(SPI_FLASH_CS_GPIO_Port, SPI_FLASH_CS_Pin, GPIO_PIN_RESET);
-  HAL_StatusTypeDef status = HAL_SPI_TransmitReceive(&hspi2, tx, rx, 4U, 10U);
-  HAL_GPIO_WritePin(SPI_FLASH_CS_GPIO_Port, SPI_FLASH_CS_Pin, GPIO_PIN_SET);
-
-  if(status == HAL_OK)
+#if !defined(BOOT_FLASH_READ_DIAGNOSTIC)
+  if (!Boot_WatchdogProgress(boot_started_ms, BOOT_STARTUP_TIMEOUT_MS))
   {
-    printf("Flash JEDEC ID: %02X %02X %02X\r\n", (unsigned int)rx[1], (unsigned int)rx[2], (unsigned int)rx[3]);
+    Boot_ResetIfWatchdogFailed("startup-gcm");
+    Error_Handler();
   }
-  else
+#endif
+
+  // 每次独立片选读取 ID，保留所有异常，不以重试成功掩盖先前错误。
+  uint8_t tx[4] = {0x9FU, 0x00U, 0x00U, 0x00U};
+  uint8_t rx[4];
+  uint32_t id_ok = 0U;
+  for (uint32_t round = 0U; round < 16U; round++)
   {
-    printf("Flash JEDEC read failed: HAL status %d\r\n", (int)status);
+    memset(rx, 0, sizeof(rx));
+    HAL_GPIO_WritePin(SPI_FLASH_CS_GPIO_Port, SPI_FLASH_CS_Pin, GPIO_PIN_RESET);
+    HAL_StatusTypeDef status = HAL_SPI_TransmitReceive(&hspi2, tx, rx, sizeof(tx), 10U);
+    HAL_GPIO_WritePin(SPI_FLASH_CS_GPIO_Port, SPI_FLASH_CS_Pin, GPIO_PIN_SET);
+
+    if ((status == HAL_OK) && (rx[1] == 0xEFU) && (rx[2] == 0x40U) && (rx[3] == 0x18U))
+    {
+      id_ok++;
+    }
+    printf("JEDEC %lu: HAL=%u ID=%02X %02X %02X\r\n",
+           (unsigned long)(round + 1U), (unsigned int)status,
+           (unsigned int)rx[1], (unsigned int)rx[2], (unsigned int)rx[3]);
+    HAL_Delay(1U);
   }
+  printf("JEDEC SUMMARY: correct=%lu/16\r\n", (unsigned long)id_ok);
 
   // 读取外部 Flash 起始位置的 16 字节，供串口检查。
   uint8_t flash_data[16] = {0U};
@@ -403,17 +451,126 @@ int main(void)
     printf("Flash read failed: HAL status %d\r\n", (int)read_status);
   }
 
+#if !defined(BOOT_FLASH_READ_DIAGNOSTIC)
+  // 完成诊断后检查整组总期限；期限通过不代表各自测结果通过。
+  if (!Boot_WatchdogProgress(boot_started_ms, BOOT_STARTUP_TIMEOUT_MS))
+  {
+    Boot_ResetIfWatchdogFailed("startup");
+    Error_Handler();
+  }
+#endif
+
+#endif
+
+#if !defined(BOOT_FLASH_READ_DIAGNOSTIC)
+  if (!Boot_WatchdogProgress(boot_started_ms, BOOT_STARTUP_TIMEOUT_MS))
+  {
+    Boot_ResetIfWatchdogFailed("startup");
+    Error_Handler();
+  }
+#endif
+
+#if defined(BOOT_FLASH_READ_DIAGNOSTIC)
+  Boot_TestFlashReadDiagnostic();
+  // 只读诊断结束后留在 Boot，不执行后续擦写测试、串口收包或 App。
+  while (1)
+  {
+    HAL_Delay(1000U);
+  }
+#endif
+
 #if defined(DEBUG)
   if (app_flash_test_request == 1U)
   {
     app_flash_test_request = 0U;
+#if !defined(BOOT_FLASH_READ_DIAGNOSTIC)
+    uint32_t test_started_ms = HAL_GetTick();
+#endif
     Boot_TestAppFlash();
+#if !defined(BOOT_FLASH_READ_DIAGNOSTIC)
+    if (!Boot_WatchdogProgress(test_started_ms, BOOT_FLASH_TEST_TIMEOUT_MS))
+    {
+      Boot_ResetIfWatchdogFailed("flash-test");
+      Error_Handler();
+    }
+#endif
   }
 #endif
 
+  // 测试根仅由显式测试配置绑定；普通构建只从保护区平台映射取得可信资料。
+#if defined(BOOT_PACKAGE_RECEIVE_TEST)
+  const UpgradeTrustKeys test_keys = {1U, boot_test_signing_public_key, 1U, boot_test_aes_key};
+  if (!UpgradeTrust_Bind(&test_keys))
+  {
+    Error_Handler();
+  }
+#else
+  (void)UpgradeTrust_Initialize();
+#endif
+  const uint8_t *public_key = NULL;
+  const uint8_t *aes_key = NULL;
+  bool keys_ready = UpgradeTrust_Get(1U, 1U, &public_key, &aes_key);
+  Boot_InstallResult install_result = keys_ready ? Boot_InstallRun(public_key, aes_key) : BOOT_INSTALL_STATE_ERROR;
+  Boot_ResetIfWatchdogFailed("install");
+  printf("Install result=%u\r\n", (unsigned int)install_result);
+  bool allow_app = (install_result == BOOT_INSTALL_BOOT_EXISTING)
+                || (install_result == BOOT_INSTALL_TRIAL_STARTED)
+                || (install_result == BOOT_INSTALL_RESTORED);
+  allow_app = allow_app && Boot_CheckAppVector();
+  bool serial_service = !allow_app;
+  // 新安装的试运行只放行一次，不能在同一次启动中再次Run而误判为未确认重启。
+  while ((install_result != BOOT_INSTALL_TRIAL_STARTED) || !allow_app)
+  {
+    BootReceiveResult received = Boot_ReceivePackage(public_key, aes_key);
+    Boot_ResetIfWatchdogFailed("receive");
+    if (received == BOOT_RECEIVE_COMMAND)
+    {
+      serial_service = true;
+      continue;
+    }
+    if (received == BOOT_RECEIVE_NO_REQUEST)
+    {
+      if (allow_app && !serial_service)
+      {
+        break;
+      }
+      HAL_Delay(10U);
+      continue;
+    }
+    install_result = keys_ready ? Boot_InstallRun(public_key, aes_key) : BOOT_INSTALL_STATE_ERROR;
+    Boot_ResetIfWatchdogFailed("install");
+    printf("RCV RESULT %u\r\n", (unsigned int)install_result);
+    allow_app = ((install_result == BOOT_INSTALL_BOOT_EXISTING)
+                 || (install_result == BOOT_INSTALL_TRIAL_STARTED)
+                 || (install_result == BOOT_INSTALL_RESTORED)) && Boot_CheckAppVector();
+    if (allow_app)
+    {
+      break;
+    }
+    serial_service = true;
+  }
+  if (!allow_app)
+  {
+    printf("Upgrade requires install/restore/recovery; stay in Boot\r\n");
+    while (1)
+    {
+      HAL_Delay(1000U);
+    }
+  }
+
   if (Boot_CheckAppVector())
   {
+    if (!Boot_TrialPrepareApp((volatile uint32_t *)UPGRADE_MAILBOX_ADDRESS))
+    {
+      Error_Handler();
+    }
     printf("App vector valid\r\n");
+    // 最终认证通过后交接 App，IWDG 在跳转过程中持续运行。
+    if (!Boot_WatchdogPrepareApp(public_key, aes_key))
+    {
+      Boot_ResetIfWatchdogFailed("handoff");
+      Error_Handler();
+    }
     if(!Boot_JumpToApp())
     {
       Error_Handler();
@@ -483,6 +640,7 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
+// 将 printf 的单个字符送往 USART1，发送失败返回 EOF。
 int __io_putchar(int ch)
 {
   uint8_t data = (uint8_t)ch;

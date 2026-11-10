@@ -4,5 +4,6 @@
             "name": "STM32",
             "compileCommands": "${workspaceFolder}/build/BootSizeCheck/compile_commands.json"
         }
-    ]
+    ],
+    "version": 4
 }

@@ -1,6 +1,6 @@
 # 公共硬件与任务资源
 
-依据 `firmware/app/modbus-mqtt-gateway.ioc`、生成代码和 `integration/app_modules.c` 核对，日期为 2026-11-02。本文列当前分配；不表示外设功能已全部实测。修改分配时先对齐受影响成员，由 M4 更新 `.ioc` 并统一生成。
+内存、任务及看门狗说明已按2026-11-10的构建和装配源码更新；引脚、外设及DMA表保留2026-11-02硬件基线，后续成员改动以最新`.ioc`和生成代码为准。本文不表示外设已全部实测。资源变更须对齐受影响成员，CubeMX配置及代码生成由用户操作。
 
 ## 时钟与内存
 
@@ -10,10 +10,10 @@
 | APB1 / APB2 | 外设时钟 42/84MHz；对应定时器时钟 84/168MHz |
 | PLLQ | Q=7，输出 48MHz，供 SDIO 等使用 |
 | HAL / RTOS 时基 | HAL 使用 TIM6，FreeRTOS 使用 SysTick，均为 1ms |
-| 应用 Flash | `0x08000000` 起，默认 512KiB 链接区域；当前没有 Bootloader 偏移构建 |
-| 普通 SRAM | `0x20000000` 起，128KiB；任务栈、堆和 DMA 缓冲使用此区 |
-| CCM | `0x10000000` 起，64KiB；当前保留，禁止交给 DMA |
-| 堆和异常检查 | heap_4 15KiB；静态任务；启用栈溢出和分配失败 Hook |
+| 应用 Flash | Debug/Release从`0x08000000`独立启动；AppDebug从`0x08010000`启动，容量448KiB；Boot容量64KiB |
+| 普通 SRAM | 总128KiB；Boot/AppDebug保留首64B邮箱，其余供堆、存储/监督栈及DMA可访问缓冲使用 |
+| CCM | `0x10000000`起，64KiB；部分业务栈及网络工作区使用，DMA不可访问 |
+| 堆和异常检查 | heap_4 32KiB；静态任务；启用栈溢出和分配失败Hook，实际峰值待验证 |
 
 ## 引脚与归属
 
@@ -34,6 +34,12 @@
 
 当前 `printf` 只验证了阻塞式启动输出，USART1 TX DMA 配置不代表已经实现多任务日志服务。业务任务暂不直接并发打印，ISR 中不调用 `printf`。
 
+## 看门狗交接约束
+
+统一方案的执行配置已于2026-11-10接入：普通Boot及BootRecoveryTest在GPIO/USART1/SPI2就绪后启动IWDG，收包/认证/安装按固定期限和实际进展刷新；调试/测试启动诊断软件上限15000 ms，普通BootSizeCheck无DEBUG及测试根，但同样具备完整运行路径。最终交接要求已启狗且可信App检查通过，App早期接管后由Monitor监督。仅只读诊断不提前启狗。当前仍为256分频、4095重装值，统一硬件预算及实板复位/时序尚未验收，不能视为已满足拟定≤8 s目标。
+
+超时配置须依据LSI范围、片内Flash擦除取指/中断停顿和最长合法无喂狗区间核算，普通运行卡死复位仍须满足经批准的恢复指标。现有256分频/4095推算约22.31～61.68s，尚未满足需求NFR-REL-04拟定≤8s复位目标；参数及交接时序需实板验证。启动准入与包格式详见[系统设计第8、9章](https://hcn4ticlccda.feishu.cn/docx/JNMDdxoBio9f9bxxQPXcPINSnqh)，不自动改选项字节。
+
 ## DMA 与中断
 
 NVIC 使用 4 位抢占优先级、无子优先级。**NVIC 数字越小优先级越高**；调用 FreeRTOS 中断安全 API 的普通外设 IRQ，数值不得小于 5。DMA 的 High/Medium 等仲裁等级与 NVIC 优先级分别配置。
@@ -51,17 +57,18 @@ SDIO 读写复用一个 DMA 流，由 M3 串行使用并切换方向。SPI2 后�
 
 ## 任务入口与初始预算
 
-**CMSIS-RTOS2 任务优先级数字越大越高**，与上面的 NVIC 规则不同。表中栈大小为字节，是初始预算，接入后按栈高水位修正。
+**CMSIS-RTOS2 任务优先级数字越大越高**，与上面的 NVIC 规则不同。以下为2026-11-10合并主线后的装配源码配置，不是实测峰值；接入后按完整调用链及栈高水位复核。
 
 | 主责 / 用途 | 初始化 / 任务入口 | 任务优先级 | 静态栈 |
 | --- | --- | --- | --- |
-| M3 存储 | `Storage_Init` / `Storage_Task` | Normal，24 | 4KiB |
-| M1 配置维护 | `Config_Init` / `Config_Task` | BelowNormal，16 | 4KiB |
+| M3 存储 | `Storage_Init` / `Storage_Task` | Normal，24 | 6KiB |
+| M1 配置维护 | `Config_Init` / `Config_Task` | BelowNormal，16 | 512B |
 | M1 Modbus | `Modbus_Init` / `vModbusPollTask` | AboveNormal，32 | 2KiB |
-| M2 MQTT | `Mqtt_Init` / `Mqtt_Task` | Normal，24 | 4KiB |
-| M4 监督 | `Monitor_Init` / `Monitor_Task` | BelowNormal，16 | 2KiB |
+| M2 MQTT | `MqttClient_Init` / `MqttClient_Task` | Normal，24 | 6KiB |
+| M2 遥测 | `Telemetry_Init` / `Telemetry_Task` | BelowNormal，16 | 2560B |
+| M4 监督 | `Monitor_Init` / `Monitor_Task` | AboveNormal，32 | 2KiB |
 | 默认启动任务 | `StartDefaultTask` → `App_Entry` | Normal，24 | 2KiB |
 
-五个模块目前均未绑定，入口保持 `NULL`；16KiB 业务栈已静态预留。默认启动任务装配完成后退出。M2 接入时另行创建协议栈要求的 ETH 接收/tcpip 线程，优先级约定为 High（40）/AboveNormal（32），不在装配层重复创建。
+Modbus和监督已绑定；Storage、Config、MQTT、Telemetry入口仍为`NULL`，不会由装配层创建这些任务。六组模块栈的源码配置合计19KiB，实际保留量受链接回收影响，以map为准。存储及监督栈使用普通SRAM，其余模块栈标记为CCM，不能将栈缓冲交给DMA。默认启动任务装配完成后退出；监督任务在网络及业务初始化前启动。ETH接收/tcpip线程由网络适配创建，优先级约定为High（40）/AboveNormal（32），不在装配层重复创建。
 
-初始化在调度器运行后准备本模块基础对象，耗时恢复放进所属任务。就绪状态通过 `app_readiness.h` 上报；初始化或任务创建成功不等于外设/业务就绪。业务队列、持久化、升级和监督实现由对应模块后续接入。
+初始化在调度器运行后准备本模块基础对象，耗时恢复放进所属任务。就绪状态通过 `app_readiness.h` 上报；初始化或任务创建成功不等于外设/业务就绪。升级入口仍待真实存储、权限和暂停回调绑定，业务健康进展须由所属任务报告。

@@ -20,10 +20,7 @@ static bool App_ResourcesValid(uint32_t resources)
   return (resources != 0U) && ((resources & ~APP_RESOURCE_ALL) == 0U);
 }
 
-/*
- * 启动任务在模块初始化前调用，使用静态控制块建立初始全未就绪的事件组。
- * 内核未运行或创建失败返回 false；重复调用保留现有事件组和资源状态。
- */
+// 创建静态就绪事件组，重复调用保留原状态；内核未运行或创建失败返回 false。
 bool App_ReadinessInit(void)
 {
   if (readiness_events != NULL)
@@ -40,10 +37,7 @@ bool App_ReadinessInit(void)
   return readiness_events != NULL;
 }
 
-/*
- * 由资源提供方在任务上下文报告单项资源的可用或失效，不修改其他资源位。
- * 非法资源、事件组未建立或 RTOS 更新失败时返回 false，供调用方处理。
- */
+// 更新单个资源的就绪位，参数或 RTOS 操作失败返回 false。
 bool App_SetResourceReady(AppResource resource, bool ready)
 {
   uint32_t bits = (uint32_t)resource;
@@ -95,11 +89,7 @@ bool App_IsReady(uint32_t required_resources)
   return (App_GetReadyResources() & required_resources) == required_resources;
 }
 
-/*
- * 任务按毫秒上限等待全部所需资源，0 表示立即检查；保留事件位供其他任务观察。
- * 校验条件及时间换算范围，分别返回就绪、超时、参数错误或 RTOS 错误。
- * 就绪结果是一次观察，调用方在实际业务操作前仍要复验并处理资源失效。
- */
+// 有界等待全部指定资源，不清除事件位；区分就绪、超时、参数和 RTOS 错误。
 AppWaitResult App_WaitResources(uint32_t required_resources, uint32_t timeout_ms)
 {
   if (!App_ResourcesValid(required_resources) || (timeout_ms == UINT32_MAX))

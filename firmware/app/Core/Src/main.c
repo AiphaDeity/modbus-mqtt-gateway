@@ -31,6 +31,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "watchdog.h"
 #include <stdio.h>
 #include "ethernet.h"   /* Day2：m2_ethernet_init() 声明（bsp/ethernet/ethernet.h） */
 /* USER CODE END Includes */
@@ -85,7 +86,16 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
+#if defined(DEBUG)
+  if (!Watchdog_Start(true))
+#else
+  if (!Watchdog_Start(false))
+#endif
+  {
+    Error_Handler();
+  }
 
+  uint32_t watchdog_peripherals_started_ms = HAL_GetTick();
   /* USER CODE END Init */
 
   /* Configure the system clock */
@@ -133,6 +143,9 @@ int main(void)
     __HAL_RCC_CLEAR_RESET_FLAGS();
   }
   /* USER CODE BEGIN 2 */
+  // 仅汇总早期初始化不喂狗区间，不因日志而额外刷新IWDG。
+  printf("WDG BUDGET app peripherals elapsed_ms=%lu\r\n",
+         (unsigned long)(HAL_GetTick() - watchdog_peripherals_started_ms));
   printf("Gateway boot\r\n");
   /* ★排障修复：osKernelInitialize 必须先于任何 os 对象创建（MX_FREERTOS_Init 会检查内核状态）。 */
   osKernelInitialize();
@@ -214,6 +227,7 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
+// 将 printf 的单个字符送往 USART1，发送失败返回 EOF。
 int __io_putchar(int ch)
 {
   uint8_t data = (uint8_t)ch;
