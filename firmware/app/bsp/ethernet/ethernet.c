@@ -311,7 +311,13 @@ static void lwip_link_thread(void *argument)
       link_again_num++;                        /* 断线计数 +1 */
 
       if (link_again_num >= 2)
-        continue;   /* 已经连续 2 秒断线：上轮已处理过，直接跳到下一轮，别再重复关 */
+      {
+        /* 已经连续 2 秒断线：上轮已处理过，不再重复关网卡。
+         * ★这里绝对不能 continue —— 那会跳过循环末尾的 vTaskDelay(1000)，
+         * 本线程(优先级 3)变成死循环，把 FreeRTOS 定时器任务(优先级 2)饿死，
+         * Modbus 的超时定时器和 T35 帧间隔定时器全部停摆：
+         * 表现就是只发出第一帧，之后主站永远等不到超时通知，队列塞满。 */
+      }
       else          /* 第一次读到断线：真正执行"断线处理" */
       {
 #if LWIP_DHCP

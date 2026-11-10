@@ -13,6 +13,7 @@
 #include "Modbus.h"
 #include "timers.h"
 #include "semphr.h"
+#include <stdio.h>
 
 #if ENABLE_TCP == 1
 #include "api.h"
@@ -44,7 +45,7 @@ const osMessageQueueAttr_t QueueTelegram_attributes = {
 const osThreadAttr_t myTaskModbusA_attributes = {
     .name = "TaskModbusSlave",
     .priority = (osPriority_t) osPriorityNormal,
-    .stack_size = 128 * 4
+    .stack_size = 256 * 4
 };
 
 const osThreadAttr_t myTaskModbusA_attributesTCP = {
@@ -60,14 +61,17 @@ const osThreadAttr_t myTaskModbusA_attributesTCP = {
 const osThreadAttr_t myTaskModbusB_attributes = {
     .name = "TaskModbusMaster",
     .priority = (osPriority_t) osPriorityNormal,
-    .stack_size = 128 * 4
+    /* ★从 512×4=2KB 提到 1024×4=4KB
+     * sendTxBuffer 里有 printf×5 + busy-wait + HAL 中断嵌套，
+     * 2KB 栈根本不够用 → 爆栈 → Error_Handler 死循环 → 调试串口也停了 */
+    .stack_size = 1024 * 4
 };
 
 
 const osThreadAttr_t myTaskModbusB_attributesTCP = {
     .name = "TaskModbusMaster",
     .priority = (osPriority_t) osPriorityNormal,
-    .stack_size = 256 * 4
+    .stack_size = 1024 * 4
 };
 
 
@@ -381,6 +385,16 @@ void ModbusStart(modbusHandler_t * modH)
 
 
 #else
+          /* ★启动 RX IT 之前，先手动清一遍 USART 所有错误标志
+           * （ORE/PE/FE/NE 需要按"读 SR → 读 DR"的特定顺序才能清）
+           * 如果 SR 里残留错误标志，HAL_UART_IRQHandler 每次进来
+           * 都会先调 UART_EndRxTransfer_IT() 静默终止 RX IT。 */
+          {
+              volatile uint32_t _sr = modH->port->Instance->SR;
+              volatile uint32_t _dr = modH->port->Instance->DR;
+              (void)_sr; (void)_dr;
+          }
+
           // Receive data from serial port for Modbus using interrupt
           if(HAL_UART_Receive_IT(modH->port, &modH->dataRX, 1) != HAL_OK)
           {
@@ -1299,10 +1313,25 @@ int16_t getRxBuffer(modbusHandler_t *modH)
 		modH->u8BufferSize = RingGetAllBytes(&modH->xBufferRX, modH->u8Buffer);
 		modH->u16InCnt++;
 		i16result = modH->u8BufferSize;
+
+        /* 打印 RX 帧 hex dump（最多 32 字节） */
+        if (modH->u8BufferSize > 0) {
+            int _i;
+            printf("[RX] len=%d |", (int)modH->u8BufferSize);
+            for (_i = 0; _i < modH->u8BufferSize && _i < 32; _i++)
+                printf(" %02X", modH->u8Buffer[_i]);
+            printf("\n");
+        }
 	}
 
 	if(modH->xTypeHW == USART_HW)
 	{
+	    /* ★重启 RX IT 之前，先清所有 USART 错误标志 */
+	    {
+	        volatile uint32_t _sr = modH->port->Instance->SR;
+	        volatile uint32_t _dr = modH->port->Instance->DR;
+	        (void)_sr; (void)_dr;
+	    }
 		HAL_UART_Receive_IT(modH->port, &modH->dataRX, 1);
 	}
 
@@ -1529,9 +1558,28 @@ if(modH->xTypeHW != TCP_HW)
 
     	if (modH->EN_Port != NULL)
         {
-    		//enable transmitter, disable receiver to avoid echo on RS485 transceivers
-    		HAL_HalfDuplex_EnableTransmitter(modH->port);
+    		/*
+    		 * Full-Duplex UART（USART3）模式下，不能调 HAL_HalfDuplex_* 系列函数！
+    		 * 它会改 gState=BUSY_TX_RX → HAL_UART_Transmit_IT 因 gState 不匹配直接返回 HAL_ERROR！
+    		 * 
+    		 * Full-Duplex 下 RE/TE 全程开着，我们只需要：
+    		 *   GPIO 拉高 DE → 切 RS485 收发器到 TX 方向
+    		 *   发完后 GPIO 拉低 DE → 切回 RX 方向
+    		 */
+    		printf("[DIR] DE=HIGH prev=%d (port=%p pin=%d)\n",
+    			(int)HAL_GPIO_ReadPin(modH->EN_Port, modH->EN_Pin),
+    			modH->EN_Port, modH->EN_Pin);
     		HAL_GPIO_WritePin(modH->EN_Port, modH->EN_Pin, GPIO_PIN_SET);
+    		printf("[DIR] DE=HIGH now=%d\n", (int)HAL_GPIO_ReadPin(modH->EN_Port, modH->EN_Pin));
+        }
+
+        /* 打印 TX 帧 hex dump（最多 32 字节） */
+        {
+            int _i;
+            printf("[TX] len=%d |", (int)modH->u8BufferSize);
+            for (_i = 0; _i < modH->u8BufferSize && _i < 32; _i++)
+                printf(" %02X", modH->u8Buffer[_i]);
+            printf("\n");
         }
 
 #if ENABLE_USART_DMA ==1
@@ -1539,7 +1587,12 @@ if(modH->xTypeHW != TCP_HW)
     	{
 #endif
     		// transfer buffer to serial line IT
-    		HAL_UART_Transmit_IT(modH->port, modH->u8Buffer,  modH->u8BufferSize);
+    		{
+    			HAL_StatusTypeDef _ret = HAL_UART_Transmit_IT(modH->port, modH->u8Buffer,  modH->u8BufferSize);
+    			if (_ret != HAL_OK) {
+    				printf("[TX-ERR] HAL_UART_Transmit_IT ret=%d gState=%d RxState=%d\n", _ret, modH->port->gState, modH->port->RxState);
+    			}
+    		}
 
 #if ENABLE_USART_DMA ==1
     	}
@@ -1551,31 +1604,50 @@ if(modH->xTypeHW != TCP_HW)
         }
 #endif
 
-        ulTaskNotifyTake(pdTRUE, 250); //wait notification from TXE interrupt
-/*
-* If you are porting the library to a different MCU check the 
-* USART datasheet and add the corresponding family in the following
-* preprocessor conditions
-*/
-#if defined(STM32H7)  || defined(STM32F3) || defined(STM32L4)  
-          while((modH->port->Instance->ISR & USART_ISR_TC) ==0 )
-#else
-          // F429, F103, L152 ...
-	  while((modH->port->Instance->SR & USART_SR_TC) ==0 )
-#endif
+        /* ================== 临时诊断：RS485 接收链路 ==================
+         * TX 结束后 12ms 内高频采样 PD9(USART3_RX) 电平：
+         *   low > 0  → 对端应答确实到了引脚，问题在 UART/配置侧
+         *   low == 0 → 引脚上什么都没有，问题在 485 收发器/接线
+         * 定位完成后整段删掉。
+         */
+        {
+            uint32_t _t0 = HAL_GetTick();
+            uint32_t _n = 0, _low = 0;
+            while ((HAL_GetTick() - _t0) < 12U)
+            {
+                _n++;
+                if ((GPIOD->IDR & GPIO_PIN_9) == 0U) { _low++; }
+            }
+            printf("[PD9] n=%lu low=%lu de=%d\n",
+                   (unsigned long)_n, (unsigned long)_low,
+                   (int)((GPIOD->ODR & GPIO_PIN_15) != 0U));
+        }
+        /* ================== 临时诊断结束 ================== */
+
+        /*
+         * ★DE 不在这里拉低！
+         *
+         * HAL 的 TC 中断会调 HAL_UART_TxCpltCallback，由它在 ISR 上下文里
+         * 立刻把 DE 拉低（微秒级），见 UARTCallback.c。
+         *
+         * 以前这里是「自旋等 TC → printf → 拉低 DE」。printf 走日志串口，
+         * 115200 下一个字符约 87us，32 个字符就要 2.8ms；而从站通常在收完
+         * 帧后 1~2ms 就回包 —— 这段时间 DE 还是高，收发器仍在驱动总线，
+         * 应答被自己的空闲电平顶掉，永远收不到（表现就是发得出去、每帧
+         * 1200ms 超时，rxneie=1 也一样）。
+         *
+         * 注意：也不能在这里「提前」拉低，最后一个字节还在移位寄存器里。
+         * 正确时机只有一个：硬件 TC 中断。
+         */
+
+         /* ★DE 刚拉低，立即清一次 USART 错误标志
+          * 发送方向期间 RS485 收发器的 RX 引脚可能浮空，产生 FE 噪声。
+          * 这些错误标志如果残留，HAL_IRQHandler 会在收到第一帧 PC 应答时
+          * 先调 UART_EndRxTransfer_IT() 把 RX IT 静默终止！ */
          {
- 	        //block the task until the the last byte is send out of the shifting buffer in USART
-         }
-
-
-         if (modH->EN_Port != NULL)
-         {
-
-             //return RS485 transceiver to receive mode
-        	 HAL_GPIO_WritePin(modH->EN_Port, modH->EN_Pin, GPIO_PIN_RESET);
-        	 //enable receiver, disable transmitter
-        	 HAL_HalfDuplex_EnableReceiver(modH->port);
-
+             volatile uint32_t _sr = modH->port->Instance->SR;
+             volatile uint32_t _dr = modH->port->Instance->DR;
+             (void)_sr; (void)_dr;
          }
 
          // set timeout for master query
