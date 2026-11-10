@@ -75,7 +75,7 @@ extern ETH_TxPacketConfig TxConfig;                  /* Tx 包公共配置（Att
 #define LAN8720_IDR2_VAL            ((uint16_t)0xC0F1) /* IDR2 值：LAN8720A 低 16 位 */
 
 #ifndef PHY_LINKED_STATUS
-#define PHY_LINKED_STATUS           ((uint16_t)0x4000) /* BSR bit14=1：链路已建立（LAN8720 数据手册） */
+#define PHY_LINKED_STATUS           ((uint16_t)0x0004) /* BSR bit2=1：链路已建立（IEEE 802.3 BMSR bit2 Link Status） */
 #endif
 #define BMCR_SOFT_RESET             ((uint16_t)0x8000) /* BMCR bit15=1：软复位（写 1 触发，完成后硬件自动清零） */
 #define BMCR_AUTONEGO_EN            ((uint16_t)0x1000) /* BMCR bit12=1：使能自动协商（自动定速率/双工） */
@@ -85,8 +85,12 @@ extern ETH_TxPacketConfig TxConfig;                  /* Tx 包公共配置（Att
 #define IFNAME1 't'
 
 /* 零拷贝 Rx 池的缓冲个数：必须 ≥ DMA Rx 描述符数（ETH_RX_DESC_CNT=4）。
-   原 10 个是例程给 Web 服务器留的，我们单 MQTT 连接 6 个够（省 4×1568≈6KB） */
-#define ETH_RX_BUFFER_CNT           6
+   ★★★2026-11-10 修复 RBUS 死锁：原 6 个（4 DMA + 2 余量）太少，
+   TCP/DHCP/DNS 流量涌入时 lwip 暂持 pbuf → 池耗尽 → RxAllocate 返回 NULL
+   → DMA 描述符得不到新缓冲 → RBUS（0x8080）→ DMA RX 挂起 → CONNACK 永久丢失。
+   改为 16：4 DMA + 12 余量，即使 lwip 暂持 8+ 个 pbuf 也不会饿死 DMA。
+   RAM 代价：+10×~1584B ≈ +15.5KB（RAM 67%→~79%，128KB 内可接受） */
+#define ETH_RX_BUFFER_CNT           16
 
 /* ★以太网最小帧长补齐（60 字节 = 14 帧头 + 46 负载，FCS 由 MAC 另加 4 字节 → 线上 64 字节）
    lwIP 发的 ARP 应答/请求只有 42 字节（14 头 + 28 ARP），短于以太网最小帧长 64。
@@ -126,17 +130,25 @@ static osSemaphoreId_t RxPktSemaphore;
 /* ★帧级排障打印开关（临时）：1=打印收发帧摘要（上限各 120 帧）+ [CNT] 心跳，0=关闭。
    排查"收了不发/发了不到"这类链路问题时打开，问题定位后改回 0。
    ★PING 已通（2026-11-04），这里按 0 关闭；以后查链路再改 1 即可，不占串口带宽 */
-#define ETH_DBG_FRAMES   0
+#define ETH_DBG_FRAMES   0   /* 排查链路问题时改 1，定位后改回 0 */
 
 /* ★★排障计数器（诊断用，量很小，长期保留也不碍事）：
-   gdbg_rx_irq  —— 收包中断次数（DMA 每收到一帧 +1）
-   gdbg_err_irq —— ETH 错误中断次数（DMA 报错时 +1，会把 HAL 状态打成 ERROR）
-   gdbg_rd_fail —— HAL_ETH_ReadData 返回失败次数（读不出帧）
-   gdbg_err_code —— 最近一次 DMAErrorCode（定位是哪种 DMA 错） */
+   gdbg_rx_irq   —— 收包中断次数（DMA 每收到一帧 +1）
+   gdbg_err_irq  —— ETH 错误中断次数（DMA 报错时 +1，会把 HAL 状态打成 ERROR）
+   gdbg_rd_fail  —— HAL_ETH_ReadData 返回失败次数（读不出帧）
+   gdbg_err_code —— 最近一次 DMAErrorCode（定位是哪种 DMA 错）
+   gdbg_pool_alloc —— RX_POOL 分配次数（RxAllocate 被调）
+   gdbg_pool_null  —— RX_POOL 分配失败次数（池空，返回 NULL → 是 RBUS 根因）
+   gdbg_pool_free  —— RX_POOL 释放次数（pbuf_free_custom 被调）
+   gdbg_rbus_recover —— RBUS 恢复尝试次数（手动 kick DMARPDR） */
 volatile uint32_t gdbg_rx_irq   = 0U;
 volatile uint32_t gdbg_err_irq  = 0U;
 volatile uint32_t gdbg_rd_fail  = 0U;
 volatile uint32_t gdbg_err_code = 0U;
+volatile uint32_t gdbg_pool_alloc = 0U;
+volatile uint32_t gdbg_pool_null  = 0U;
+volatile uint32_t gdbg_pool_free  = 0U;
+volatile uint32_t gdbg_rbus_recover = 0U;
 
 /* 收包线程属性：名字 "ethif"、栈 1024 字节、优先级 High。
    ★栈为什么从例程的 512 加到 1024：本线程里要调 printf（调试打印）和
@@ -197,7 +209,15 @@ uint8_t lan8720_link_read(void)
     return 0;                     /* 读失败按"未链接"处理 */
   }
   if (last_fail) { printf("[PHY] link read OK again (BSR=0x%04X)\r\n", (uint16_t)val); last_fail = 0; }
-  return (val & PHY_LINKED_STATUS) ? 1 : 0;   /* BSR 的 bit2=1 就是链接建立 */
+  uint8_t cur = (val & PHY_LINKED_STATUS) ? 1 : 0;   /* BSR bit2=1 就是链接建立 */
+  /* ★调试：link 状态变化时打印 BSR 完整值（验证 mask 修复） */
+  static uint8_t last_link = 0xFF;
+  if (cur != last_link)
+  {
+    printf("[PHY] link %s (BSR=0x%04X bit2=%d)\r\n", cur ? "UP" : "DOWN", (uint16_t)val, (val & 0x0004) ? 1 : 0);
+    last_link = cur;
+  }
+  return cur;
 }
 
 /**
@@ -243,6 +263,29 @@ static uint8_t lan8720_init(void)
      0x0100 = 100M 全双工能力位，LAN8720 支持，协商时双方取共同最高能力 */
   if (lan8720_write_reg(PHY_BMCR, BMCR_AUTONEGO_EN | 0x0100) != 0) { printf("[PHY] autonego write FAIL\r\n"); return 1; }
   printf("[PHY] autonego started\r\n");
+
+  /* 3b. 等自协商完成（BSR bit5=1），最多等 3 秒。
+   * ★某些交换机/路由器不响应 FLP 自协商脉冲，LAN8720 会永远等下去，
+   *   表现为灯亮但 BSR bit2(link)=0 bit5(autonego done)=0。超时后强制 100M 全双工。 */
+  timeout = 0;
+  do {
+    osDelay(10);
+    if (lan8720_read_reg(PHY_BSR, &val) != 0) { printf("[PHY] autonego poll FAIL\r\n"); break; }
+    timeout++;
+  } while (((val & 0x0020) == 0) && (timeout < 300));   /* bit5=Auto-Neg Complete */
+  if (val & 0x0020)
+  {
+    printf("[PHY] autonego done (BSR=0x%04X)\r\n", (uint16_t)val);
+  }
+  else
+  {
+    printf("[PHY] autonego TIMEOUT (BSR=0x%04X), forcing 100M FD\r\n", (uint16_t)val);
+    /* 强制 100M 全双工：BMCR bit13=1(100M) bit8=1(FD) bit12=0(禁自协商) = 0x2100 */
+    lan8720_write_reg(PHY_BMCR, 0x2100);
+    osDelay(100);
+    lan8720_read_reg(PHY_BSR, &val);
+    printf("[PHY] after force: BSR=0x%04X link=%d\r\n", (uint16_t)val, (val & 0x0004) ? 1 : 0);
+  }
 
   return 0;   /* 全部成功 */
 }
@@ -511,6 +554,13 @@ static struct pbuf *low_level_input(struct netif *netif)
  * @note   这就是"带 OS 版"的收包姿势：
  *         裸跑版是主循环里手动轮询；这里线程挂起在信号量上，
  *         接收中断一来 osSemaphoreRelease 唤醒它，不空转不丢包
+ *
+ * ★★2026-11-10 RBUS 恢复机制：
+ *   当 RX_POOL 耗尽导致 DMA RBUS 挂起后，即使池后来有空闲缓冲（pbuf 被 lwip 释放），
+ *   DMA 也不会自动恢复——需要手动写 DMARPDR 寄存器"踢"一下 DMA，
+ *   让它重新检查描述符可用性并恢复 RX 进程。
+ *   本线程每秒超时醒来一次（osSemaphoreAcquire 1000ms），检查 RBUS 标志，
+ *   如果检测到则强制调 HAL_ETH_ReadData 触发 ETH_UpdateDescriptor（补缓冲）+ 写 DMARPDR。
  */
 static void ethernetif_thread(void *argument)
 {
@@ -535,13 +585,16 @@ static void ethernetif_thread(void *argument)
     HAL_ETH_ReleaseTxPacket(&heth);
 
 #if ETH_DBG_FRAMES
-    /* 心跳：每秒打印一次中断/错误/读失败计数（只在有变化时打，避免刷屏） */
+    /* 心跳：每秒打印一次中断/错误/读失败计数 + pool 使用情况（只在有变化时打，避免刷屏） */
     if ((gdbg_rx_irq != last_irq) || (gdbg_err_irq != last_err) || (gdbg_rd_fail != last_rdf))
     {
-      printf("[CNT] rxirq=%lu errirq=%lu rdfail=%lu errcode=0x%08lX state=%u\r\n",
+      printf("[CNT] rxirq=%lu errirq=%lu rdfail=%lu errcode=0x%08lX state=%u"
+             " pool: alloc=%lu null=%lu free=%lu\r\n",
              (unsigned long)gdbg_rx_irq, (unsigned long)gdbg_err_irq,
              (unsigned long)gdbg_rd_fail, (unsigned long)gdbg_err_code,
-             (unsigned)heth.gState);
+             (unsigned)heth.gState,
+             (unsigned long)gdbg_pool_alloc, (unsigned long)gdbg_pool_null,
+             (unsigned long)gdbg_pool_free);
       last_irq = gdbg_rx_irq; last_err = gdbg_err_irq; last_rdf = gdbg_rd_fail;
     }
 #endif
@@ -570,6 +623,34 @@ static void ethernetif_thread(void *argument)
 #endif
       if (netif->input(p, netif) != ERR_OK)   /* 内核处理失败（内存不够等） */
         pbuf_free(p);                          /* 自己释放，不能丢 */
+    }
+
+    /* ★★RBUS 恢复：检查是否发生过 RBUS（DMA RX 挂起）
+       即使池扩大后 RBUS 理论上不会再发生，这里作为安全网：
+       如果 lwip 因某种原因暂持大量 pbuf 导致池再次耗尽，RBUS 恢复能自动救回，
+       不至于像之前一样永久死锁（CONNACK 永远收不到）。 */
+    if (gdbg_err_code & 0x0080U)  /* ETH_DMASR_RBUS bit */
+    {
+      gdbg_err_code = 0U;  /* 清除标志，避免重复恢复 */
+
+      /* 步骤1：强制调 HAL_ETH_ReadData 触发 ETH_UpdateDescriptor。
+         如果 RxBuildDescCnt > 0（之前有描述符被消费但未补缓冲），
+         ETH_UpdateDescriptor 会尝试从池里取新缓冲补上，并写 DMARPDR 恢复 DMA。
+         此时如果池有空闲（pbuf 已被 lwip 释放），恢复成功。 */
+      void *dummy_p = NULL;
+      HAL_ETH_ReadData(&heth, &dummy_p);
+
+      /* 步骤2：无论步骤1是否成功，手动写 DMARPDR "踢"DMA。
+         DMA 收到此写入后会重新检查描述符环——如果有 OWN=1 的描述符可用，
+         RX 进程立即从 Suspended 恢复到 Running。
+         写入值不影响行为（RM0090: "any value"），用 0 即可。 */
+      __DMB();  /* 确保前面的描述符 OWN 位写入对 DMA 可见 */
+      WRITE_REG(heth.Instance->DMARPDR, 0U);
+      gdbg_rbus_recover++;
+      printf("[ETH] RBUS recovery #%lu (DMARPDR kicked, pool: alloc=%lu null=%lu free=%lu)\r\n",
+             (unsigned long)gdbg_rbus_recover,
+             (unsigned long)gdbg_pool_alloc, (unsigned long)gdbg_pool_null,
+             (unsigned long)gdbg_pool_free);
     }
   }
 }
@@ -611,6 +692,7 @@ void pbuf_free_custom(struct pbuf *p)
 {
   struct pbuf_custom *custom_pbuf = (struct pbuf_custom *)p;
   LWIP_MEMPOOL_FREE(RX_POOL, custom_pbuf);   /* ★还回池子，下次接收还能用 */
+  gdbg_pool_free++;                          /* ★诊断：跟踪池归还 */
 }
 
 /** Rx 缓冲分配回调：从 RX_POOL 取一块给 DMA 描述符
@@ -619,6 +701,7 @@ void pbuf_free_custom(struct pbuf *p)
 void HAL_ETH_RxAllocateCallback(uint8_t **buff)
 {
   struct pbuf_custom *p = LWIP_MEMPOOL_ALLOC(RX_POOL);
+  gdbg_pool_alloc++;                                /* ★诊断：跟踪池分配 */
   if (p != NULL)
   {
     /* ★关键技巧（offsetof）：
@@ -632,7 +715,8 @@ void HAL_ETH_RxAllocateCallback(uint8_t **buff)
   }
   else
   {
-    *buff = NULL;   /* 池空了（理论不会，给了 10 个缓冲） */
+    *buff = NULL;   /* ★池空了！这是 RBUS 死锁的根因——DMA 描述符拿不到新缓冲 */
+    gdbg_pool_null++;                                /* ★诊断：跟踪池耗尽次数 */
   }
 }
 
@@ -691,9 +775,23 @@ void HAL_ETH_TxCpltCallback(ETH_HandleTypeDef *heth)
 /** ETH 错误回调（DMA 错误等）
     ★注意：HAL 在自己的 IRQHandler 里遇到致命总线错误(FBE)时会把 gState 直接置成
     HAL_ETH_STATE_ERROR，之后 HAL_ETH_ReadData 一进门就返回错误 → 收包永久停止。
-    这里把错误次数和错误码记下来，交给收包线程打心跳时一起输出。 */
+    这里把错误次数和错误码记下来，交给收包线程打心跳时一起输出。
+
+    ★★2026-11-10 RBUS 分析：
+    错误码 0x00008080 = AIS(bit15) + RBUS(bit7)，不是 FBE(bit13, 0x2000)。
+    HAL 走非致命分支：清除 RBUS/AIS 标志，不设 gState=ERROR。
+    但 DMA RX 进程已挂起（Suspended），需要手动写 DMARPDR 恢复（见 ethernetif_thread）。
+    根因是 RX_POOL 太小（原 6 个），TCP 流量涌入时池耗尽 → RxAllocate 返回 NULL
+    → DMA 描述符无新缓冲 → RBUS。 */
 void HAL_ETH_ErrorCallback(ETH_HandleTypeDef *heth)
 {
   gdbg_err_irq++;
   gdbg_err_code = heth->DMAErrorCode;
+  /* ★RBUS 只在中断上下文打印一次，避免刷屏（高频错误时每秒可能触发数十次） */
+  if (gdbg_err_code & 0x0080U)  /* ETH_DMASR_RBUS */
+  {
+    printf("[ETH-ERR] RBUS! pool_alloc=%lu null=%lu free=%lu\r\n",
+           (unsigned long)gdbg_pool_alloc, (unsigned long)gdbg_pool_null,
+           (unsigned long)gdbg_pool_free);
+  }
 }

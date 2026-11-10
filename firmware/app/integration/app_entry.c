@@ -47,12 +47,16 @@ void App_Entry(void *argument)
 
   if (!App_ReadinessInit())
   {
+    printf("[App] ReadinessInit FAILED\r\n");
     Error_Handler();
     return;
   }
+  printf("[App] ReadinessInit OK, starting ModulesInit\r\n");
 
   App_ModulesInit();
+  printf("[App] ModulesInit done, starting ModulesStart\r\n");
   App_ModulesStart();
+  printf("[App] ModulesStart done\r\n");
 
   // 启动任务完成一次装配后退出
   osThreadExit();

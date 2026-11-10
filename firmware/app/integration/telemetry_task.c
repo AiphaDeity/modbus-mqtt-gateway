@@ -103,7 +103,7 @@ static int on_slave_telemetry(mb_slave_runtime_t *slave, void *ctx)
     else
     {
         /* 5) 在线时直接 PUBLISH 到 broker（不等补传），失败也不阻塞离线缓存 */
-        int pr = MqttClient_Publish("mb2mqtt_001/telemetry",
+        int pr = MqttClient_Publish(MqttClient_TopicTelemetry(),
                                    (const uint8_t *)buf, (size_t)n);
         /* 注：newlib-nano 不支持 %llu，seq 当前值 < 4G，用 %lu 打即可 */
         printf("[TEL] seq=%lu slave=%u online=%u pts=%d mqtt_pub=%d\r\n",

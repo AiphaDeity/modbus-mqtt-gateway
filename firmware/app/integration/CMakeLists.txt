@@ -8,6 +8,7 @@ if(GATEWAY_ENABLE_M2)
     target_sources(${CMAKE_PROJECT_NAME} PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/mqtt_client.c
         ${CMAKE_CURRENT_SOURCE_DIR}/telemetry_task.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/hmac_sha256.c
     )
 endif()
 

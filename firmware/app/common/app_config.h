@@ -15,7 +15,7 @@
  */
 
 #define CONFIG_MAGIC      0x4D334346U   // "M3CF"
-#define CONFIG_VERSION    1U
+#define CONFIG_VERSION    2U  /* v2: mq_broker_ip[16]→mq_broker_host[64] 支持域名（连云） */
 #define CONFIG_MAX_SLAVE  16U           // 最多支持的从站数量
 
 #pragma pack(push, 1)
@@ -37,7 +37,7 @@ typedef struct
     uint32_t mb_poll_interval_ms;             // 采集周期（ms）
 
     /* ===== MQTT 参数（M2 使用） ===== */
-    char     mq_broker_ip[16];      // Broker IP 地址
+    char     mq_broker_host[64];    // Broker 地址（IP 或域名，连云用域名）
     uint16_t mq_broker_port;        // Broker 端口（默认 1883）
     char     mq_client_id[32];      // 客户端 ID
     char     mq_username[32];       // 用户名

@@ -117,15 +117,23 @@ AppModuleInitResult Storage_Init(void)
 
     // 序列号管理 — 从 Flash 恢复高水位（双份冗余取最大）
     (void)storage_seq_init();
+    printf("[STO] seq_init done\r\n"); fflush(stdout);
 
     // 设备身份 — 读取双份 gateway_id，取有效且最新的一份
     (void)storage_identity_init();
+    printf("[STO] identity_init done\r\n"); fflush(stdout);
 
     // 持久时间下界 — 读取双份，取较大的有效值
     s_floor_ok = s_flash_ok && (storage_timefloor_init() == HAL_OK);
+    printf("[STO] timefloor_init done ok=%d\r\n", s_floor_ok); fflush(stdout);
 
     // 控制日志 — 扫描双区，恢复写入位置与去重键
-    s_log_ok = s_flash_ok && (storage_ctrllog_init() == HAL_OK);
+    /* ★临时跳过 ctrllog_init：实测卡在此函数不返回（M3 扫描双区时疑似死循环）。
+     * ctrllog 是控制日志功能，不影响 MQTT 连接和遥测上报。
+     * 跳过后 s_log_ok=0，Storage_Init 能正常返回，App_ModulesInit 能完成，
+     * MQTT/Telemetry 任务能创建。等 M3 修复 ctrllog_init 后恢复此调用。 */
+    s_log_ok = 0;  /* s_flash_ok && (storage_ctrllog_init() == HAL_OK); */
+    printf("[STO] ctrllog_init SKIPPED (M3 bug workaround) ok=%d\r\n", s_log_ok); fflush(stdout);
 
     /*
      * 注意：不在 Init 里加载配置。
