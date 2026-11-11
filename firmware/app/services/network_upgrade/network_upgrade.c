@@ -144,7 +144,7 @@ static void report_status(const char *task_id, const char *phase, const char *de
         len = snprintf(buf, sizeof(buf),
             "{\"task_id\":\"%s\",\"phase\":\"%s\"}", task_id, phase);
     }
-    MqttClient_Publish(s_ota_status_topic, (const uint8_t *)buf, (size_t)len);
+    MqttClient_PublishQos1(s_ota_status_topic, (const uint8_t *)buf, (size_t)len);
 }
 
 static void report_progress(const char *task_id, uint32_t offset, uint32_t total)
@@ -154,7 +154,7 @@ static void report_progress(const char *task_id, uint32_t offset, uint32_t total
     int len = snprintf(buf, sizeof(buf),
         "{\"task_id\":\"%s\",\"phase\":\"downloading\",\"offset\":%u,\"total\":%u}",
         task_id, (unsigned)offset, (unsigned)total);
-    MqttClient_Publish(s_ota_status_topic, (const uint8_t *)buf, (size_t)len);
+    MqttClient_PublishQos1(s_ota_status_topic, (const uint8_t *)buf, (size_t)len);
 }
 
 static const char *phase_to_string(int phase)
