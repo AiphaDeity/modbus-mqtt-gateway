@@ -78,6 +78,24 @@
 #define MQTT_REPLAY_RESEND_MS  30000  /* 回执未到重发间隔（设计 5.2: 30s） */
 #define MQTT_MAX_PAYLOAD       4096   /* 设计 5.2: payload 上限 */
 
+/* ===== QoS1 未确认队列（设计 5.2: PUBLISH 带 packet_id → 等 PUBACK → 30s 超时重发）===== */
+#define MQTT_QOS1_PENDING_MAX   2     /* 同时最多 2 条未确认（RAM 约束） */
+#define MQTT_QOS1_PAYLOAD_MAX   512   /* QoS1 pending payload 上限 */
+/* MQTT_REPLAY_RESEND_MS=30000 复用为 QoS1 重发超时（设计 5.2: 30s） */
+
+typedef struct {
+    bool        in_use;
+    uint16_t    packet_id;
+    uint32_t    send_tick;
+    bool        retain;
+    char        topic[96];
+    uint8_t     payload[MQTT_QOS1_PAYLOAD_MAX];
+    size_t      payload_len;
+} qos1_pending_t;
+
+/* 放 CCMRAM：2条×~620B ≈ 1240B，不占普通 SRAM（设计 5.2: PUBACK 只释放 packet_id） */
+static qos1_pending_t s_qos1_pending[MQTT_QOS1_PENDING_MAX] __attribute__((section(".ccmram")));
+
 /* 重连退避表（设计 5.1: 1/2/4/8/16/32/60s + 20% 抖动，最长 72s） */
 static const uint32_t g_backoff_table[] = {1000, 2000, 4000, 8000, 16000, 32000, 60000};
 #define BACKOFF_TABLE_LEN  (sizeof(g_backoff_table) / sizeof(g_backoff_table[0]))
@@ -492,21 +510,32 @@ static size_t mqtt_build_subscribe(void)
 }
 
 /**
- * 组 PUBLISH 报文（QoS0，DUP=0，retain 可选）
+ * 组 PUBLISH 报文（支持 QoS0/QoS1，DUP flag，retain 可选）
  * 设计 5.1: 状态 retain=true，其余 retain=false
+ * 设计 5.2: OTA状态/补传用 QoS1（带 packet_id + 等 PUBACK + 30s 重发）
  */
-static size_t mqtt_build_publish(const char *topic, const uint8_t *payload, size_t plen, bool retain)
+static size_t mqtt_build_publish(const char *topic, const uint8_t *payload, size_t plen,
+                                 bool retain, uint8_t qos, uint16_t packet_id, bool dup)
 {
     size_t tlen = strlen(topic);
     size_t remaining = 2 + tlen + plen;
+    if (qos > 0) remaining += 2;  /* QoS1/2 加 2 字节 packet_id */
 
     size_t off = 0;
-    tx_buf[off++] = 0x30 | (retain ? 0x01 : 0x00);   /* PUBLISH QoS0, retain */
+    uint8_t header = 0x30 | (retain ? 0x01 : 0x00);
+    if (qos == 1) header |= 0x02;        /* QoS1: bit1=1 bit2=0 */
+    if (dup)      header |= 0x08;        /* DUP=1: 重发标志 */
+    tx_buf[off++] = header;
     off += mqtt_encode_remaining_length(&tx_buf[off], (uint32_t)remaining);
     tx_buf[off++] = (uint8_t)((tlen >> 8) & 0xFF);
     tx_buf[off++] = (uint8_t)(tlen & 0xFF);
     memcpy(&tx_buf[off], topic, tlen);
     off += tlen;
+    if (qos > 0)
+    {
+        tx_buf[off++] = (uint8_t)((packet_id >> 8) & 0xFF);
+        tx_buf[off++] = (uint8_t)(packet_id & 0xFF);
+    }
     memcpy(&tx_buf[off], payload, plen);
     off += plen;
     return off;
@@ -765,6 +794,21 @@ static void mqtt_handle_ack(const uint8_t *body, uint32_t body_len)
     }
 }
 
+/* 收到 PUBACK：匹配 QoS1 pending 队列，释放 packet_id
+ * 设计 5.2: PUBACK 只释放 MQTT packet_id，不回收业务缓存（业务回执才回收） */
+static void mqtt_handle_puback(uint16_t packet_id)
+{
+    for (int i = 0; i < MQTT_QOS1_PENDING_MAX; i++)
+    {
+        if (s_qos1_pending[i].in_use && s_qos1_pending[i].packet_id == packet_id)
+        {
+            s_qos1_pending[i].in_use = false;
+            printf("[MQTT] PUBACK pid=%u\r\n", (unsigned)packet_id);
+            return;
+        }
+    }
+}
+
 /* ===== 离线补传驱动 =====
  * 设计 5.2:
  *   - 在线立即请求存储任务读取已提交记录，按现有 Topic 和 JSON 契约发布
@@ -793,7 +837,7 @@ static void mqtt_replay_pump(void)
             {
                 record_out_t *r = &g_fetch_resp.records[i];
                 const char *topic = (r->kind == RECORD_KIND_EVENT) ? g_topic_events : g_topic_telemetry;
-                if (MqttClient_Publish(topic, r->payload, r->payload_len) == 0)
+                if (MqttClient_PublishQos1(topic, r->payload, r->payload_len) == 0)
                 {
                     if (r->seq > max_seq) max_seq = r->seq;
                 }
@@ -842,6 +886,32 @@ static void mqtt_replay_pump(void)
         {
             g_fetch_in_flight = true;
         }
+    }
+}
+
+/* QoS1 超时重发检查（设计 5.2: 30s 未收到 PUBACK 则保持原 packet_id 重发，DUP=1）
+ * 在主循环 ERR_TIMEOUT 分支和补传 pump 一起调用 */
+static void mqtt_qos1_check_resend(void)
+{
+    uint32_t now = osKernelGetTickCount();
+    for (int i = 0; i < MQTT_QOS1_PENDING_MAX; i++)
+    {
+        if (!s_qos1_pending[i].in_use) continue;
+        if ((now - s_qos1_pending[i].send_tick) < MQTT_REPLAY_RESEND_MS) continue;
+
+        /* 30s 超时，重发（保持原 packet_id，DUP=1） */
+        osMutexAcquire(g_tx_mutex, osWaitForever);
+        size_t pkt_len = mqtt_build_publish(s_qos1_pending[i].topic,
+                                            s_qos1_pending[i].payload,
+                                            s_qos1_pending[i].payload_len,
+                                            s_qos1_pending[i].retain, 1,
+                                            s_qos1_pending[i].packet_id, true);
+        err_t err = netconn_write(g_conn, tx_buf, pkt_len, NETCONN_COPY);
+        osMutexRelease(g_tx_mutex);
+
+        s_qos1_pending[i].send_tick = now;
+        printf("[MQTT] QoS1 resend pid=%u (30s timeout)\r\n",
+               (unsigned)s_qos1_pending[i].packet_id);
     }
 }
 
@@ -907,11 +977,67 @@ int MqttClient_Publish(const char *topic, const uint8_t *payload, size_t plen)
 
     osMutexAcquire(g_tx_mutex, osWaitForever);
 
-    size_t pkt_len = mqtt_build_publish(topic, payload, plen, false);   /* 外部发布 retain=false */
+    size_t pkt_len = mqtt_build_publish(topic, payload, plen, false, 0, 0, false);   /* QoS0, retain=false */
     err_t err = netconn_write(g_conn, tx_buf, pkt_len, NETCONN_COPY);
 
     osMutexRelease(g_tx_mutex);
     return (err == ERR_OK) ? 0 : -2;
+}
+
+int MqttClient_PublishQos1(const char *topic, const uint8_t *payload, size_t plen)
+{
+    if (!g_connected || g_conn == NULL)
+    {
+        return -1;
+    }
+
+    size_t tlen = strlen(topic);
+    if (tlen + plen + 10 > sizeof(tx_buf))
+    {
+        return -3;   /* 过大 */
+    }
+    if (plen > MQTT_QOS1_PAYLOAD_MAX)
+    {
+        return -3;   /* 超过 QoS1 pending payload 上限 */
+    }
+
+    /* 找空闲 pending 槽 */
+    int slot = -1;
+    for (int i = 0; i < MQTT_QOS1_PENDING_MAX; i++)
+    {
+        if (!s_qos1_pending[i].in_use) { slot = i; break; }
+    }
+    if (slot < 0)
+    {
+        return -4;   /* pending 队列满 */
+    }
+
+    /* 分配 packet_id */
+    uint16_t pid = g_next_packet_id++;
+    if (g_next_packet_id == 0) g_next_packet_id = 1;
+
+    /* 存 pending（拷贝 payload，函数返回后调用方数据可释放） */
+    s_qos1_pending[slot].in_use      = true;
+    s_qos1_pending[slot].packet_id   = pid;
+    s_qos1_pending[slot].send_tick   = osKernelGetTickCount();
+    s_qos1_pending[slot].retain      = false;
+    s_qos1_pending[slot].payload_len = plen;
+    strncpy(s_qos1_pending[slot].topic, topic, sizeof(s_qos1_pending[slot].topic) - 1);
+    s_qos1_pending[slot].topic[sizeof(s_qos1_pending[slot].topic) - 1] = '\0';
+    memcpy(s_qos1_pending[slot].payload, payload, plen);
+
+    /* 发送 QoS1 PUBLISH */
+    osMutexAcquire(g_tx_mutex, osWaitForever);
+    size_t pkt_len = mqtt_build_publish(topic, payload, plen, false, 1, pid, false);
+    err_t err = netconn_write(g_conn, tx_buf, pkt_len, NETCONN_COPY);
+    osMutexRelease(g_tx_mutex);
+
+    if (err != ERR_OK)
+    {
+        s_qos1_pending[slot].in_use = false;  /* 发送失败，释放槽 */
+        return -2;
+    }
+    return 0;
 }
 
 int MqttClient_ReportEvent(const char *event_type, const char *detail)
@@ -1159,7 +1285,7 @@ void MqttClient_Task(void *argument)
             const char *online = "online";
             /* online 状态 retain=true（设计 5.1: 状态 retain=true） */
             osMutexAcquire(g_tx_mutex, osWaitForever);
-            size_t plen = mqtt_build_publish(g_topic_status, (const uint8_t *)online, 6, true);
+            size_t plen = mqtt_build_publish(g_topic_status, (const uint8_t *)online, 6, true, 0, 0, false);
             netconn_write(g_conn, tx_buf, plen, NETCONN_COPY);
             osMutexRelease(g_tx_mutex);
 
@@ -1208,6 +1334,8 @@ void MqttClient_Task(void *argument)
                         mqtt_replay_pump();
                         last_replay = osKernelGetTickCount();
                     }
+                    /* QoS1 超时重发检查（设计 5.2: 30s 未收到 PUBACK 重发） */
+                    mqtt_qos1_check_resend();
                     continue;
                 }
 
@@ -1259,9 +1387,17 @@ void MqttClient_Task(void *argument)
                     {
                         /* 心跳回复，无需处理 */
                     }
+                    else if (mtype == 4)  /* PUBACK: QoS1 PUBLISH 确认 */
+                    {
+                        if (mbody_len >= 2)
+                        {
+                            uint16_t pid = ((uint16_t)mbody[0] << 8) | mbody[1];
+                            mqtt_handle_puback(pid);
+                        }
+                    }
                     else
                     {
-                        /* 其它类型（PUBACK 等）忽略——PUBACK 不回收缓存（设计 5.2） */
+                        /* 其它类型忽略 */
                     }
                     rx_ring_consume(flen);
                 }
@@ -1277,6 +1413,11 @@ void MqttClient_Task(void *argument)
         g_fetch_in_flight = false;
         g_replay_last_seq = 0;
         g_replay_last_tick = 0;
+        /* 清空 QoS1 pending 队列（断连后未确认报文失效，重连后由业务层重发） */
+        for (int i = 0; i < MQTT_QOS1_PENDING_MAX; i++)
+        {
+            s_qos1_pending[i].in_use = false;
+        }
         {
             uint32_t delay = mqtt_backoff_delay(g_backoff_attempt++);
             printf("[MQTT] disconnected, reconnect in %lums (attempt=%lu)\r\n",
