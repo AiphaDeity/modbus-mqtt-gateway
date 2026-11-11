@@ -12,6 +12,7 @@
 
 #include "mb_api.h"
 #include "mb_pointmap.h"
+#include "cmsis_os2.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -380,4 +381,55 @@ void test_modbus_all(void)
     test_batch_config();
 
     MB_LOGI("====== ALL TESTS DONE ======");
+}
+
+
+/* =========================================================
+ * 模拟数据注入（无真实传感器时验证遥测上行链路）
+ *
+ *  原理：跳过 RS485 真实轮询，直接往每个已配置从站的
+ *  reg_data_buf 填合理的假数据，设 data_valid=1，
+ *  让 telemetry_task 能遍历到"有效数据"并 PUBLISH 到云端。
+ *
+ *  数据随时间波动，在云端看是"活的"：
+ *    slave 1 (FC01 线圈): 8 个线圈交替开关
+ *    slave 2 (FC03 寄存器): 温度 25.0~25.9°C + 湿度 58.0~58.9%
+ *    slave 3 (FC04 输入寄存器): 电压 3200~3290mV + 递增计数器
+ *
+ *  用法：vModbusPollTask 里 MB_SIMULATE_DATA=1 时周期调用
+ *  关闭：改 MB_SIMULATE_DATA=0 恢复真实 RS485 轮询
+ * ========================================================= */
+static int simulate_inject_cb(mb_slave_runtime_t *slave, void *ctx)
+{
+    (void)ctx;
+    uint32_t secs = osKernelGetTickCount() / 1000U;
+
+    switch (slave->telegram.u8id)
+    {
+        case 1:  /* FC01 线圈 8bit：奇偶秒交替 */
+            slave->reg_data_buf[0] = (secs & 1U) ? 0x00AAU : 0x0055U;
+            slave->valid_point = 1U;   /* 8 线圈打包成 1 个字 */
+            break;
+        case 2:  /* FC03 保持寄存器：温度 + 湿度 */
+            slave->reg_data_buf[0] = (uint16_t)(250U + (secs % 10U));         /* scale=0.1 → 25.0~25.9°C */
+            slave->reg_data_buf[1] = (uint16_t)(5800U + (secs % 10U) * 10U);  /* scale=0.01 → 58.0~58.9% */
+            slave->valid_point = 2U;
+            break;
+        case 3:  /* FC04 输入寄存器：电压 + 计数器 */
+            slave->reg_data_buf[0] = (uint16_t)(3200U + (secs % 10U) * 10U);  /* scale=1.0 → 3200~3290 mV */
+            slave->reg_data_buf[1] = (uint16_t)(secs & 0xFFFFU);              /* 递增计数器 */
+            slave->valid_point = 2U;
+            break;
+        default:
+            return 0;   /* 未知从站不注入 */
+    }
+    slave->data_valid = 1U;
+    slave->is_online  = 1U;
+    return 0;
+}
+
+void mb_simulate_inject(void)
+{
+    uint8_t n = mb_for_each_valid_slave(simulate_inject_cb, NULL);
+    printf("[SIM] inject %u slaves\r\n", (unsigned)n);
 }

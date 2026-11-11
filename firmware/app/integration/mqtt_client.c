@@ -39,8 +39,31 @@
 #include "storage_m2.h"      /* storage_m2_fetch/ack 队列协议（补传） */
 #include "storage_record.h"  /* record_out_t / RECORD_KIND_* */
 #include "storage_seq.h"     /* storage_seq_alloc() */
+#include "storage_time.h"   /* storage_get_unix_time() 取 RTC 时间戳做百度云签名 */
+#include "lwip/dns.h"        /* dns_gethostbyname 解析云平台域名 */
+#include "hmac_sha256.h"     /* 百度云签名 SHA256 */
+#if GATEWAY_ENABLE_M2
+#include "network_upgrade.h" /* NetworkUpgrade_Notify() OTA 升级通知分流 */
+#endif
 
-/* ===== 默认配置（AppConfig 未就绪时回退用） ===== */
+/* ===== 上云模式选择 =====
+ *   MQTT_USE_BAIDU=1：连百度云 IoT Core（域名 broker + SHA256 签名 + 自定义 topic）
+ *   MQTT_USE_BAIDU=0：连本地 mosquitto（IP broker + 明文认证 + client_id/子名 topic）
+ * 切换只需改这个宏。百度云模式下三元组填下面三个宏（百度智能云控制台开通后获得）。
+ * 百度云 1883 TCP 明文接入，免 TLS，每月免费 100 万条消息，适合无 TLS 的 STM32 设备。 */
+#define MQTT_USE_BAIDU      1
+
+#if MQTT_USE_BAIDU
+/* ★百度云 IoT Core 三元组 —— 在百度智能云「IoT Core → 设备详情」里复制粘贴到这里。
+ *   IoTCoreId / DeviceKey / DeviceSecret 在设备详情页「连接信息」里可见。
+ *   broker 域名 = {IoTCoreId}.iot.{region}.baidubce.com，端口 1883（TCP 明文，免 TLS） */
+#define BAIDU_IOTCORE_ID    "aeklwww"
+#define BAIDU_DEVICE_KEY    "stm32_gw_01"
+#define BAIDU_DEVICE_SECRET "YOUR_DEVICE_SECRET"  /* 占位符，测试时替换为真实密钥 */
+#define BAIDU_REGION        "gz"        /* 广州地域，创建实例时选的 */
+#endif
+
+/* ===== 默认配置（AppConfig 未就绪时回退用，仅本地模式生效） ===== */
 
 #define MQTT_DEF_BROKER_IP0   192
 #define MQTT_DEF_BROKER_IP1   168
@@ -50,7 +73,7 @@
 #define MQTT_DEF_CLIENT_ID    "mb2mqtt_001"
 #define MQTT_DEF_KEEPALIVE    30      /* 秒 */
 #define MQTT_SUBACK_TIMEOUT_MS 2000   /* 等 SUBACK 超时 */
-#define MQTT_CONNACK_TIMEOUT_MS 3000  /* 等 CONNACK 超时 */
+#define MQTT_CONNACK_TIMEOUT_MS 5000  /* 等 CONNACK 超时（原 3000 改 5000，给云端更多处理时间） */
 #define MQTT_REPLAY_INTERVAL_MS 3000  /* 补传 pump 调度间隔（有新数据时） */
 #define MQTT_REPLAY_RESEND_MS  30000  /* 回执未到重发间隔（设计 5.2: 30s） */
 #define MQTT_MAX_PAYLOAD       4096   /* 设计 5.2: payload 上限 */
@@ -66,27 +89,31 @@ static const uint32_t g_backoff_table[] = {1000, 2000, 4000, 8000, 16000, 32000,
 #define MQTT_TOPIC_COMMANDS   "commands"
 #define MQTT_TOPIC_ACKS       "acks"
 #define MQTT_TOPIC_CMD_ACK    "cmd_ack"   /* 命令执行回执（设备发布） */
+#define MQTT_TOPIC_OTA_STATUS "ota_status" /* OTA 升级状态上报（设备发布） */
 
 /* ===== 运行时配置（Init 时加载） ===== */
 typedef struct
 {
-    uint8_t  broker_ip[4];
+    char     broker_host[64];    /* 域名或 IP（阿里云域名 / 本地 IP） */
     uint16_t broker_port;
-    char     client_id[32];
-    char     username[32];
-    char     password[32];
+    ip_addr_t broker_ip;         /* DNS 解析后的 IP（连接用） */
+    bool     broker_ip_valid;    /* DNS 解析成功标志 */
+    char     client_id[48];      /* 百度云: DeviceKey；本地: 自定义 */
+    char     username[96];       /* 百度云: thingidp@id|key|ts|SHA256 较长，加宽 */
+    char     password[72];       /* 百度云: SHA256 hex=64字符；本地: 明文密码 */
     uint16_t keepalive_sec;
 } mqtt_runtime_cfg_t;
 
 static mqtt_runtime_cfg_t g_cfg;
 
 /* topic 缓冲（Init 时按 client_id 拼好） */
-static char g_topic_status[48];
-static char g_topic_events[48];
-static char g_topic_telemetry[48];
-static char g_topic_commands[48];
-static char g_topic_acks[48];
-static char g_topic_cmd_ack[48];
+static char g_topic_status[96];
+static char g_topic_events[96];
+static char g_topic_telemetry[96];
+static char g_topic_commands[96];
+static char g_topic_acks[96];
+static char g_topic_cmd_ack[96];
+static char g_topic_ota_status[96];
 
 /* ===== 收发缓冲（放 CCMRAM，不挤占 SRAM 里的 FreeRTOS 堆）
  * tx_buf: 固定头(5) + topic(64) + payload(4096) ≈ 4165，给 4200
@@ -128,53 +155,179 @@ static uint32_t g_replay_last_tick = 0;
 /* ===== 配置加载 ===== */
 static void mqtt_config_load(void)
 {
+#if MQTT_USE_BAIDU
+    /* ===== 百度云模式：broker 域名 + SHA256 签名 =====
+     * clientId=DeviceKey, username=thingidp@...|...|ts|SHA256, password=SHA256 hex
+     * 每次连接前由 baidu_build_auth() 重算（timestamp 变化） */
+    snprintf(g_cfg.broker_host, sizeof(g_cfg.broker_host),
+             "%s.iot.%s.baidubce.com", BAIDU_IOTCORE_ID, BAIDU_REGION);
+    g_cfg.broker_port = 1883;
+    g_cfg.broker_ip_valid = false;     /* 连接时才 DNS 解析 */
+    g_cfg.keepalive_sec = MQTT_DEF_KEEPALIVE;
+#else
+    /* ===== 本地 mosquitto 模式：IP/域名 + 明文认证 ===== */
     const app_config_t *cfg = AppConfig_Get();
-
-    /* broker IP：配置合法且 IP 非空字符串才用，否则回退默认 */
-    if (cfg != NULL && cfg->magic == CONFIG_MAGIC && cfg->mq_broker_ip[0] != '\0')
+    if (cfg != NULL && cfg->magic == CONFIG_MAGIC && cfg->mq_broker_host[0] != '\0')
     {
-        unsigned int b[4] = {0,0,0,0};
-        int parsed = sscanf(cfg->mq_broker_ip, "%u.%u.%u.%u", &b[0], &b[1], &b[2], &b[3]);
-        if (parsed == 4)
-        {
-            g_cfg.broker_ip[0] = (uint8_t)b[0];
-            g_cfg.broker_ip[1] = (uint8_t)b[1];
-            g_cfg.broker_ip[2] = (uint8_t)b[2];
-            g_cfg.broker_ip[3] = (uint8_t)b[3];
-            g_cfg.broker_port = cfg->mq_broker_port ? cfg->mq_broker_port : MQTT_DEF_BROKER_PORT;
-            strncpy(g_cfg.client_id, cfg->mq_client_id, sizeof(g_cfg.client_id)-1);
-            g_cfg.client_id[sizeof(g_cfg.client_id)-1] = '\0';
-            strncpy(g_cfg.username, cfg->mq_username, sizeof(g_cfg.username)-1);
-            g_cfg.username[sizeof(g_cfg.username)-1] = '\0';
-            strncpy(g_cfg.password, cfg->mq_password, sizeof(g_cfg.password)-1);
-            g_cfg.password[sizeof(g_cfg.password)-1] = '\0';
-            g_cfg.keepalive_sec = 30;
-            return;
-        }
+        strncpy(g_cfg.broker_host, cfg->mq_broker_host, sizeof(g_cfg.broker_host)-1);
+        g_cfg.broker_host[sizeof(g_cfg.broker_host)-1] = '\0';
+        g_cfg.broker_port = cfg->mq_broker_port ? cfg->mq_broker_port : MQTT_DEF_BROKER_PORT;
+        strncpy(g_cfg.client_id, cfg->mq_client_id, sizeof(g_cfg.client_id)-1);
+        g_cfg.client_id[sizeof(g_cfg.client_id)-1] = '\0';
+        strncpy(g_cfg.username, cfg->mq_username, sizeof(g_cfg.username)-1);
+        g_cfg.username[sizeof(g_cfg.username)-1] = '\0';
+        strncpy(g_cfg.password, cfg->mq_password, sizeof(g_cfg.password)-1);
+        g_cfg.password[sizeof(g_cfg.password)-1] = '\0';
+        g_cfg.keepalive_sec = 30;
+        g_cfg.broker_ip_valid = false;   /* 统一走 DNS 解析（host 可能是域名或 IP） */
+        return;
     }
-
     /* 回退默认值 */
-    g_cfg.broker_ip[0] = MQTT_DEF_BROKER_IP0;
-    g_cfg.broker_ip[1] = MQTT_DEF_BROKER_IP1;
-    g_cfg.broker_ip[2] = MQTT_DEF_BROKER_IP2;
-    g_cfg.broker_ip[3] = MQTT_DEF_BROKER_IP3;
+    strncpy(g_cfg.broker_host, "192.168.2.45", sizeof(g_cfg.broker_host)-1);
+    g_cfg.broker_host[sizeof(g_cfg.broker_host)-1] = '\0';
     g_cfg.broker_port  = MQTT_DEF_BROKER_PORT;
     strncpy(g_cfg.client_id, MQTT_DEF_CLIENT_ID, sizeof(g_cfg.client_id)-1);
     g_cfg.client_id[sizeof(g_cfg.client_id)-1] = '\0';
     g_cfg.username[0] = '\0';
     g_cfg.password[0] = '\0';
     g_cfg.keepalive_sec = MQTT_DEF_KEEPALIVE;
+    g_cfg.broker_ip_valid = false;
+#endif
 }
 
-/* 拼所有主题：client_id + "/" + 子名 */
+#if MQTT_USE_BAIDU
+
+/* 百度云 IoT Core 认证参数生成（每次连接前调用，timestamp 变化需重算）
+ *
+ * 百度云官方签名算法（见 cloud.baidu.com/doc/IoTCore MQTT连接）：
+ *   clientId   = DeviceKey
+ *   username   = "thingidp@" + IoTCoreId + "|" + DeviceKey + "|" + timestamp + "|SHA256"
+ *   password   = lowercase_hex( SHA256( DeviceKey + "&" + timestamp + "&SHA256" + DeviceSecret ) )
+ *
+ *   timestamp 以秒为单位，与服务器时间误差允许 10min；
+ *   RTC 未校时时传 0 占位（百度云允许）。
+ *
+ * broker 地址 = {IoTCoreId}.iot.{region}.baidubce.com:1883（TCP 明文，免 TLS）
+ * topic 完全自定义（无固定前缀），权限由设备 topic 列表控制。
+ */
+/* ★★编译时间 → Unix 时间戳（替代硬编码 base timestamp）
+ * __DATE__ 格式 "Mmm dd yyyy"（如 "Nov 10 2026"）
+ * __TIME__ 格式 "hh:mm:ss"（如 "17:59:30"）
+ * 每次构建自动获得新鲜时间戳，板子烧录后 + uptime 秒数 ≈ 实际时间，
+ * 只要编译到烧录间隔 <10 分钟就在百度云允许窗口内。 */
+static uint32_t compile_time_to_unix(void)
+{
+    /* 月份缩写查找表 */
+    static const char *const months = "JanFebMarAprMayJunJulAugSepOctNovDec";
+    const char *mstr = __DATE__;   /* "Mmm dd yyyy" */
+    const char *tstr = __TIME__;   /* "hh:mm:ss"    */
+
+    /* 解析月份 */
+    char mon3[4] = {0};
+    mon3[0] = mstr[0]; mon3[1] = mstr[1]; mon3[2] = mstr[2];
+    const char *p = strstr(months, mon3);
+    int month = p ? (int)((p - months) / 3 + 1) : 1;
+
+    /* 解析日、年 */
+    int day = atoi(mstr + 4);       /* 跳过 "Mmm " */
+    int year = atoi(mstr + 7);      /* 跳过 "Mmm dd " */
+
+    /* 解析时:分:秒 */
+    int hour = atoi(tstr);
+    int min = atoi(tstr + 3);
+    int sec = atoi(tstr + 6);
+
+    /* 累加天数：1970→year-1 的完整年 */
+    uint32_t days = 0;
+    for (int y = 1970; y < year; y++)
+        days += ((y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)) ? 366 : 365;
+
+    /* 累加当年 1→month-1 的完整月 */
+    static const int dom[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    for (int m = 1; m < month; m++)
+    {
+        days += dom[m - 1];
+        if (m == 2 && ((year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)))
+            days += 1;  /* 闰年 2 月多一天 */
+    }
+    days += (uint32_t)(day - 1);
+
+    /* ★★关键：__DATE__/__TIME__ 返回编译机的本地时间（北京 UTC+8），
+     * Unix 时间戳是 UTC，必须减去时区偏移。否则时间戳偏前 8 小时，
+     * 百度云认证失败返回 CONNACK rc=2。 */
+    return days * 86400U + (uint32_t)(hour * 3600 + min * 60 + sec) - 28800U;
+}
+
+static void baidu_build_auth(void)
+{
+    const char *iotcore_id = BAIDU_IOTCORE_ID;
+    const char *dk = BAIDU_DEVICE_KEY;
+    const char *ds = BAIDU_DEVICE_SECRET;
+
+    /* timestamp：百度云官方文档明确允许传 0 占位（跳过时间校验）。
+     * ★★2026-11-10：之前用编译时间+uptime 算 timestamp，但编译本地时间(UTC+8)→UTC
+     * 转换有偏差导致认证失败(rc=2)。直接传 0 最安全——服务器跳过时间校验。
+     * 后续 SNTP 校时后再改回真实时间戳。 */
+    uint32_t ts = 0;  /* 0 = 不校验时间（百度云允许） */
+
+    /* username = thingidp@{IoTCoreId}|{DeviceKey}|{timestamp}|SHA256 */
+    snprintf(g_cfg.username, sizeof(g_cfg.username),
+             "thingidp@%s|%s|%lu|SHA256",
+             iotcore_id, dk, (unsigned long)ts);
+
+    /* 加密字符串 = {DeviceKey}&{timestamp}&SHA256{DeviceSecret} */
+    char sign_str[128];
+    int n = snprintf(sign_str, sizeof(sign_str),
+                     "%s&%lu&SHA256%s", dk, (unsigned long)ts, ds);
+
+    /* password = SHA256(加密字符串) 的 hex 小写 */
+    sha256_hex((const uint8_t *)sign_str, (size_t)n, g_cfg.password);
+
+    /* clientId = DeviceKey */
+    strncpy(g_cfg.client_id, dk, sizeof(g_cfg.client_id)-1);
+    g_cfg.client_id[sizeof(g_cfg.client_id)-1] = '\0';
+
+    printf("[MQTT] Baidu auth: cid=%s ts=%lu\r\n",
+           g_cfg.client_id, (unsigned long)ts);
+}
+#endif
+
+/* 对外：返回遥测主题（telemetry_task 用，替代硬编码 topic，切云平台自动适配） */
+const char *MqttClient_TopicTelemetry(void)
+{
+    return g_topic_telemetry;
+}
+
+const char *MqttClient_TopicOtaStatus(void)
+{
+    return g_topic_ota_status;
+}
+
+/* 拼所有主题。
+ * 百度云 IoT Core：$iot/{DeviceKey}/user/{子名}（官方固定前缀，详见 IoT Core 文档）
+ * 本地 mosquitto：{client_id}/{子名}
+ * （百度云 topic 权限在设备详情→Topic 权限里配置，或用通配符 $iot/{DeviceKey}/user/# 授权） */
 static void mqtt_topics_build(void)
 {
+#if MQTT_USE_BAIDU
+    /* 百度云：$iot/{DeviceKey}/user/{子名}。g_cfg.client_id 在 baidu_build_auth 里已设为 DeviceKey */
+    const char *dk = g_cfg.client_id;
+    snprintf(g_topic_status,    sizeof(g_topic_status),    "$iot/%s/user/%s", dk, MQTT_TOPIC_STATUS);
+    snprintf(g_topic_events,    sizeof(g_topic_events),    "$iot/%s/user/%s", dk, MQTT_TOPIC_EVENTS);
+    snprintf(g_topic_telemetry, sizeof(g_topic_telemetry), "$iot/%s/user/%s", dk, MQTT_TOPIC_TELEMETRY);
+    snprintf(g_topic_commands,  sizeof(g_topic_commands),  "$iot/%s/user/%s", dk, MQTT_TOPIC_COMMANDS);
+    snprintf(g_topic_acks,      sizeof(g_topic_acks),      "$iot/%s/user/%s", dk, MQTT_TOPIC_ACKS);
+    snprintf(g_topic_cmd_ack,   sizeof(g_topic_cmd_ack),   "$iot/%s/user/%s", dk, MQTT_TOPIC_CMD_ACK);
+    snprintf(g_topic_ota_status,sizeof(g_topic_ota_status),"$iot/%s/user/%s", dk, MQTT_TOPIC_OTA_STATUS);
+#else
     snprintf(g_topic_status,    sizeof(g_topic_status),    "%s/%s", g_cfg.client_id, MQTT_TOPIC_STATUS);
     snprintf(g_topic_events,    sizeof(g_topic_events),    "%s/%s", g_cfg.client_id, MQTT_TOPIC_EVENTS);
     snprintf(g_topic_telemetry, sizeof(g_topic_telemetry), "%s/%s", g_cfg.client_id, MQTT_TOPIC_TELEMETRY);
     snprintf(g_topic_commands,  sizeof(g_topic_commands),  "%s/%s", g_cfg.client_id, MQTT_TOPIC_COMMANDS);
     snprintf(g_topic_acks,      sizeof(g_topic_acks),      "%s/%s", g_cfg.client_id, MQTT_TOPIC_ACKS);
     snprintf(g_topic_cmd_ack,   sizeof(g_topic_cmd_ack),   "%s/%s", g_cfg.client_id, MQTT_TOPIC_CMD_ACK);
+    snprintf(g_topic_ota_status,sizeof(g_topic_ota_status),"%s/%s", g_cfg.client_id, MQTT_TOPIC_OTA_STATUS);
+#endif
 }
 
 /* ===== MQTT 变长 remaining length 编码/解码 ===== */
@@ -456,6 +609,34 @@ static void mqtt_handle_command(const uint8_t *body, uint32_t body_len, uint8_t 
 
     printf("[MQTT] recv cmd: %s\r\n", cmd_payload_buf);
 
+#if GATEWAY_ENABLE_M2
+    /* ★OTA 升级通知分流：JSON 含 "url" + "sha256" → 升级通知，转给 NetworkUpgrade。
+     * 升级通知和普通 Modbus 命令复用 commands topic，靠 JSON 字段区分：
+     *   升级通知: {"task_id":"...","url":"http://...","sha256":"...","size":262144,...}
+     *   普通命令: {"slave":2,"func":6,"addr":0,"val":100}
+     * 不在回调里执行下载/Flash/密码运算（README 要求），只唤醒执行任务。 */
+    if (strstr(cmd_payload_buf, "\"url\"") && strstr(cmd_payload_buf, "\"sha256\""))
+    {
+        int nr = NetworkUpgrade_Notify(cmd_payload_buf);
+        char ack[96];
+        int alen;
+        if (nr == 0)
+        {
+            alen = snprintf(ack, sizeof(ack), "{\"status\":\"accepted\",\"type\":\"ota\"}");
+        }
+        else if (nr == -2)
+        {
+            alen = snprintf(ack, sizeof(ack), "{\"status\":\"busy\",\"type\":\"ota\"}");
+        }
+        else
+        {
+            alen = snprintf(ack, sizeof(ack), "{\"status\":\"err\",\"type\":\"ota\",\"err\":%d}", nr);
+        }
+        MqttClient_Publish(g_topic_cmd_ack, (const uint8_t *)ack, (size_t)alen);
+        return;
+    }
+#endif
+
     /* 手写 JSON 解析：找 "slave":<int> "func":<int> "addr":<int> "val":<int> */
     int slave = -1, func = -1, addr = -1, val = 0;
     const char *keys[] = { "\"slave\"", "\"func\"", "\"addr\"", "\"val\"" };
@@ -683,6 +864,16 @@ AppModuleInitResult MqttClient_Init(void)
     srand(osKernelGetTickCount());   /* 退避抖动随机种子 */
 
     mqtt_config_load();
+
+#if MQTT_USE_BAIDU
+    /* ★★2026-11-10 关键修复：必须先调 baidu_build_auth() 设置 g_cfg.client_id=DeviceKey，
+     * 再调 mqtt_topics_build() 拼 topic。之前顺序反了：topics_build 用空 client_id
+     * → Will Topic 变成 "$iot//user/status"（DeviceKey 丢失）→ CONNACK rc=2。
+     * baidu_build_auth 里的 timestamp 每次连接前会重算（在 task 循环里），这里只是
+     * 初始化阶段把 client_id/username/password 填上，让 topics_build 能拿到正确的 DeviceKey。 */
+    baidu_build_auth();
+#endif
+
     mqtt_topics_build();
 
     g_conn = NULL;
@@ -757,9 +948,8 @@ static bool wait_network_ready(uint32_t timeout_ms)
 void MqttClient_Task(void *argument)
 {
     (void)argument;
-    printf("[MQTT] task started, broker=%u.%u.%u.%u:%u cid=%s auth=%s\r\n",
-           g_cfg.broker_ip[0], g_cfg.broker_ip[1], g_cfg.broker_ip[2], g_cfg.broker_ip[3],
-           g_cfg.broker_port, g_cfg.client_id,
+    printf("[MQTT] task started, broker=%s:%u cid=%s auth=%s\r\n",
+           g_cfg.broker_host, g_cfg.broker_port, g_cfg.client_id,
            g_cfg.username[0] ? "yes" : "no");
 
     while (1)
@@ -775,9 +965,23 @@ void MqttClient_Task(void *argument)
                ipaddr_ntoa(netif_ip4_addr(netif_default)));
 
         /* ---- 2. TCP 连接 broker ---- */
-        printf("[MQTT] connecting to broker %u.%u.%u.%u:%u ...\r\n",
-               g_cfg.broker_ip[0], g_cfg.broker_ip[1], g_cfg.broker_ip[2], g_cfg.broker_ip[3],
-               g_cfg.broker_port);
+        /* DNS 解析 broker 域名 → IP（同步，走 tcpip 线程；LWIP_DNS=1） */
+        printf("[MQTT] resolving %s ...\r\n", g_cfg.broker_host);
+        err_t dnserr = netconn_gethostbyname(g_cfg.broker_host, &g_cfg.broker_ip);
+        if (dnserr != ERR_OK)
+        {
+            printf("[MQTT] DNS resolve '%s' failed err=%d\r\n", g_cfg.broker_host, (int)dnserr);
+            osDelay(mqtt_backoff_delay(g_backoff_attempt++));
+            continue;
+        }
+        g_cfg.broker_ip_valid = true;
+        printf("[MQTT] DNS %s -> %s, connecting ...\r\n",
+               g_cfg.broker_host, ipaddr_ntoa(&g_cfg.broker_ip));
+
+#if MQTT_USE_BAIDU
+        /* 百度云：每次连接重算签名（timestamp 变化） */
+        baidu_build_auth();
+#endif
 
         g_conn = netconn_new(NETCONN_TCP);
         if (g_conn == NULL)
@@ -787,11 +991,11 @@ void MqttClient_Task(void *argument)
             continue;
         }
 
-        ip_addr_t broker_ip;
-        IP4_ADDR(&broker_ip, g_cfg.broker_ip[0], g_cfg.broker_ip[1],
-                 g_cfg.broker_ip[2], g_cfg.broker_ip[3]);
+        /* ★关键：设 recv 超时 1 秒，主循环才能定期醒来发 PINGREQ 心跳 + 跑补传 pump。
+           不设的话 netconn_recv 永久阻塞 → 心跳不发 → keepalive(30s) 超时云端断连。 */
+        netconn_set_recvtimeout(g_conn, 1000);
 
-        err_t err = netconn_connect(g_conn, &broker_ip, g_cfg.broker_port);
+        err_t err = netconn_connect(g_conn, &g_cfg.broker_ip, g_cfg.broker_port);
         if (err != ERR_OK)
         {
             printf("[MQTT] TCP connect failed err=%d\r\n", (int)err);
@@ -801,15 +1005,14 @@ void MqttClient_Task(void *argument)
             continue;
         }
 
-        g_conn->recv_timeout = 1000;
-
         /* ---- 3. 发 CONNECT ---- */
         rx_ring_len = 0;
         size_t pkt_len = mqtt_build_connect();
+        printf("[MQTT] CONNECT %u bytes, sending...\r\n", (unsigned)pkt_len);
         err = netconn_write(g_conn, tx_buf, pkt_len, NETCONN_COPY);
         if (err != ERR_OK)
         {
-            printf("[MQTT] CONNECT write failed\r\n");
+            printf("[MQTT] CONNECT write failed err=%d\r\n", (int)err);
             goto conn_fail;
         }
 
@@ -834,23 +1037,48 @@ void MqttClient_Task(void *argument)
                     size_t flen = rx_ring_take_frame(&mtype, &mflags, &mbody, &mbody_len);
                     if (flen > 0)
                     {
-                        if (mtype == 2 && mbody_len >= 2 && mbody[0] == 0x00 && mbody[1] == 0x00)
+                        if (mtype == 2)  /* CONNACK = 0x20 >> 4 = 2 */
                         {
-                            got_connack = true;
-                            rx_ring_consume(flen);
-                            break;
+                            uint8_t rc = (mbody_len >= 2) ? mbody[1] : 0xFF;
+                            printf("[MQTT] CONNACK rc=%u (0=accepted 1=bad_proto 2=bad_cid 3=server_unavail 4=bad_auth 5=not_auth)\r\n",
+                                   (unsigned)rc);
+                            if (rc == 0)
+                            {
+                                got_connack = true;
+                                rx_ring_consume(flen);
+                                break;
+                            }
+                            else
+                            {
+                                /* ★★原 bug：错误 CONNACK 被静默丢弃，继续等直到超时。
+                                   修复：认证失败直接退出，不浪费时间 */
+                                printf("[MQTT] CONNECT rejected by broker (rc=%u)\r\n", (unsigned)rc);
+                                rx_ring_consume(flen);
+                                goto conn_fail;
+                            }
                         }
+                        printf("[MQTT] unexpected msg type=%u (waiting CONNACK)\r\n", (unsigned)mtype);
                         rx_ring_consume(flen);
                     }
                 }
-                else if (nb != NULL)
+                else
                 {
-                    netbuf_delete(nb);
+                    /* ★★调试：打印 netconn_recv 返回的错误码，判断是超时还是连接关闭 */
+                    if (err != ERR_TIMEOUT)
+                        printf("[MQTT] recv err=%d (timeout=%d closed=%d)\r\n",
+                               (int)err, (int)ERR_TIMEOUT, (int)ERR_CLSD);
+                    if (nb != NULL) netbuf_delete(nb);
+                    if (err == ERR_CLSD)
+                    {
+                        printf("[MQTT] connection closed by broker before CONNACK\r\n");
+                        goto conn_fail;
+                    }
                 }
             }
             if (!got_connack)
             {
-                printf("[MQTT] CONNACK timeout\r\n");
+                printf("[MQTT] CONNACK timeout (%ums, no MQTT data received)\r\n",
+                       (unsigned)MQTT_CONNACK_TIMEOUT_MS);
                 goto conn_fail;
             }
         }
@@ -936,6 +1164,7 @@ void MqttClient_Task(void *argument)
             osMutexRelease(g_tx_mutex);
 
             MqttClient_ReportEvent("boot", "gateway started");
+            printf("[MQTT] online + boot event published, entering main loop\r\n");
         }
 
         /* ---- 7. 主循环：收消息 + 心跳 + 补传 ---- */
@@ -950,6 +1179,14 @@ void MqttClient_Task(void *argument)
 
                 if (err == ERR_TIMEOUT)
                 {
+                    /* 低频心跳：每 10 秒确认主循环在跑、recv 超时生效 */
+                    static uint32_t last_alive = 0;
+                    uint32_t now_tick = osKernelGetTickCount();
+                    if (now_tick - last_alive >= 10000U)
+                    {
+                        printf("[MQTT] main loop alive (keepalive=%us)\r\n", (unsigned)g_cfg.keepalive_sec);
+                        last_alive = now_tick;
+                    }
                     /* 心跳：超过 keepalive 的 80% 没发数据就发 PINGREQ */
                     if ((osKernelGetTickCount() - last_ping) >= (uint32_t)(g_cfg.keepalive_sec * 800))
                     {
@@ -996,6 +1233,8 @@ void MqttClient_Task(void *argument)
 
                     if (mtype == 3)        /* PUBLISH：下行命令 / 业务回执 */
                     {
+                        printf("[MQTT] PUBLISH recv flags=0x%02X body=%lu\r\n",
+                               (unsigned)mflags, (unsigned long)mbody_len);
                         /* 根据 topic 分发：commands → 命令处理，acks → 回执处理 */
                         if (mbody_len >= 4)
                         {

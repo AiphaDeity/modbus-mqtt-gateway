@@ -32,7 +32,7 @@ static const app_config_t s_default_config = {
     .mb_poll_interval_ms = 1000,
 
     /* MQTT 参数（M2） */
-    .mq_broker_ip = "192.168.2.45",
+    .mq_broker_host = "192.168.2.45",   /* 本地 mosquitto 默认（阿里云模式走宏不走这里） */
     .mq_broker_port = 1883,
     .mq_client_id = "mb2mqtt_001",
     .mq_username = "",

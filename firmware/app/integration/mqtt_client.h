@@ -71,6 +71,20 @@ bool MqttClient_IsConnected(void);
  */
 int MqttClient_ReportEvent(const char *event_type, const char *detail);
 
+/**
+ * @brief  获取遥测上报主题（Init 时按当前上云模式拼好）
+ * @note   telemetry_task 用它替代硬编码 topic，切云平台时自动适配
+ * @return 主题字符串指针（只读，生命周期同 mqtt 模块）
+ */
+const char *MqttClient_TopicTelemetry(void);
+
+/**
+ * @brief  获取 OTA 状态上报主题（Init 时按当前上云模式拼好）
+ * @note   network_upgrade 模块用它上报升级状态到云端
+ * @return 主题字符串指针（只读，生命周期同 mqtt 模块）
+ */
+const char *MqttClient_TopicOtaStatus(void);
+
 #ifdef __cplusplus
 }
 #endif

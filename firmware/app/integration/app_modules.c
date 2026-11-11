@@ -44,7 +44,7 @@ _Alignas(8) static StackType_t config_stack[CONFIG_STACK_SIZE_BYTES / sizeof(Sta
 _Alignas(8) static StackType_t modbus_stack[MODBUS_STACK_SIZE_BYTES / sizeof(StackType_t)]  __attribute__((section(".ccmram")));
 _Alignas(8) static StackType_t mqtt_stack[MQTT_STACK_SIZE_BYTES / sizeof(StackType_t)]  __attribute__((section(".ccmram")));
 _Alignas(8) static StackType_t telemetry_stack[TELEMETRY_STACK_SIZE_BYTES / sizeof(StackType_t)]  __attribute__((section(".ccmram")));
-_Alignas(8) static StackType_t monitor_stack[MONITOR_STACK_SIZE_BYTES / sizeof(StackType_t)];
+_Alignas(8) static StackType_t monitor_stack[MONITOR_STACK_SIZE_BYTES / sizeof(StackType_t)] __attribute__((section(".ccmram")));
 
 static StaticTask_t storage_control_block;
 static StaticTask_t config_control_block;
@@ -101,7 +101,7 @@ static const osThreadAttr_t telemetry_attributes =
   .cb_size = sizeof(telemetry_control_block),
   .stack_mem = telemetry_stack,
   .stack_size = sizeof(telemetry_stack),
-  .priority = osPriorityBelowNormal
+  .priority = osPriorityNormal    /* ★原 BelowNormal(16) 被 MQTT/Storage(24) 饿死，改 Normal */
 };
 
 static const osThreadAttr_t monitor_attributes =
@@ -137,12 +137,12 @@ static AppModuleSlot module_slots[APP_MODULE_COUNT] =
   },
   [APP_MODULE_MQTT] =
   {
-    .init = NULL/*MqttClient_Init*/, .task = NULL/*MqttClient_Task*/, .attributes = &mqtt_attributes,
+    .init = MqttClient_Init, .task = MqttClient_Task, .attributes = &mqtt_attributes,
     .result = APP_MODULE_INIT_NOT_READY, .task_state = APP_MODULE_TASK_NOT_STARTED
   },
   [APP_MODULE_TELEMETRY] =
   {
-    .init = NULL/*Telemetry_Init*/, .task = NULL/*Telemetry_Task*/, .attributes = &telemetry_attributes,
+    .init = Telemetry_Init, .task = Telemetry_Task, .attributes = &telemetry_attributes,
     .result = APP_MODULE_INIT_NOT_READY, .task_state = APP_MODULE_TASK_NOT_STARTED
   },
   [APP_MODULE_MONITOR] =
@@ -259,6 +259,8 @@ void App_ModulesInit(void)
     }
 
     AppModuleInitResult result = slot->init();
+
+    printf("[MOD] module[%u] init=%d state=%d\r\n", i, (int)result, (int)slot->task_state);
 
     switch (result)
     {

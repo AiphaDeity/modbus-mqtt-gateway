@@ -25,6 +25,7 @@
 #include "lwip/udp.h"        /* UDP 控制块类型 */
 #include "netif/etharp.h"    /* ARP 模块（etharp_output 在 ethernetif 里用） */
 #include "lwip/dhcp.h"       /* ★DHCP：dhcp_start/dhcp_stop/dhcp_supplied_address */
+#include "lwip/dns.h"        /* ★DNS：dns_setserver（静态 IP 兜底时设公共 DNS） */
 #include "lwip/init.h"       /* lwip_init（tcpip_init 内部会调，不用直接调） */
 #include "lwip/timeouts.h"   /* lwip 超时管理（tcpip 线程内部用） */
 #include "lwip/netif.h"      /* ★netif 结构体：netif_add/netif_set_default/netif_is_link_up 等 */
@@ -87,7 +88,9 @@ static uint8_t g_lwip_dhcp_state = LWIP_DHCP_OFF;   /* 当前 DHCP 状态（全�
    ★为什么不是例程的 128*2=256 字（1KB）：这线程里 lwip 会往串口打印
    "The network cable is connected" 这类信息，printf 本身就要吃掉几百字节栈，
    1KB 在带调试打印时很容易爆栈（爆栈 → vApplicationStackOverflowHook → 全系统停机） */
-#define LWIP_LINK_TASK_PRIO     3
+#define LWIP_LINK_TASK_PRIO     24    /* ★osPriorityNormal：和 Storage/MQTT 同级。
+                                        * 之前=3 太低，被 Modbus(32)/Storage(24) 等业务任务饿死，
+                                        *  link 线程永远不被调度 → PHY link 变化检测不到。 */
 #define LWIP_LINK_STK_SIZE      128 * 6
 
 /* DHCP 线程：优先级 4（比链接线程高 1，因为拿 IP 更重要）、栈 768 字 = 3KB。
@@ -97,7 +100,7 @@ static uint8_t g_lwip_dhcp_state = LWIP_DHCP_OFF;   /* 当前 DHCP 状态（全�
    例程的 256 字（1KB）在这个深度上会爆栈，实测就是卡在这里导致整机停机。
    为什么优先级都不高？因为 tcpip 内核线程优先级是 configMAX_PRIORITIES-2（最高档），
    协议栈处理不能被低优先级线程打断太久，所以业务线程都让着内核 */
-#define LWIP_DHCP_TASK_PRIO     4
+#define LWIP_DHCP_TASK_PRIO     24    /* ★osPriorityNormal：同 link 线程，避免被业务任务饿死 */
 #define LWIP_DHCP_STK_SIZE      128 * 6
 
 /* 函数声明（提前声明，避免编译器"隐式声明"告警） */
@@ -216,20 +219,27 @@ int32_t m2_ethernet_init(void)
 #if LWIP_NETIF_LINK_CALLBACK
   lwip_link_status_updated(&g_lwip_netif);
   netif_set_link_callback(&g_lwip_netif, lwip_link_status_updated);
+  printf("[ETH] before link thread, freeHeap=%u\r\n", (unsigned)xPortGetFreeHeapSize());
   /* 这里不再套临界区：xTaskCreate 内部自己会处理临界区，外面再包一层只会让
      整个建线程过程长时间关中断，没有任何好处 */
   sys_thread_new("eth_link", lwip_link_thread, &g_lwip_netif,
                  LWIP_LINK_STK_SIZE, LWIP_LINK_TASK_PRIO);
+  printf("[ETH] link thread created, freeHeap=%u\r\n", (unsigned)xPortGetFreeHeapSize());
 #endif
 
   /* 6. DHCP 线程：去路由器要 IP（超时自动回落静态）
      sys_thread_new = lwip 的建线程封装，带 OS 下由 sys_arch.c 实现（= FreeRTOS xTaskCreate） */
 #if LWIP_DHCP
   g_lwipdev.dhcpstatus = 0;               /* 标记：还没 DHCP */
-  g_lwip_dhcp_state = LWIP_DHCP_OFF;      /* 状态机复位 */
+  printf("[ETH] before dhcp thread, freeHeap=%u\r\n", (unsigned)xPortGetFreeHeapSize());
+  /* ★注意：g_lwip_dhcp_state 不能在这里设 OFF！
+   * 上面的 lwip_link_status_updated(第218行) 已经根据 link 状态设好了
+   *（link up 时设了 LWIP_DHCP_START）。这里再设 OFF 会覆盖掉 START，
+   *  导致 DHCP 线程读到 OFF 永远不发起 DHCP 请求。 */
   /* 同上：不套临界区 */
   sys_thread_new("eth_dhcp", lwip_dhcp_process, &g_lwip_netif,
                  LWIP_DHCP_STK_SIZE, LWIP_DHCP_TASK_PRIO);
+  printf("[ETH] dhcp thread created, freeHeap=%u\r\n", (unsigned)xPortGetFreeHeapSize());
 #endif
 
   g_lwipdev.link_status = LWIP_LINK_OFF;  /* 初始标记断链（链接线程马上会更新） */
@@ -359,6 +369,7 @@ static void lwip_link_thread(void *argument)
 #if LWIP_DHCP
 static void lwip_dhcp_process(void *pvParameters)
 {
+  printf("[DHCP] thread started, state=%d freeHeap=%u\r\n", g_lwip_dhcp_state, (unsigned)xPortGetFreeHeapSize());
   struct netif *netif = (struct netif *)pvParameters;  /* 线程参数 = 网卡对象 */
   uint32_t ip = 0, netmask = 0, gw = 0;               /* 缓存从 netif 读出的地址（解析字节用） */
   struct dhcp *dhcp;                                  /* DHCP 客户端内部状态（看尝试次数） */
@@ -442,6 +453,15 @@ static void lwip_dhcp_process(void *pvParameters)
                  先down再up强制LWIP清ARP缓存、重新初始化接口、发gratuitous ARP，否则PC ping不通。 */
               netifapi_netif_set_down(netif);
               netifapi_netif_set_up(netif);
+
+              /* ★静态 IP 兜底没有 DHCP 提供 DNS，手动设公共 DNS，否则解析不了云平台域名 */
+              {
+                ip_addr_t dns1, dns2;
+                IP4_ADDR(&dns1, 114, 114, 114, 114);
+                IP4_ADDR(&dns2, 223, 5, 5, 5);
+                dns_setserver(0, &dns1);
+                dns_setserver(1, &dns2);
+              }
             }
             printf("Static IP: %d.%d.%d.%d / %d.%d.%d.%d / gw %d.%d.%d.%d\r\n",
                    g_lwipdev.ip[0], g_lwipdev.ip[1], g_lwipdev.ip[2], g_lwipdev.ip[3],
