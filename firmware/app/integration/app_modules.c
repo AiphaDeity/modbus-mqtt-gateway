@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdio.h>
 
 #include "FreeRTOS.h"
 #include "task.h"
@@ -106,7 +107,7 @@ static const osThreadAttr_t telemetry_attributes =
   .cb_size = sizeof(telemetry_control_block),
   .stack_mem = telemetry_stack,
   .stack_size = sizeof(telemetry_stack),
-  .priority = osPriorityBelowNormal
+  .priority = osPriorityNormal    /* ★原 BelowNormal(16) 被 MQTT/Storage(24) 饿死，改 Normal */
 };
 
 static const osThreadAttr_t monitor_attributes =
@@ -152,12 +153,20 @@ static AppModuleSlot module_slots[APP_MODULE_COUNT] =
   },
   [APP_MODULE_MQTT] =
   {
-    .init = NULL/*MqttClient_Init*/, .task = NULL/*MqttClient_Task*/, .attributes = &mqtt_attributes,
+#if GATEWAY_ENABLE_M2
+    .init = MqttClient_Init, .task = MqttClient_Task, .attributes = &mqtt_attributes,
+#else
+    .init = NULL, .task = NULL, .attributes = &mqtt_attributes,
+#endif
     .result = APP_MODULE_INIT_NOT_READY, .task_state = APP_MODULE_TASK_NOT_STARTED
   },
   [APP_MODULE_TELEMETRY] =
   {
-    .init = NULL/*Telemetry_Init*/, .task = NULL/*Telemetry_Task*/, .attributes = &telemetry_attributes,
+#if GATEWAY_ENABLE_M2
+    .init = Telemetry_Init, .task = Telemetry_Task, .attributes = &telemetry_attributes,
+#else
+    .init = NULL, .task = NULL, .attributes = &telemetry_attributes,
+#endif
     .result = APP_MODULE_INIT_NOT_READY, .task_state = APP_MODULE_TASK_NOT_STARTED
   },
   [APP_MODULE_MONITOR] =
@@ -279,6 +288,8 @@ void App_ModulesInit(void)
     }
 
     AppModuleInitResult result = slot->init();
+
+    printf("[MOD] module[%u] init=%d state=%d\r\n", i, (int)result, (int)slot->task_state);
 
     switch (result)
     {

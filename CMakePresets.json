@@ -68,6 +68,15 @@
             }
         },
         {
+            "name": "AppFlashDebug",
+            "inherits": "Debug",
+            "cacheVariables": {
+                "GATEWAY_FIRMWARE": "app",
+                "GATEWAY_APP_LINKER_SCRIPT": "${sourceDir}/firmware/app/STM32F407xx_FLASH.ld",
+                "GATEWAY_APP_VECTOR_OFFSET": "0x00000000"
+            }
+        },
+        {
             "name": "M3Test",
             "inherits": "Debug",
             "cacheVariables": {
@@ -103,6 +112,10 @@
         {
             "name": "AppDebug",
             "configurePreset": "AppDebug"
+        },
+        {
+            "name": "AppFlashDebug",
+            "configurePreset": "AppFlashDebug"
         },
         {
             "name": "M3Test",

@@ -28,6 +28,12 @@ extern UART_HandleTypeDef huart3;
 // extern volatile uint32_t mb_dbg_uart_err;
 // extern volatile uint32_t mb_dbg_uart_err_cnt;
 
+/* ========= 测试用例入口（定义在 modbus_test.c）========= */
+extern void test_add_three_slaves(void);
+extern void test_read_snapshot(void);
+extern void test_parse_points(void);
+extern void test_write_operations(void);
+extern void mb_simulate_inject(void);
 /* ========= 内部静态函数 ========= */
 
 /**
@@ -319,7 +325,13 @@ void Modbus_Init(void)
 
 /**
  * @brief Modbus Poll 任务入口（在 app_modules.c 里注册）
+ *
+ *  MB_SIMULATE_DATA=1 时跳过 RS485 真实轮询，周期注入模拟数据，
+ *  用于无传感器环境下验证遥测上行链路（采集→上报→云端收到）。
+ *  接真实传感器时改为 0 即可恢复正常轮询。
  */
+#define MB_SIMULATE_DATA  0   /* 1=模拟数据(无传感器); 0=真实RS485轮询 */
+
 void vModbusPollTask(void *argument)
 {
     (void)argument;
@@ -328,7 +340,20 @@ void vModbusPollTask(void *argument)
         Monitor_ReportFatal(APP_MODULE_MODBUS);
         return;
     }
-    //test_add_three_slaves();
+#if MB_SIMULATE_DATA
+    test_add_three_slaves();   /* 添加 3 个测试从站配置(含点位表) */
+    MB_LOGI("=== Modbus SIMULATE mode: no real sensors, injecting fake data ===");
+    for (;;)
+    {
+        if (mb_runtime_poll_begin())
+        {
+            mb_simulate_inject();
+            mb_runtime_poll_end();
+        }
+        mb_runtime_report();
+        osDelay(2000);   /* 2 秒一轮，和遥测周期匹配 */
+    }
+#else
     for (;;)
     {
         mb_poll_slave();
@@ -343,6 +368,7 @@ void vModbusPollTask(void *argument)
         //test_parse_points();
         //test_write_operations();
     }
+#endif
 }
 
 /**

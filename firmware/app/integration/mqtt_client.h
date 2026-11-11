@@ -14,7 +14,8 @@
  *
  * 设计取舍（RAM 128KB 已用 ~86%）：
  *   - 收发缓冲 static，放 CCMRAM，不占任务栈
- *   - 只做 QoS0（CONNECT/SUBSCRIBE 用 QoS1 但不重传，靠 broker 兜底）
+ *   - PUBLISH 支持 QoS0 和 QoS1（设计 5.2: OTA状态/补传用QoS1可靠传输，遥测用QoS0）
+ *   - QoS1: 带 packet_id + 等 PUBACK + 30s 超时重发（设计 5.2），pending 队列放 CCMRAM
  *   - 不引入 cJSON，下行命令用手写最小 JSON 解析
  *   - Publish 加互斥锁，多任务并发安全
  *
@@ -58,6 +59,17 @@ void MqttClient_Task(void *argument);
 int MqttClient_Publish(const char *topic, const uint8_t *payload, size_t plen);
 
 /**
+ * @brief  线程安全的 PUBLISH（QoS1）——OTA状态/补传等需要可靠传输的场景
+ * @param  topic   主题字符串（\0 结尾）
+ * @param  payload 数据指针
+ * @param  plen    数据长度（≤512B，QoS1 pending 缓冲上限）
+ * @return 0=已发送(等PUBACK), -1=未连接, -2=发送失败, -3=过大, -4=pending队列满
+ * @note   内部拷贝 payload 到 pending 槽，函数返回后 payload 可释放。
+ *         PUBACK 30s 未到则保持原 packet_id 重发（设计 5.2）。
+ */
+int MqttClient_PublishQos1(const char *topic, const uint8_t *payload, size_t plen);
+
+/**
  * @brief  查询 MQTT 是否已连接到 broker
  * @return true=已连接，false=未连接/断连中
  */
@@ -70,6 +82,20 @@ bool MqttClient_IsConnected(void);
  * @return 0=成功，非0=失败
  */
 int MqttClient_ReportEvent(const char *event_type, const char *detail);
+
+/**
+ * @brief  获取遥测上报主题（Init 时按当前上云模式拼好）
+ * @note   telemetry_task 用它替代硬编码 topic，切云平台时自动适配
+ * @return 主题字符串指针（只读，生命周期同 mqtt 模块）
+ */
+const char *MqttClient_TopicTelemetry(void);
+
+/**
+ * @brief  获取 OTA 状态上报主题（Init 时按当前上云模式拼好）
+ * @note   network_upgrade 模块用它上报升级状态到云端
+ * @return 主题字符串指针（只读，生命周期同 mqtt 模块）
+ */
+const char *MqttClient_TopicOtaStatus(void);
 
 #ifdef __cplusplus
 }

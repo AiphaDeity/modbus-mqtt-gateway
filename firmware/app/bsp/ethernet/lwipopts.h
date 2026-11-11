@@ -52,8 +52,8 @@
 /* ★协议栈堆内存大小：12KB
    lwip 的动态分配（mem_malloc）都从这块堆走，TCP 发送缓冲等大块内存也在这。
    与 FreeRTOS heap(32KB) 独立。MQTT 客户端 TCP 发送缓冲走 FreeRTOS heap，
-   lwip 这边够 DHCP/UDP/TCPIP mailbox 就行。SRAM 128KB 装得下 MEM_SIZE 12KB + heap 32KB。 */
-#define MEM_SIZE                    (12*1024)
+   lwip 这边够 DHCP/UDP/TCPIP mailbox 就行。M4合并后SRAM紧张，10KB够单MQTT连接用。 */
+#define MEM_SIZE                    (10*1024)
 
 /* 内存池数量（Day3 裁剪：单 MQTT 连接够用） */
 #define MEMP_NUM_PBUF               6     /* 原 15：原始 pbuf，只给 IP 分片用，6 够 */
@@ -61,12 +61,15 @@
 #define MEMP_NUM_TCP_PCB            2     /* 原 4：MQTT 只占 1 个，留 1 个余量 */
 #define MEMP_NUM_TCP_PCB_LISTEN     0     /* 原 2：我们不做 TCP 服务器，关掉 */
 #define MEMP_NUM_TCP_SEG            32    /* 原 150：TCP 分段缓冲，32 段够发小 JSON */
-#define MEMP_NUM_SYS_TIMEOUT        6     /* 原 6：arp/dhcp/tcp 等超时槽位，不动 */
+#define MEMP_NUM_SYS_TIMEOUT        8     /* 原 6：arp/dhcp/tcp；开 DNS 后需 +1 超时槽位，给 8 */
 
 /* ---------- Pbuf 选项 ---------- */
-/* 原 20 是给多连接收包池。我们单 TCP + MQTT，8 个 pbuf 足够。
-   省 12 × 1514B ≈ 18KB */
-#define PBUF_POOL_SIZE              8
+/* ★★2026-11-10：原 8 改为 12。
+   虽然零拷贝 RX 用的是自定义 RX_POOL（不走 lwip PBUF_POOL），
+   但 lwip 内部 IP 分片/ARP 队列/TCP 重传等仍需从 PBUF_POOL 分配。
+   TCP 连云期间 ARP+DHCP+DNS+TCP 并发，8 个 pbuf 偏紧，
+   +4 个余量避免 lwip 内部分配失败导致丢帧。RAM 代价 ~6KB */
+#define PBUF_POOL_SIZE              12
 /* ★单块 pbuf 大小 = TCP_MSS(1460) + 40(IP+TCP头) + 链路层头尾 ≈ 1514，
    正好装得下一个完整以太网帧。LWIP_MEM_ALIGN_SIZE 按 4 对齐 */
 #define PBUF_POOL_BUFSIZE           LWIP_MEM_ALIGN_SIZE(TCP_MSS+40+PBUF_LINK_ENCAPSULATION_HLEN+PBUF_LINK_HLEN)
@@ -87,6 +90,15 @@
 
 /* ---------- DHCP ---------- */
 #define LWIP_DHCP                   1     /* ★开 DHCP：自动从路由器要 IP，超时回落静态（ethernet.c） */
+
+/* ---------- DNS（★连云必须：云平台 broker 都是域名，不开 DNS 解析不了） ---------- */
+#define LWIP_DNS                   1     /* ★开 DNS：解析阿里云 broker 域名 */
+/* DHCP 开启时 LwIP 自动从 DHCP 服务器拿 DNS（LWIP_DHCP_GET_SERVER_DNS 默认随 LWIP_DHCP 开）；
+ * 静态 IP 兜底时由 ethernet.c 手动设 114.114.114.114。LWIP_DNS_MAX_SERVERS 默认 2 够用。 */
+
+/* LWIP_RAND：DNS 生成 txid/source port 用。例程未定义，这里给固定值（调试够用，
+ *   不防预测；量产应换成真随机源如 STM32 RNG）。固定 txid 不影响 DNS 解析正确性。 */
+#define LWIP_RAND()  ((u32_t)0xC0FFEE01u)
 
 /* ---------- UDP ---------- */
 #define LWIP_UDP                    1     /* 开 UDP（DHCP/SNTP 等都要 UDP） */
