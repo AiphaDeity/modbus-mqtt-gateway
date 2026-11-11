@@ -101,7 +101,7 @@ static const osThreadAttr_t telemetry_attributes =
   .cb_size = sizeof(telemetry_control_block),
   .stack_mem = telemetry_stack,
   .stack_size = sizeof(telemetry_stack),
-  .priority = osPriorityBelowNormal
+  .priority = osPriorityNormal    /* ★原 BelowNormal(16) 被 MQTT/Storage(24) 饿死，改 Normal */
 };
 
 static const osThreadAttr_t monitor_attributes =

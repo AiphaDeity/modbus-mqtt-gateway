@@ -42,6 +42,9 @@
 #include "storage_time.h"   /* storage_get_unix_time() 取 RTC 时间戳做百度云签名 */
 #include "lwip/dns.h"        /* dns_gethostbyname 解析云平台域名 */
 #include "hmac_sha256.h"     /* 百度云签名 SHA256 */
+#if GATEWAY_ENABLE_M2
+#include "network_upgrade.h" /* NetworkUpgrade_Notify() OTA 升级通知分流 */
+#endif
 
 /* ===== 上云模式选择 =====
  *   MQTT_USE_BAIDU=1：连百度云 IoT Core（域名 broker + SHA256 签名 + 自定义 topic）
@@ -56,7 +59,7 @@
  *   broker 域名 = {IoTCoreId}.iot.{region}.baidubce.com，端口 1883（TCP 明文，免 TLS） */
 #define BAIDU_IOTCORE_ID    "aeklwww"
 #define BAIDU_DEVICE_KEY    "stm32_gw_01"
-#define BAIDU_DEVICE_SECRET "YOUR_DEVICE_SECRET"  /* git commit 前替换为占位符 */
+#define BAIDU_DEVICE_SECRET "YOUR_DEVICE_SECRET"  /* 占位符，测试时替换为真实密钥 */
 #define BAIDU_REGION        "gz"        /* 广州地域，创建实例时选的 */
 #endif
 
@@ -86,6 +89,7 @@ static const uint32_t g_backoff_table[] = {1000, 2000, 4000, 8000, 16000, 32000,
 #define MQTT_TOPIC_COMMANDS   "commands"
 #define MQTT_TOPIC_ACKS       "acks"
 #define MQTT_TOPIC_CMD_ACK    "cmd_ack"   /* 命令执行回执（设备发布） */
+#define MQTT_TOPIC_OTA_STATUS "ota_status" /* OTA 升级状态上报（设备发布） */
 
 /* ===== 运行时配置（Init 时加载） ===== */
 typedef struct
@@ -109,6 +113,7 @@ static char g_topic_telemetry[96];
 static char g_topic_commands[96];
 static char g_topic_acks[96];
 static char g_topic_cmd_ack[96];
+static char g_topic_ota_status[96];
 
 /* ===== 收发缓冲（放 CCMRAM，不挤占 SRAM 里的 FreeRTOS 堆）
  * tx_buf: 固定头(5) + topic(64) + payload(4096) ≈ 4165，给 4200
@@ -293,6 +298,11 @@ const char *MqttClient_TopicTelemetry(void)
     return g_topic_telemetry;
 }
 
+const char *MqttClient_TopicOtaStatus(void)
+{
+    return g_topic_ota_status;
+}
+
 /* 拼所有主题。
  * 百度云 IoT Core：$iot/{DeviceKey}/user/{子名}（官方固定前缀，详见 IoT Core 文档）
  * 本地 mosquitto：{client_id}/{子名}
@@ -308,6 +318,7 @@ static void mqtt_topics_build(void)
     snprintf(g_topic_commands,  sizeof(g_topic_commands),  "$iot/%s/user/%s", dk, MQTT_TOPIC_COMMANDS);
     snprintf(g_topic_acks,      sizeof(g_topic_acks),      "$iot/%s/user/%s", dk, MQTT_TOPIC_ACKS);
     snprintf(g_topic_cmd_ack,   sizeof(g_topic_cmd_ack),   "$iot/%s/user/%s", dk, MQTT_TOPIC_CMD_ACK);
+    snprintf(g_topic_ota_status,sizeof(g_topic_ota_status),"$iot/%s/user/%s", dk, MQTT_TOPIC_OTA_STATUS);
 #else
     snprintf(g_topic_status,    sizeof(g_topic_status),    "%s/%s", g_cfg.client_id, MQTT_TOPIC_STATUS);
     snprintf(g_topic_events,    sizeof(g_topic_events),    "%s/%s", g_cfg.client_id, MQTT_TOPIC_EVENTS);
@@ -315,6 +326,7 @@ static void mqtt_topics_build(void)
     snprintf(g_topic_commands,  sizeof(g_topic_commands),  "%s/%s", g_cfg.client_id, MQTT_TOPIC_COMMANDS);
     snprintf(g_topic_acks,      sizeof(g_topic_acks),      "%s/%s", g_cfg.client_id, MQTT_TOPIC_ACKS);
     snprintf(g_topic_cmd_ack,   sizeof(g_topic_cmd_ack),   "%s/%s", g_cfg.client_id, MQTT_TOPIC_CMD_ACK);
+    snprintf(g_topic_ota_status,sizeof(g_topic_ota_status),"%s/%s", g_cfg.client_id, MQTT_TOPIC_OTA_STATUS);
 #endif
 }
 
@@ -596,6 +608,34 @@ static void mqtt_handle_command(const uint8_t *body, uint32_t body_len, uint8_t 
     cmd_payload_buf[plen] = '\0';
 
     printf("[MQTT] recv cmd: %s\r\n", cmd_payload_buf);
+
+#if GATEWAY_ENABLE_M2
+    /* ★OTA 升级通知分流：JSON 含 "url" + "sha256" → 升级通知，转给 NetworkUpgrade。
+     * 升级通知和普通 Modbus 命令复用 commands topic，靠 JSON 字段区分：
+     *   升级通知: {"task_id":"...","url":"http://...","sha256":"...","size":262144,...}
+     *   普通命令: {"slave":2,"func":6,"addr":0,"val":100}
+     * 不在回调里执行下载/Flash/密码运算（README 要求），只唤醒执行任务。 */
+    if (strstr(cmd_payload_buf, "\"url\"") && strstr(cmd_payload_buf, "\"sha256\""))
+    {
+        int nr = NetworkUpgrade_Notify(cmd_payload_buf);
+        char ack[96];
+        int alen;
+        if (nr == 0)
+        {
+            alen = snprintf(ack, sizeof(ack), "{\"status\":\"accepted\",\"type\":\"ota\"}");
+        }
+        else if (nr == -2)
+        {
+            alen = snprintf(ack, sizeof(ack), "{\"status\":\"busy\",\"type\":\"ota\"}");
+        }
+        else
+        {
+            alen = snprintf(ack, sizeof(ack), "{\"status\":\"err\",\"type\":\"ota\",\"err\":%d}", nr);
+        }
+        MqttClient_Publish(g_topic_cmd_ack, (const uint8_t *)ack, (size_t)alen);
+        return;
+    }
+#endif
 
     /* 手写 JSON 解析：找 "slave":<int> "func":<int> "addr":<int> "val":<int> */
     int slave = -1, func = -1, addr = -1, val = 0;

@@ -43,6 +43,9 @@ add_subdirectory(bsp)
 add_subdirectory(integration)
 add_subdirectory(services/modbus)
 add_subdirectory(services/storage)
+if(GATEWAY_ENABLE_M2)
+    add_subdirectory(services/network_upgrade)
+endif()
 
 # Configure the application vector table offset.
 set(GATEWAY_APP_VECTOR_OFFSET "0x00000000" CACHE STRING "Application vector table offset")

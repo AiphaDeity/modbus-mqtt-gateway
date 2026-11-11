@@ -9,6 +9,7 @@
 #include "main.h"
 #if GATEWAY_ENABLE_M2
 #include "ethernet.h"   /* m2_ethernet_init()：以太网/LwIP 初始化入口 */
+#include "network_upgrade.h" /* NetworkUpgrade_Init/StartTask：OTA 升级入口 */
 #endif
 #include <stdio.h>      /* printf：网络初始化失败时记录最小错误信息（不阻塞业务） */
 
@@ -71,6 +72,14 @@ void App_Entry(void *argument)
   App_ModulesInit();
   printf("[App] ModulesInit done, starting ModulesStart\r\n");
   App_ModulesStart();
+#if GATEWAY_ENABLE_M2
+  /* 网络升级入口：绑定 Policy+Quiesce+Monitor 后创建执行任务。
+   * 在 ModulesStart 后调用，确保 M4 升级框架和 MQTT 模块已就绪。 */
+  NetworkUpgrade_Init();
+  NetworkUpgrade_StartTask();
+  /* 重启后查升级结果并上报（试运行启动时才实际工作） */
+  NetworkUpgrade_ReportFinalResult();
+#endif
   printf("[App] ModulesStart done\r\n");
   Monitor_StartupComplete();
 
