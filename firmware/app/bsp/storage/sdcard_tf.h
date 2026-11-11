@@ -30,6 +30,11 @@ bool sdcard_tf_is_ready(void);
 // block_count: 要读的块数
 HAL_StatusTypeDef sdcard_tf_read(uint32_t start_block, uint8_t *buf, uint32_t block_count);
 
+/* 升级文件专用轮询读：单扇区，HAL绝对毫秒期限，不启动DMA或保留buf。 */
+HAL_StatusTypeDef sdcard_tf_read_until(uint32_t block, uint8_t *buf, uint32_t deadline_ms);
+/* 同期限制单扇区轮询写，返回前等待卡结束写入，不启动DMA。 */
+HAL_StatusTypeDef sdcard_tf_write_until(uint32_t block, const uint8_t *buf, uint32_t deadline_ms);
+
 // 写入连续扇区
 HAL_StatusTypeDef sdcard_tf_write(uint32_t start_block, const uint8_t *buf, uint32_t block_count);
 

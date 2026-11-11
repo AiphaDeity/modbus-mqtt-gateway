@@ -13,6 +13,7 @@
 #include "main.h"   /* SDIO_D0_Pin, SDIO_CMD_Pin 等 */
 #include "stm32f4xx_hal_sd.h"
 #include "ff_gen_drv.h"   /* Disk_drvTypeDef / disk.is_initialized */
+#include "cmsis_os2.h"
 
 extern SD_HandleTypeDef hsd;
 extern Disk_drvTypeDef  disk;
@@ -163,4 +164,38 @@ uint64_t sdcard_tf_get_capacity(void)
     if (HAL_SD_GetCardInfo(&hsd, &info) != HAL_OK)
         return 0;
     return (uint64_t)info.BlockNbr * (uint64_t)info.BlockSize;
+}
+
+
+/* 升级文件读使用同步单块轮询，避免DMA超时后继续引用调用方缓冲。 */
+HAL_StatusTypeDef sdcard_tf_read_until(uint32_t block, uint8_t *buf, uint32_t deadline_ms)
+{
+    int32_t remaining = (int32_t)(deadline_ms - HAL_GetTick());
+    if (remaining <= 0) return HAL_TIMEOUT;
+    if (buf == NULL || HAL_GPIO_ReadPin(SD_CARD_DET_GPIO_Port, SD_CARD_DET_Pin) != GPIO_PIN_RESET)
+        return HAL_ERROR;
+    if (hsd.State != HAL_SD_STATE_READY || hsd.Context != SD_CONTEXT_NONE) return HAL_BUSY;
+    if (block >= hsd.SdCard.LogBlockNbr) return HAL_ERROR;
+
+    HAL_StatusTypeDef st = HAL_SD_ReadBlocks(&hsd, buf, block, 1U, (uint32_t)remaining);
+    if ((int32_t)(deadline_ms - HAL_GetTick()) <= 0) return HAL_TIMEOUT;
+    return st;
+}
+
+/* 单扇区同步写入；卡内部忙等待也使用原HAL期限。 */
+HAL_StatusTypeDef sdcard_tf_write_until(uint32_t block, const uint8_t *buf, uint32_t deadline_ms)
+{
+    int32_t remaining = (int32_t)(deadline_ms - HAL_GetTick());
+    if (remaining <= 0) return HAL_TIMEOUT;
+    if (buf == NULL || HAL_GPIO_ReadPin(SD_CARD_DET_GPIO_Port, SD_CARD_DET_Pin) != GPIO_PIN_RESET)
+        return HAL_ERROR;
+    if (hsd.State != HAL_SD_STATE_READY || hsd.Context != SD_CONTEXT_NONE) return HAL_BUSY;
+    if (block >= hsd.SdCard.LogBlockNbr) return HAL_ERROR;
+    HAL_StatusTypeDef st = HAL_SD_WriteBlocks(&hsd, (uint8_t *)buf, block, 1U, (uint32_t)remaining);
+    if (st != HAL_OK) return st;
+    while ((int32_t)(deadline_ms - HAL_GetTick()) > 0) {
+        if (HAL_SD_GetCardState(&hsd) == HAL_SD_CARD_TRANSFER) return HAL_OK;
+        osDelay(1U);
+    }
+    return HAL_TIMEOUT;
 }

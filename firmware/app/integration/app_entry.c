@@ -1,6 +1,10 @@
 #include "app_entry.h"
 #include "app_modules.h"
 #include "app_readiness.h"
+#include "app_upgrade.h"
+#include "app_monitor.h"
+#include "upgrade_stage.h"
+#include "upgrade_trust.h"
 #include "cmsis_os2.h"
 #include "main.h"
 #if GATEWAY_ENABLE_M2
@@ -10,13 +14,24 @@
 
 
 /*
- * 默认启动任务的应用入口，在调度器运行后执行一次，argument 当前不使用。
- * 先建立全未就绪的资源状态，再准备模块基础资源并集中创建业务任务。
- * 完成装配后退出；各模块任务上报就绪或失效，并按资源条件控制业务运行。
+ * 调度器启动后完成就绪状态、模块资源和业务任务的装配，然后退出启动任务。
+ * argument 未使用；运行期资源状态由所属模块报告。
  */
 void App_Entry(void *argument)
 {
   (void)argument;
+  // 可选的保护区只读映射；未配置只关闭升级入口，不阻断普通降级业务启动。
+  (void)UpgradeTrust_Initialize();
+  // 在其他模块和网络线程启动前读取Boot消息；普通独立调试App不使用保留邮箱。
+  App_UpgradeInit((volatile uint32_t *)UPGRADE_MAILBOX_ADDRESS,
+                  SCB->VTOR == 0x08010000U, osKernelGetTickCount());
+  if (!UpgradeStage_Init())
+  {
+    Error_Handler();
+    return;
+  }
+  // 监督先于耗时初始化启动，覆盖网络/业务初始化阻塞；不另建喂狗任务。
+  App_MonitorStart();
 
 #if GATEWAY_ENABLE_M2
   /* ★网卡初始化必须在【任务上下文】里做，不能放回 main.c 的 osKernelStart 之前：
@@ -57,6 +72,7 @@ void App_Entry(void *argument)
   printf("[App] ModulesInit done, starting ModulesStart\r\n");
   App_ModulesStart();
   printf("[App] ModulesStart done\r\n");
+  Monitor_StartupComplete();
 
   // 启动任务完成一次装配后退出
   osThreadExit();

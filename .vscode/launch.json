@@ -2,36 +2,86 @@
   "version": "0.2.0",
   "configurations": [
     {
+      "name": "BootReceiveTest - read-only Flash diagnostic",
+      "type": "cortex-debug",
+      "request": "launch",
+      "cwd": "${workspaceFolder}",
+      "executable": "${workspaceFolder}/build/BootReceiveTest/firmware/bootloader/bootloader.elf",
+      "loadFiles": [
+        "${workspaceFolder}/build/BootReceiveTest/firmware/bootloader/bootloader.elf"
+      ],
+      "servertype": "openocd",
+      "serverpath": "${input:openocdExecutable}",
+      "armToolchainPath": "${input:armToolchainBin}",
+      "searchDir": ["${input:openocdScripts}"],
+      "configFiles": ["${input:probeConfig}", "target/stm32f4x.cfg"],
+      "openOCDLaunchCommands": ["adapter speed 1000", "reset_config none"],
+      "runToEntryPoint": "main"
+    },
+    {
       "name": "STM32F407 OpenOCD",
       "type": "cortex-debug",
       "request": "launch",
-      // 路径必须用「正斜杠绝对路径」。MI 协议会把 \ 当转义符吃掉，
-      // 用 ${workspaceFolder}（Windows 下是反斜杠）会导致 GDB 找不到 ELF，
-      // 报 "No symbol table is loaded"。
-      "cwd": "D:/modbus-mqtt-gateway/modbus-mqtt-gateway",
-      "executable": "D:/modbus-mqtt-gateway/modbus-mqtt-gateway/build/Debug/firmware/app/modbus-mqtt-gateway.elf",
+      "cwd": "${workspaceFolder}",
+      //"executable": "${workspaceFolder}/build/BootDebug/firmware/bootloader/bootloader.elf",
+      //"loadFiles": [
+      //   "${workspaceFolder}/build/BootDebug/firmware/bootloader/bootloader.elf",
+      //   "${workspaceFolder}/build/AppDebug/firmware/app/modbus-mqtt-gateway.elf"
+      // ],
+      "executable": "${workspaceFolder}/build/BootSizeCheck/firmware/bootloader/bootloader.elf",
+      "loadFiles": [
+        "${workspaceFolder}/build/BootSizeCheck/firmware/bootloader/bootloader.elf",
+        "${workspaceFolder}/build/AppDebug/firmware/app/modbus-mqtt-gateway.elf"
+      ],
       "servertype": "openocd",
-      // 不要用 ${input:...}：cortex-debug 内部解析这些变量会崩
-      // （"Cannot read properties of undefined (reading 'sendUserInput')"）。
-      // 探针固定 DAPLink；要换 ST-LINK 就把下面改成 interface/stlink-dap.cfg
-      "serverpath": "D:/OpenOCD/bin/openocd.exe",
-      "armToolchainPath": "D:/gcc-arm/arm-none-eabi/bin",
-      // 必须用 ST 官方 GDB：gcc-arm 那份 GDB 打不开含中文（“白菜子”）的路径，
-      // 扩展会 source 扩展目录下的 support/gdbsupport.init，路径含中文就失败。
-      "gdbPath": "D:/stm32cube/bundles/gnu-gdb-for-stm32/14.3.1+st.2/bin/arm-none-eabi-gdb.exe",
+      "serverpath": "${input:openocdExecutable}",
+      "armToolchainPath": "${input:armToolchainBin}",
       "searchDir": [
-        "D:/OpenOCD/share/openocd/scripts"
+        "${input:openocdScripts}"
       ],
       "configFiles": [
-        "interface/cmsis-dap.cfg",
+        "${input:probeConfig}",
         "target/stm32f4x.cfg"
       ],
       "openOCDLaunchCommands": [
-        // 1000 kHz 实测会间歇报 "CMSIS-DAP transfer count mismatch"（山寨 DAPLink 高速不稳）
-        "adapter speed 100",
+        "adapter speed 1000",
         "reset_config none"
       ],
       "runToEntryPoint": "main"
+    }
+  ],
+  "inputs": [
+    {
+      "id": "openocdExecutable",
+      "type": "promptString",
+      "description": "本机 openocd.exe 的完整路径；若已在 PATH 中可填 openocd",
+      "default": "openocd"
+    },
+    {
+      "id": "armToolchainBin",
+      "type": "promptString",
+      "description": "固定版本 ST GCC 工具包的 bin 目录，内含 arm-none-eabi-gdb.exe"
+    },
+    {
+      "id": "openocdScripts",
+      "type": "promptString",
+      "description": "与 OpenOCD 配套的脚本目录，内含 interface/ 和 target/"
+    },
+    {
+      "id": "probeConfig",
+      "type": "pickString",
+      "description": "选择本次使用的 SWD 调试探针",
+      "options": [
+        {
+          "label": "DAPLink / CMSIS-DAP",
+          "value": "interface/cmsis-dap.cfg"
+        },
+        {
+            "label": "ST-LINK(ST OpenOCD 原生 DAP)",
+            "value": "interface/stlink-dap.cfg"
+        }
+      ],
+      "default": "interface/cmsis-dap.cfg"
     }
   ]
 }

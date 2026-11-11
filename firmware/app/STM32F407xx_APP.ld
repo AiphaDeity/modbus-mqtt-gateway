@@ -55,7 +55,9 @@ ENTRY(Reset_Handler)
 /* Specify the memory areas */
 MEMORY
 {
-RAM (xrw)      : ORIGIN = 0x20000000, LENGTH = 128K
+/* 与Boot共同保留普通SRAM首64B；启动清零/拷贝不触及复位邮箱。 */
+MAILBOX (rw)   : ORIGIN = 0x20000000, LENGTH = 64
+RAM (xrw)      : ORIGIN = 0x20000040, LENGTH = 128K - 64
 CCMRAM (xrw)      : ORIGIN = 0x10000000, LENGTH = 64K
 FLASH (rx)      : ORIGIN = 0x08010000, LENGTH = 448K
 }

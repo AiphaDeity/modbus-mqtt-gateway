@@ -8,6 +8,7 @@
  * 启动时取两份中有效且较大的高水位，避免序号复用。
  */
 
+#include "storage_runtime.h"
 #include "storage_seq.h"
 #include "flash_partition.h"
 #include "spi_flash_w25q128.h"
@@ -50,6 +51,10 @@ _Static_assert(sizeof(seq_meta_t) == 16, "seq_meta_t must be 16 bytes");
 #define SEQ_CRC_LEN (sizeof(seq_meta_t) - sizeof(uint32_t))
 
 static const uint32_t s_copy_addr[2] = { FLASH_SEQ_A_ADDR, FLASH_SEQ_B_ADDR };
+
+static bool s_read_error;
+static bool s_copy_blank[2];
+
 
 static uint64_t s_next_reserved = 0;   /* 已持久化的高水位 */
 static uint64_t s_current       = 0;   /* 当前可分配序号 */
@@ -102,11 +107,16 @@ static uint32_t crc32_calc(const uint8_t *data, uint32_t len)
 
 static bool copy_read(int idx, seq_meta_t *meta)
 {
-    if (spi_flash_w25q128_read(s_copy_addr[idx], (uint8_t *)meta,
+    if (storage_flash_read(s_copy_addr[idx], (uint8_t *)meta,
                                sizeof(*meta)) != HAL_OK) {
+        s_read_error = true;
         return false;
     }
-    if (meta->magic != SEQ_MAGIC) return false;
+    s_copy_blank[idx] = true;
+    for (uint32_t i = 0U; i < sizeof(*meta); i++) {
+        if (((const uint8_t *)meta)[i] != 0xFFU) s_copy_blank[idx] = false;
+    }
+    if (meta->magic != SEQ_MAGIC || meta->next_reserved < SEQ_FIRST_VALUE) return false;
     if (meta->crc32 != crc32_calc((const uint8_t *)meta, SEQ_CRC_LEN)) return false;
     return true;
 }
@@ -137,11 +147,11 @@ static HAL_StatusTypeDef copy_write(int idx, uint64_t next_reserved)
     /* 擦除前后各打一条，用于判断复位是否发生在擦除过程中 */
     SEQ_TRACE("[SEQ] erase begin addr=0x%06lX\r\n", (unsigned long)s_copy_addr[idx]);
 
-    HAL_StatusTypeDef st = spi_flash_w25q128_sector_erase(s_copy_addr[idx]);
+    HAL_StatusTypeDef st = storage_flash_erase(s_copy_addr[idx]);
     SEQ_TRACE("[SEQ] erase st=%d\r\n", (int)st);
     if (st != HAL_OK) return st;
 
-    st = spi_flash_w25q128_write(s_copy_addr[idx], (const uint8_t *)&meta,
+    st = storage_flash_write(s_copy_addr[idx], (const uint8_t *)&meta,
                                     sizeof(meta));
     SEQ_TRACE("[SEQ] write st=%d\r\n", (int)st);
 
@@ -167,7 +177,9 @@ static HAL_StatusTypeDef copy_write(int idx, uint64_t next_reserved)
 
 HAL_StatusTypeDef storage_seq_init(void)
 {
-    seq_meta_t meta_a, meta_b;
+    s_read_error = false;
+    s_copy_blank[0] = s_copy_blank[1] = false;
+    seq_meta_t meta_a = {0}, meta_b = {0};
     bool ok_a, ok_b;
 
     if (!seq_mutex_init()) return HAL_ERROR;
@@ -180,6 +192,12 @@ HAL_StatusTypeDef storage_seq_init(void)
     ok_b = copy_read(1, &meta_b);
     printf("[SEQ] init read B: ok=%d magic=0x%08lX crc=0x%08lX\r\n", ok_b,
            (unsigned long)meta_b.magic, (unsigned long)meta_b.crc32); fflush(stdout);
+
+    if (s_read_error || (!ok_a && !ok_b && !(s_copy_blank[0] && s_copy_blank[1]))) {
+        s_inited = false;
+        seq_unlock();
+        return HAL_ERROR;
+    }
 
     s_newer = -1;
     if (ok_a && ok_b) {
@@ -201,31 +219,13 @@ HAL_StatusTypeDef storage_seq_init(void)
     s_current    = s_next_reserved;
     s_window_end = s_next_reserved;
 
-    /*
-     * 空设备：把初始高水位落下，避免下一次写入时两份都为空。
-     *
-     * ⚠️ s_inited 必须在落盘成功之后才置位。原实现先把 s_inited 置 true，
-     *    再 copy_write；一旦 copy_write 失败（擦除/写入错误），函数返回错误，
-     *    但内存里已经是"已初始化"状态，后续 alloc 照常放号，而 Flash 里
-     *    没有任何高水位 —— 掉电重启后两份都无效，seq 退回 SEQ_FIRST_VALUE，
-     *    已发出去的序号被重新分配，破坏"全局单调递增"契约。
-     */
-    if (s_newer < 0) {
-        HAL_StatusTypeDef st = copy_write(0, SEQ_FIRST_VALUE);
-        if (st != HAL_OK) {
-            s_inited = false;       /* 保持未初始化，alloc 直接拒绝 */
-            seq_unlock();
-            return st;
-        }
-        s_newer = 0;
-    }
-
+    /* 恢复只读；首次分号也必须先提交完整预留窗口，失败不交付序号。 */
     s_inited = true;
     seq_unlock();
     return HAL_OK;
 }
 
-HAL_StatusTypeDef storage_seq_alloc(uint64_t *seq_out)
+static HAL_StatusTypeDef storage_seq_alloc_impl(uint64_t *seq_out)
 {
     HAL_StatusTypeDef st;
 
@@ -282,7 +282,7 @@ HAL_StatusTypeDef storage_seq_alloc(uint64_t *seq_out)
                 exp_meta.magic         = SEQ_MAGIC;
                 exp_meta.next_reserved = new_reserved;
                 exp_meta.crc32         = crc32_calc((const uint8_t *)&exp_meta, SEQ_CRC_LEN);
-                (void)spi_flash_w25q128_read(s_copy_addr[target], raw, sizeof(raw));
+                (void)storage_flash_read(s_copy_addr[target], raw, sizeof(raw));
 
                 dump16("expect ", (const uint8_t *)&exp_meta, sizeof(exp_meta));
                 dump16("got(1st)", (const uint8_t *)&verify, sizeof(verify));
@@ -317,4 +317,15 @@ HAL_StatusTypeDef storage_seq_alloc(uint64_t *seq_out)
 uint64_t storage_seq_get_high_watermark(void)
 {
     return s_next_reserved;
+}
+
+/* 分配持久预留窗口内的序号，跨任务调用转交存储队列。 */
+HAL_StatusTypeDef storage_seq_alloc(uint64_t *seq_out)
+{
+    if (seq_out != NULL) *seq_out = 0U;
+    if (!storage_runtime_is_owner()) return storage_runtime_alloc_seq(seq_out);
+    if (!storage_mutation_begin()) return HAL_BUSY;
+    HAL_StatusTypeDef st = storage_seq_alloc_impl(seq_out);
+    storage_mutation_end();
+    return st;
 }

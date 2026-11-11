@@ -55,6 +55,8 @@ typedef struct {
 
 /* 初始化：创建全部队列（Storage_Task 启动时调用一次） */
 void storage_m2_init(void);
+/* 暂停后检查已接纳的写/回执/拉取请求是否全部处理，不能丢队列冒充结算。 */
+bool storage_m2_settled(void);
 
 /* M2 侧获取队列句柄（M2 在自己的任务里 osMessageQueuePut） */
 osMessageQueueId_t storage_m2_write_queue(void);

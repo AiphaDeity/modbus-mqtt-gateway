@@ -58,12 +58,53 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
+    ${CMAKE_CURRENT_LIST_DIR}/services/upgrade/upgrade_stage.c
+    ${CMAKE_CURRENT_LIST_DIR}/services/upgrade/upgrade_stage_auth.c
+    ${CMAKE_CURRENT_LIST_DIR}/services/upgrade/upgrade_quiesce.c
+    ${CMAKE_CURRENT_LIST_DIR}/services/upgrade/upgrade_storage.c
+    ${CMAKE_CURRENT_LIST_DIR}/services/upgrade/upgrade_entry.c
+    ${CMAKE_CURRENT_LIST_DIR}/services/upgrade/upgrade_tf.c
+    ${CMAKE_CURRENT_LIST_DIR}/../shared/upgrade_package.c
+    ${CMAKE_CURRENT_LIST_DIR}/../shared/upgrade_state.c
+    ${CMAKE_CURRENT_LIST_DIR}/../shared/upgrade_transaction.c
+    ${CMAKE_CURRENT_LIST_DIR}/../shared/upgrade_trust.c
+)
+
+# 复用Boot同一版本的安全包算法；不引入Boot驱动、安装器或测试密钥。
+set(UPGRADE_MBEDTLS_DIR ${CMAKE_CURRENT_LIST_DIR}/../bootloader/third_party/mbedtls)
+set(UPGRADE_MBEDTLS_SOURCES
+    ${UPGRADE_MBEDTLS_DIR}/library/sha256.c
+    ${UPGRADE_MBEDTLS_DIR}/library/aes.c
+    ${UPGRADE_MBEDTLS_DIR}/library/gcm.c
+    ${UPGRADE_MBEDTLS_DIR}/library/block_cipher.c
+    ${UPGRADE_MBEDTLS_DIR}/library/ecdsa.c
+    ${UPGRADE_MBEDTLS_DIR}/library/ecp.c
+    ${UPGRADE_MBEDTLS_DIR}/library/ecp_curves.c
+    ${UPGRADE_MBEDTLS_DIR}/library/bignum.c
+    ${UPGRADE_MBEDTLS_DIR}/library/bignum_core.c
+    ${UPGRADE_MBEDTLS_DIR}/library/bignum_mod.c
+    ${UPGRADE_MBEDTLS_DIR}/library/bignum_mod_raw.c
+    ${UPGRADE_MBEDTLS_DIR}/library/constant_time.c
+    ${UPGRADE_MBEDTLS_DIR}/library/asn1parse.c
+    ${UPGRADE_MBEDTLS_DIR}/library/asn1write.c
+    ${UPGRADE_MBEDTLS_DIR}/library/platform_util.c
+)
+target_sources(${CMAKE_PROJECT_NAME} PRIVATE ${UPGRADE_MBEDTLS_SOURCES})
+set_source_files_properties(
+    ${CMAKE_CURRENT_LIST_DIR}/services/upgrade/upgrade_tf.c
+    ${CMAKE_CURRENT_LIST_DIR}/services/upgrade/upgrade_stage.c
+    ${CMAKE_CURRENT_LIST_DIR}/services/upgrade/upgrade_stage_auth.c
+    ${CMAKE_CURRENT_LIST_DIR}/../shared/upgrade_package.c
+    ${UPGRADE_MBEDTLS_SOURCES}
+    PROPERTIES COMPILE_DEFINITIONS MBEDTLS_CONFIG_FILE="upgrade_stage_mbedtls_config.h"
 )
 
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined include paths
     ${CMAKE_CURRENT_LIST_DIR}/common
+    ${CMAKE_CURRENT_LIST_DIR}/services/upgrade
+    ${UPGRADE_MBEDTLS_DIR}/include
 )
 
 # Add project symbols (macros)

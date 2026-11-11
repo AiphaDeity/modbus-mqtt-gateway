@@ -8,6 +8,7 @@
 - 以太网 MQTT 3.1.1 通信。
 - TF 卡持久缓存、断网补传及业务回执确认。
 - 本地配置、安全固件升级与串口恢复。
+- Bootloader 与正常、回退及恢复应用统一看门狗监督和交接。
 
 ## 硬件平台
 
@@ -43,6 +44,9 @@ modbus-mqtt-gateway/
 │  ├─ modbus-mqtt-gateway.ioc     CubeMX 配置
 │  ├─ startup_stm32f407xx.s       启动文件
 │  └─ STM32F407xx_FLASH.ld        链接脚本
+├─ firmware/bootloader/           Boot、片内安装、回退及串口恢复
+├─ firmware/shared/               Boot/App共用包认证、状态记录及看门狗
+├─ tools/                         升级包制作和串口恢复工具
 ├─ docs/                         公共资源与基线验证说明
 ├─ .settings/                    ST 工程及工具包配置
 ├─ .vscode/                      VS Code 工程配置
@@ -67,11 +71,26 @@ Debug 固件输出位置：
 build/Debug/firmware/app/modbus-mqtt-gateway.elf
 ```
 
+Boot 与偏移 App 使用以下预设，从仓库根目录选择并构建：
+
+| 预设 | 用途 |
+| --- | --- |
+| Debug / Release | 从 `0x08000000` 独立启动的应用调试/优化构建 |
+| AppDebug | 从 `0x08010000` 启动、由 Boot 管理的应用 |
+| BootDebug | 64 KiB Boot，保留调试信息及启动诊断 |
+| BootSizeCheck | 不含启动密码自测和测试信任根的完整 Boot 路径 |
+| BootReceiveTest | 只读 Flash 一致性诊断，结束后停留 Boot，不接收升级包或跳转 App |
+| BootRecoveryTest | 使用本机测试夹具的串口收包和恢复验证 |
+
+Boot、App及配套工具统一使用持久兼容号2，其他版本拒绝，不自动迁移旧日志。首次部署及M3对接约定见[升级模块说明](firmware/app/services/upgrade/README.md)。
+
+例如在根目录终端执行 `cube-cmake --preset AppDebug`，再执行 `cube-cmake --build --preset AppDebug`。Boot 测试预设需要本机自备 `.local/upgrade-fixture/boot_test_keys.h`，该夹具不随仓库分发。普通 Boot/App 的可信密钥映射通过 `GATEWAY_UPGRADE_TRUST_SOURCE` 接入；未配置时升级入口保持关闭。正常固件构建不依赖测试夹具。
+
 调整目录或切换工具链后，如缓存仍引用旧路径，在命令面板执行 `CMake: Delete Build Directory and Reconfigure`，再执行生成。该操作清除所选构建目录，不影响源码。
 
 使用 CubeMX 编辑 `firmware/app/modbus-mqtt-gateway.ioc`，代码生成位置保持在 `firmware/app/`。重新生成后检查构建配置差异，再从仓库根目录构建。
 
-当前应用使用 `STM32F407xx_FLASH.ld`，从 `0x08000000` 直接启动；任务栈和堆位于普通 SRAM，CCM 保留。
+独立应用使用 `STM32F407xx_FLASH.ld`；AppDebug 使用 `STM32F407xx_APP.ld`，与 Boot 共同保留普通 SRAM 首 64 B 作为复位邮箱。堆、存储任务栈和监督任务栈使用普通 SRAM；其余业务栈的放置以 `integration/app_modules.c` 为准，CCM 中的缓冲不能交给 DMA。
 
 模块接入时，在实际模块目录维护源码列表，并在 `firmware/app/CMakeLists.txt` 添加对应 `add_subdirectory(...)`。在 `integration/app_modules.c` 同时绑定模块的初始化函数和任务入口；任务由装配层统一创建。未接入模块保持两个入口均为 `NULL`，不提供返回成功的空实现。引脚、DMA 和中断配置以 `.ioc` 为准。
 

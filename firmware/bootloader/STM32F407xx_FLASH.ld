@@ -55,7 +55,9 @@ ENTRY(Reset_Handler)
 /* Specify the memory areas */
 MEMORY
 {
-RAM (xrw)      : ORIGIN = 0x20000000, LENGTH = 128K
+/* 普通SRAM首64B保留为Boot/App复位邮箱；不进入.data/.bss和堆栈。 */
+MAILBOX (rw)   : ORIGIN = 0x20000000, LENGTH = 64
+RAM (xrw)      : ORIGIN = 0x20000040, LENGTH = 128K - 64
 CCMRAM (xrw)      : ORIGIN = 0x10000000, LENGTH = 64K
 FLASH (rx)      : ORIGIN = 0x08000000, LENGTH = 64K
 }
@@ -65,7 +67,7 @@ _estack = ORIGIN(RAM) + LENGTH(RAM);    /* end of RAM */
 _sstack = _estack - _Min_Stack_Size;
 /* Generate a link error if heap and stack don't fit into RAM */
 _Min_Heap_Size = 0x200;      /* required amount of heap  */
-_Min_Stack_Size = 0x400; /* required amount of stack */
+_Min_Stack_Size = 0x2000; /* required amount of stack */
 
 /* Define output sections */
 SECTIONS

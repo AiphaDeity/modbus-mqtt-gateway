@@ -6,6 +6,15 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 set(GATEWAY_FIRMWARE "app" CACHE STRING " Firmware to build: app or bootloader")
 
+# 升级状态记录的格式版本；Boot、App 和制包工具须使用相同版本。
+set(GATEWAY_UPGRADE_PERSISTENCE_VERSION "2" CACHE STRING "Upgrade persistence version (2 only)")
+set_property(CACHE GATEWAY_UPGRADE_PERSISTENCE_VERSION PROPERTY STRINGS 2)
+if(NOT GATEWAY_UPGRADE_PERSISTENCE_VERSION STREQUAL "2")
+    message(FATAL_ERROR "Only upgrade persistence version 2 is supported; reconfigure with version 2")
+endif()
+
+add_compile_definitions(GATEWAY_UPGRADE_PERSISTENCE_VERSION=${GATEWAY_UPGRADE_PERSISTENCE_VERSION})
+
 # 是否编入 M2（以太网/LwIP/MQTT）代码。关掉后只保留 M1/M3，便于单独测 M3：
 #   不编译 mqtt_client.c，不链接 lwip / m2_ethernet，也不调用 m2_ethernet_init。
 option(GATEWAY_ENABLE_M2 "Build M2 (Ethernet/LwIP/MQTT) sources" ON)
@@ -16,4 +25,20 @@ elseif(GATEWAY_FIRMWARE STREQUAL "bootloader")
     add_subdirectory(firmware/bootloader)
 else()
     message(FATAL_ERROR "GATEWAY_FIRMWARE must be either 'app' or 'bootloader'")
+endif()
+
+# 可选的保护区只读信任映射实现；文件中不得嵌入生产私钥或明文设备密钥。
+set(GATEWAY_UPGRADE_TRUST_SOURCE "" CACHE FILEPATH "Protected-storage upgrade trust provider")
+if(GATEWAY_UPGRADE_TRUST_SOURCE)
+    if(BOOT_PACKAGE_RECEIVE_TEST)
+        message(FATAL_ERROR "Production trust provider cannot be combined with the test trust root")
+    endif()
+    if(NOT EXISTS "${GATEWAY_UPGRADE_TRUST_SOURCE}")
+        message(FATAL_ERROR "Upgrade trust provider source does not exist")
+    endif()
+    if(GATEWAY_FIRMWARE STREQUAL "bootloader")
+        target_sources(bootloader PRIVATE "${GATEWAY_UPGRADE_TRUST_SOURCE}")
+    else()
+        target_sources(modbus-mqtt-gateway PRIVATE "${GATEWAY_UPGRADE_TRUST_SOURCE}")
+    endif()
 endif()

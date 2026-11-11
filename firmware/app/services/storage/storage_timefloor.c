@@ -7,6 +7,7 @@
  * 时间下界单调递增：启动取两份中较大的有效值，写旧副本保新副本。
  */
 
+#include "storage_runtime.h"
 #include "storage_timefloor.h"
 #include "flash_partition.h"
 #include "spi_flash_w25q128.h"
@@ -32,6 +33,10 @@ _Static_assert(sizeof(timefloor_record_t) == 12, "timefloor_record_t must be 12 
 
 static const uint32_t s_copy_addr[2] = { FLASH_TIME_FLOOR_A_ADDR, FLASH_TIME_FLOOR_B_ADDR };
 
+static bool s_read_error;
+static bool s_copy_blank[2];
+
+
 static uint32_t s_floor = 0;
 static int      s_newer = -1;   /* 较大值所在副本索引 */
 
@@ -49,9 +54,14 @@ static uint32_t crc32_calc(const uint8_t *data, uint32_t len)
 
 static bool copy_read(int idx, timefloor_record_t *rec)
 {
-    if (spi_flash_w25q128_read(s_copy_addr[idx], (uint8_t *)rec,
+    if (storage_flash_read(s_copy_addr[idx], (uint8_t *)rec,
                                sizeof(*rec)) != HAL_OK) {
+        s_read_error = true;
         return false;
+    }
+    s_copy_blank[idx] = true;
+    for (uint32_t i = 0U; i < sizeof(*rec); i++) {
+        if (((const uint8_t *)rec)[i] != 0xFFU) s_copy_blank[idx] = false;
     }
     if (rec->magic != TIMEFLOOR_MAGIC) return false;
     if (rec->crc32 != crc32_calc((const uint8_t *)rec, TIMEFLOOR_CRC_LEN)) return false;
@@ -65,18 +75,23 @@ static HAL_StatusTypeDef copy_write(int idx, uint32_t floor)
     rec.time_floor = floor;
     rec.crc32      = crc32_calc((const uint8_t *)&rec, TIMEFLOOR_CRC_LEN);
 
-    HAL_StatusTypeDef st = spi_flash_w25q128_sector_erase(s_copy_addr[idx]);
+    HAL_StatusTypeDef st = storage_flash_erase(s_copy_addr[idx]);
     if (st != HAL_OK) return st;
 
-    return spi_flash_w25q128_write(s_copy_addr[idx], (const uint8_t *)&rec,
+    return storage_flash_write(s_copy_addr[idx], (const uint8_t *)&rec,
                                     sizeof(rec));
 }
 
 HAL_StatusTypeDef storage_timefloor_init(void)
 {
-    timefloor_record_t rec_a, rec_b;
+    s_read_error = false;
+    s_copy_blank[0] = s_copy_blank[1] = false;
+    timefloor_record_t rec_a = {0}, rec_b = {0};
     bool ok_a = copy_read(0, &rec_a);
     bool ok_b = copy_read(1, &rec_b);
+
+    if (s_read_error || (!ok_a && !ok_b && !(s_copy_blank[0] && s_copy_blank[1])))
+        return HAL_ERROR;
 
     s_newer = -1;
     s_floor = 0;
@@ -86,6 +101,7 @@ HAL_StatusTypeDef storage_timefloor_init(void)
      */
     ok_a = ok_a && rec_a.time_floor >= TIMEFLOOR_MIN_VALID_UNIX;
     ok_b = ok_b && rec_b.time_floor >= TIMEFLOOR_MIN_VALID_UNIX;
+    if (!ok_a && !ok_b && !(s_copy_blank[0] && s_copy_blank[1])) return HAL_ERROR;
 
     if (ok_a && ok_b) {
         s_newer = (rec_a.time_floor >= rec_b.time_floor) ? 0 : 1;
@@ -107,7 +123,7 @@ uint32_t storage_timefloor_get(void)
     return s_floor;
 }
 
-HAL_StatusTypeDef storage_timefloor_update(uint32_t now)
+static HAL_StatusTypeDef storage_timefloor_update_impl(uint32_t now)
 {
     if (now == 0) return HAL_OK;
 
@@ -139,4 +155,13 @@ bool storage_timefloor_trusted(uint32_t now)
 {
     if (s_floor == 0) return true;   /* 无参考值（全新设备），不能据此否定 */
     return now >= s_floor;
+}
+
+/* 按阈值持久推进时间下界，不降低已保存的值。 */
+HAL_StatusTypeDef storage_timefloor_update(uint32_t now)
+{
+    if (!storage_mutation_begin()) return HAL_BUSY;
+    HAL_StatusTypeDef st = storage_timefloor_update_impl(now);
+    storage_mutation_end();
+    return st;
 }
