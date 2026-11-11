@@ -85,6 +85,13 @@ int NetworkUpgrade_Notify(const char *json);
 const char *NetworkUpgrade_GetPhaseString(void);
 
 /**
+ * @brief  查询网络业务是否被门控暂停（升级期间）
+ * @return true=已暂停（Telemetry/MQTT 遥测应跳过），false=正常运行
+ * @note   Telemetry_Task 主循环每轮开始检查此标志。MQTT 保活和 ota_status 不受影响。
+ */
+bool NetworkUpgrade_IsQuiesced(void);
+
+/**
  * @brief  重启后调用：查 Boot 身份 + GetStatus，上报最终升级结果
  * @note   在 App_Entry 或 MQTT 上线后调用一次。读 App_UpgradeIsTrial() 判断是否升级后启动，
  *         调 UpgradeEntry_GetStatus() 查安装结果，PUBLISH 到 ota_status。

@@ -165,10 +165,14 @@ nw_dl_status_t NetworkDownloader_Fetch(const nw_dl_params_t *params)
     /* 5. 收响应头（循环收直到找到 \r\n\r\n） */
     static char hdr_buf[512];   /* 响应头缓冲 */
     int hdr_len = 0;
-    int header_done = 0;
+    int header_end_pos = -1;    /* \r\n\r\n 结束位置（body 起始在 hdr_buf 中的偏移） */
     struct netbuf *nbuf = NULL;
 
-    while (!header_done && hdr_len < (int)sizeof(hdr_buf) - 1)
+    /* body 残余：如果 header 和 body 在同一个 netbuf，保留 header 后面的 body 数据 */
+    static uint8_t body_residual[NW_DL_RX_BUF_SIZE];
+    uint32_t body_residual_len = 0;
+
+    while (header_end_pos < 0 && hdr_len < (int)sizeof(hdr_buf) - 1)
     {
         err = netconn_recv(conn, &nbuf);
         if (err != ERR_OK)
@@ -191,19 +195,41 @@ nw_dl_status_t NetworkDownloader_Fetch(const nw_dl_params_t *params)
             if (hdr_buf[i-3] == '\r' && hdr_buf[i-2] == '\n' &&
                 hdr_buf[i-1] == '\r' && hdr_buf[i] == '\n')
             {
-                header_done = 1;
+                header_end_pos = i + 1;  /* body 起始偏移 */
                 break;
             }
         }
 
-        /* 如果 header 已找到，body 残余数据保留在 data+dlen-copy 之后 */
-        /* 简单处理：先释放，body 从下一次 recv 开始收（copy 量已含残余时另处理） */
+        if (header_end_pos >= 0)
+        {
+            /* header 后面的残余数据是 body 的开头 */
+            int residual_start = header_end_pos + 1;  /* \r\n\r\n 后第一个字节 */
+            /* 但残余可能不在 hdr_buf 里（如果 copy 被截断了），而是还在 netbuf 里 */
+            if (copy < dlen)
+            {
+                /* netbuf 里还有未拷贝的数据，是 body 的开头 */
+                uint16_t remain = dlen - copy;
+                if (remain > sizeof(body_residual)) remain = sizeof(body_residual);
+                memcpy(body_residual, (uint8_t *)data + copy, remain);
+                body_residual_len = remain;
+            }
+            else if (residual_start < hdr_len)
+            {
+                /* hdr_buf 里 header 后面还有 body 数据 */
+                int remain = hdr_len - residual_start;
+                if (remain > (int)sizeof(body_residual)) remain = sizeof(body_residual);
+                memcpy(body_residual, hdr_buf + residual_start, remain);
+                body_residual_len = (uint32_t)remain;
+                hdr_len = residual_start;  /* 截断 hdr_buf 到 header 结束 */
+            }
+        }
+
         netbuf_free(nbuf);
         nbuf = NULL;
     }
     hdr_buf[hdr_len] = '\0';
 
-    if (!header_done)
+    if (header_end_pos < 0)
     {
         printf("[NWDL] header incomplete\r\n");
         netconn_delete(conn);
@@ -239,6 +265,27 @@ nw_dl_status_t NetworkDownloader_Fetch(const nw_dl_params_t *params)
     uint32_t offset = 0;
     uint32_t chunk_accum = 0;   /* 当前 chunk 累积字节数 */
 
+    /* 先处理 header 同包带来的 body 残余 */
+    if (body_residual_len > 0)
+    {
+        uint32_t copy = body_residual_len;
+        if (copy > chunk_size) copy = chunk_size;
+        memcpy(chunk_buf, body_residual, copy);
+        chunk_accum = copy;
+        if (chunk_accum >= chunk_size || offset + chunk_accum >= (uint32_t)content_len)
+        {
+            nw_dl_status_t cb_ret = params->cb(params->ctx, offset, chunk_buf, chunk_accum);
+            if (cb_ret != NW_DL_OK)
+            {
+                printf("[NWDL] callback error at residual offset=%u\r\n", (unsigned)offset);
+                netconn_delete(conn);
+                return NW_DL_ERR_CALLBACK;
+            }
+            offset += chunk_accum;
+            chunk_accum = 0;
+        }
+    }
+
     while (offset < (uint32_t)content_len)
     {
         err = netconn_recv(conn, &nbuf);
@@ -250,40 +297,39 @@ nw_dl_status_t NetworkDownloader_Fetch(const nw_dl_params_t *params)
             return NW_DL_ERR_RECEIVE;
         }
 
-        void *data;
-        uint16_t dlen;
-        uint16_t consumed = 0;
+        /* 遍历 netbuf 的所有段（pbuf 链可能有多段） */
+        void *seg_data;
+        uint16_t seg_len;
+        netbuf_data(nbuf, &seg_data, &seg_len);
 
-        while (consumed < dlen && offset < (uint32_t)content_len)
-        {
-            netbuf_data(nbuf, &data, &dlen);
-            /* data 指向当前 netbuf 的第一段；分段 netbuf 用 netbuf_next */
-            /* 简单处理：只用第一段（HTTP 响应通常单段） */
-            uint16_t avail = dlen - consumed;
-            uint32_t space = chunk_size - chunk_accum;
-            uint32_t copy = (avail < space) ? avail : space;
-
-            memcpy(chunk_buf + chunk_accum, (uint8_t *)data + consumed, copy);
-            chunk_accum += copy;
-            consumed += (uint16_t)copy;
-
-            if (chunk_accum >= chunk_size || offset + chunk_accum >= (uint32_t)content_len)
+        do {
+            uint16_t seg_consumed = 0;
+            while (seg_consumed < seg_len && offset + chunk_accum < (uint32_t)content_len)
             {
-                /* 调回调 */
-                nw_dl_status_t cb_ret = params->cb(params->ctx, offset, chunk_buf, chunk_accum);
-                if (cb_ret != NW_DL_OK)
-                {
-                    printf("[NWDL] callback error at offset=%u\r\n", (unsigned)offset);
-                    netbuf_free(nbuf);
-                    netconn_delete(conn);
-                    return NW_DL_ERR_CALLBACK;
-                }
-                offset += chunk_accum;
-                chunk_accum = 0;
+                uint16_t avail = seg_len - seg_consumed;
+                uint32_t space = chunk_size - chunk_accum;
+                uint32_t copy = (avail < space) ? avail : space;
 
-                /* 状态上报用的进度（回调里更新） */
+                memcpy(chunk_buf + chunk_accum, (uint8_t *)seg_data + seg_consumed, copy);
+                chunk_accum += copy;
+                seg_consumed += (uint16_t)copy;
+
+                /* chunk 满或包结束 → 调回调 */
+                if (chunk_accum >= chunk_size || offset + chunk_accum >= (uint32_t)content_len)
+                {
+                    nw_dl_status_t cb_ret = params->cb(params->ctx, offset, chunk_buf, chunk_accum);
+                    if (cb_ret != NW_DL_OK)
+                    {
+                        printf("[NWDL] callback error at offset=%u\r\n", (unsigned)offset);
+                        netbuf_free(nbuf);
+                        netconn_delete(conn);
+                        return NW_DL_ERR_CALLBACK;
+                    }
+                    offset += chunk_accum;
+                    chunk_accum = 0;
+                }
             }
-        }
+        } while (netbuf_next(nbuf) == ERR_OK);  /* 移到下一段 */
 
         netbuf_free(nbuf);
         nbuf = NULL;

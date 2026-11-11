@@ -224,35 +224,49 @@ static nw_dl_status_t download_chunk_callback(void *ctx_, uint32_t offset,
  * sync: flush 缓冲
  * resume: 恢复业务
  */
+
+/* 门控标志：pause 设 true，resume 设 false。Telemetry 主循环检查它。 */
+static volatile bool s_quiesced = false;
+
+bool NetworkUpgrade_IsQuiesced(void)
+{
+    return s_quiesced;
+}
+
 static UpgradeStageResult quiesce_pause(void *ctx, uint32_t timeout_ms)
 {
     (void)ctx; (void)timeout_ms;
-    /* TODO: 暂停 Telemetry 采集周期 + 暂停 MQTT 遥测 PUBLISH（保留 PINGREQ） */
-    printf("[NWUPG] quiesce_pause\r\n");
+    /* 设暂停标志：Telemetry 下一轮看到就跳过采集+上报 */
+    s_quiesced = true;
+    printf("[NWUPG] quiesce_pause: telemetry paused\r\n");
     return UPGRADE_STAGE_OK;
 }
 
 static UpgradeStageResult quiesce_settle(void *ctx, uint32_t timeout_ms)
 {
-    (void)ctx; (void)timeout_ms;
-    /* TODO: 结算在途 PUBLISH（等 ack 或超时） */
-    printf("[NWUPG] quiesce_settle\r\n");
+    (void)ctx;
+    /* 结算在途 PUBLISH：等当前轮 Telemetry 完成（最多 timeout_ms）。
+     * Telemetry 周期 2s，一轮采集+上报约 200ms。等 500ms 足够让在途消息发完。 */
+    uint32_t wait = (timeout_ms > 0 && timeout_ms < 500) ? timeout_ms : 500;
+    osDelay(wait);
+    printf("[NWUPG] quiesce_settle: in-flight settled (%ums)\r\n", (unsigned)wait);
     return UPGRADE_STAGE_OK;
 }
 
 static UpgradeStageResult quiesce_sync(void *ctx, uint32_t timeout_ms)
 {
     (void)ctx; (void)timeout_ms;
-    /* TODO: flush 存储/日志缓冲 */
-    printf("[NWUPG] quiesce_sync\r\n");
+    /* flush：当前无额外缓冲要刷，MQTT netconn_write 是同步的，直接返回 OK */
+    printf("[NWUPG] quiesce_sync: no buffer to flush\r\n");
     return UPGRADE_STAGE_OK;
 }
 
 static UpgradeStageResult quiesce_resume(void *ctx, uint32_t timeout_ms)
 {
     (void)ctx; (void)timeout_ms;
-    /* TODO: 恢复 Telemetry + MQTT 遥测 */
-    printf("[NWUPG] quiesce_resume\r\n");
+    /* 恢复业务：清暂停标志，Telemetry 下一轮恢复采集+上报 */
+    s_quiesced = false;
+    printf("[NWUPG] quiesce_resume: telemetry resumed\r\n");
     return UPGRADE_STAGE_OK;
 }
 

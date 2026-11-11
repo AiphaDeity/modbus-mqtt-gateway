@@ -33,6 +33,9 @@
 #include "storage_seq.h"
 #include "mqtt_client.h"
 #include "app_modules.h"
+#if GATEWAY_ENABLE_M2
+#include "network_upgrade.h" /* NetworkUpgrade_IsQuiesced() 升级门控 */
+#endif
 
 /* 上报周期：Modbus 采集本身可能 1~2 秒一轮，这里 2 秒足够 */
 #define TELEMETRY_PERIOD_MS   2000U
@@ -154,6 +157,15 @@ void Telemetry_Task(void *argument)
 
     for (;;)
     {
+#if GATEWAY_ENABLE_M2
+        /* 升级门控：被暂停时跳过采集+上报，只等恢复（保留任务存活） */
+        if (NetworkUpgrade_IsQuiesced())
+        {
+            osDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+#endif
+
         /* 阶段1：收集有效从站 ID（只持 cfg 锁很短时间） */
         tel_slave_list_t list = {0};
         uint8_t cnt = mb_for_each_valid_slave(collect_slave_ids, &list);
