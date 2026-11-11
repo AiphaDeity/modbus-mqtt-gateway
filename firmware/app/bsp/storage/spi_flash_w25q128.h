@@ -49,6 +49,16 @@ HAL_StatusTypeDef spi_flash_w25q128_write(uint32_t addr, const uint8_t *buf, uin
 // 等待写入完成（轮询忙位，有超时保护）
 HAL_StatusTypeDef spi_flash_w25q128_wait_ready(uint32_t timeout_ms);
 
+/* 升级专用有界I/O：deadline_ms为HAL绝对毫秒期限，覆盖取锁、SPI和内部忙等待。
+ * read/write每次1~256B；write允许跨页。erase的block64选择64KiB块或4KiB扇区。
+ * 返回前结束SPI访问；超时不表示已发出的Flash编程/擦除命令已撤销。 */
+HAL_StatusTypeDef spi_flash_w25q128_read_until(uint32_t addr, uint8_t *buf,
+                                             uint32_t len, uint32_t deadline_ms);
+HAL_StatusTypeDef spi_flash_w25q128_write_until(uint32_t addr, const uint8_t *buf,
+                                              uint32_t len, uint32_t deadline_ms);
+HAL_StatusTypeDef spi_flash_w25q128_erase_until(uint32_t addr, bool block64,
+                                              uint32_t deadline_ms);
+
 /*
  * 【临时诊断】读状态寄存器，用于定位“写入返回成功但回读校验失败”。
  * SR1(0x05)：bit0 BUSY，bit1 WEL，bit2..4 BP0..2，bit7 SRP0

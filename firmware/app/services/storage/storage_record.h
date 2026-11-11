@@ -68,8 +68,12 @@ typedef struct {
 
 typedef void (*record_visit_fn)(const record_view_t *rec, void *user);
 
-/* 初始化：挂载 SD 卡（新卡自动 mkfs），优先用 W25Q128 环状态恢复，失败退全盘扫描 */
+/* 正常业务初始化：挂载现有卷并恢复记录环，不因读失败自动格式化。 */
 HAL_StatusTypeDef storage_record_init(void);
+/* 试运行只挂载现有卷、检查环状态及当前文件；不创建、格式化或写回。 */
+HAL_StatusTypeDef storage_record_restore(void);
+/* Storage_Task结算同步：f_sync与环状态写入/读回均完成才成功。 */
+HAL_StatusTypeDef storage_record_sync(void);
 
 /*
  * 追加一条记录。seq 由调用方（M2 经 storage_seq_alloc）分配并保证单调；
@@ -105,7 +109,7 @@ void storage_record_maintenance(void);
 /* 是否已就绪（卡挂载成功） */
 bool storage_record_is_ready(void);
 
-/* 卸载（物理卡拔出时调用）— 关闭所有文件 + FatFs unmount */
+/* 介质变化时失效文件对象，不向旧卡补写；保留尚未持久的RAM状态。 */
 void storage_record_unmount(void);
 
 #endif /* STORAGE_RECORD_H */

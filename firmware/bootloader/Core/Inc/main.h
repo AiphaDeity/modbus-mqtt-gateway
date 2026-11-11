@@ -57,8 +57,14 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
+#define SPI_FLASH_CS_Pin GPIO_PIN_4
+#define SPI_FLASH_CS_GPIO_Port GPIOE
+#define SPI_IMU_CS_Pin GPIO_PIN_7
+#define SPI_IMU_CS_GPIO_Port GPIOE
 #define LOG_TX_Pin GPIO_PIN_9
 #define LOG_TX_GPIO_Port GPIOA
+#define LOG_RX_Pin GPIO_PIN_10
+#define LOG_RX_GPIO_Port GPIOA
 
 /* USER CODE BEGIN Private defines */
 

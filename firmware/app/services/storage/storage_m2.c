@@ -16,6 +16,9 @@
 
 #include "storage_m2.h"
 #include "storage_record.h"
+#include "storage_runtime.h"
+#include "FreeRTOS.h"
+#include "queue.h"
 
 #include <string.h>
 
@@ -50,6 +53,7 @@ M3_CCM static storage_fetch_resp_t s_resp_buf;
  * 估算，用 _Alignas(8) 对齐到 8 字节（FreeRTOS port 要求）。
  */
 #define QCB_SIZE(depth, item)  (128U + ((depth) * (item)))
+_Static_assert(sizeof(StaticQueue_t) <= 128U, "M3 queue control reservation");
 
 _Alignas(8) M3_CCM static uint8_t s_write_q_cb[ QCB_SIZE(STORAGE_M2_WRITE_Q_DEPTH,
                                                   sizeof(storage_write_req_t)) ];
@@ -73,13 +77,17 @@ void storage_m2_init(void)
     memset(s_ack_q_cb,    0, sizeof(s_ack_q_cb));
 
     static const osMessageQueueAttr_t attr_write = {
-        .name = "m3_write_q", .cb_mem = s_write_q_cb, .cb_size = sizeof(s_write_q_cb) };
+        .name = "m3_write_q", .mq_mem = s_write_q_cb + 128U, .mq_size = sizeof(s_write_q_cb) - 128U,
+        .cb_mem = s_write_q_cb, .cb_size = sizeof(s_write_q_cb) };
     static const osMessageQueueAttr_t attr_fetch = {
-        .name = "m3_fetch_q", .cb_mem = s_fetch_q_cb, .cb_size = sizeof(s_fetch_q_cb) };
+        .name = "m3_fetch_q", .mq_mem = s_fetch_q_cb + 128U, .mq_size = sizeof(s_fetch_q_cb) - 128U,
+        .cb_mem = s_fetch_q_cb, .cb_size = sizeof(s_fetch_q_cb) };
     static const osMessageQueueAttr_t attr_resp = {
-        .name = "m3_resp_q",  .cb_mem = s_resp_q_cb,  .cb_size = sizeof(s_resp_q_cb) };
+        .name = "m3_resp_q",  .mq_mem = s_resp_q_cb + 128U, .mq_size = sizeof(s_resp_q_cb) - 128U,
+        .cb_mem = s_resp_q_cb,  .cb_size = sizeof(s_resp_q_cb) };
     static const osMessageQueueAttr_t attr_ack = {
-        .name = "m3_ack_q",   .cb_mem = s_ack_q_cb,   .cb_size = sizeof(s_ack_q_cb) };
+        .name = "m3_ack_q",   .mq_mem = s_ack_q_cb + 128U, .mq_size = sizeof(s_ack_q_cb) - 128U,
+        .cb_mem = s_ack_q_cb,   .cb_size = sizeof(s_ack_q_cb) };
 
     s_write_q = osMessageQueueNew(STORAGE_M2_WRITE_Q_DEPTH,
                                   sizeof(storage_write_req_t), &attr_write);
@@ -110,7 +118,8 @@ void storage_m2_get_cache_stats(storage_cache_stats_t *out)
 static void process_write_queue(void)
 {
     storage_write_req_t req;
-    while (osMessageQueueGet(s_write_q, &req, NULL, 0) == osOK) {
+    /* 每轮至多一条，持续上报不能饿死升级读回和取消请求。 */
+    if (osMessageQueueGet(s_write_q, &req, NULL, 0) == osOK) {
         (void)storage_record_append(req.kind, req.seq, req.captured_at_ms,
                                     req.payload, req.payload_len);
     }
@@ -137,15 +146,24 @@ static void process_fetch_queue(void)
 static void process_ack_queue(void)
 {
     storage_ack_t ack;
-    while (osMessageQueueGet(s_ack_q, &ack, NULL, 0) == osOK) {
+    if (osMessageQueueGet(s_ack_q, &ack, NULL, 0) == osOK) {
         storage_record_ack_upto(ack.ack_upto_seq);
     }
 }
 
 void storage_m2_process(void)
 {
-    if (s_write_q == NULL) return;   /* 未初始化 */
+    if (s_write_q == NULL || !storage_mutation_allowed()) return;
     process_write_queue();
     process_fetch_queue();
     process_ack_queue();
+}
+
+/* 调用方已暂停生产和业务处理，只观察未完成请求，不清空或伪造应答。 */
+bool storage_m2_settled(void)
+{
+    return s_write_q != NULL && s_ack_q != NULL && s_fetch_q != NULL && s_resp_q != NULL &&
+           osMessageQueueGetCount(s_write_q) == 0U &&
+           osMessageQueueGetCount(s_ack_q) == 0U &&
+           osMessageQueueGetCount(s_fetch_q) == 0U;
 }

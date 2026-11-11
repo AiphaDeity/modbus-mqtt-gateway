@@ -4,10 +4,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-// 跳转到 APP
+// 清理 Boot 硬件后跳转 App，成功不返回；失败可能已关闭部分硬件。
 bool Boot_JumpToApp(void);
 
-// 校验 APP 向量表是否合法，跳转前检查，防止跳飞、HardFault
+// 检查 MSP 范围/对齐及 Thumb 入口地址；通过不表示固件已认证。
 bool Boot_IsAppVectorValid(uint32_t initial_sp, uint32_t reset_vector);
 
 // 读取并检查候选应用的向量表；通过返回 true，否则返回 false

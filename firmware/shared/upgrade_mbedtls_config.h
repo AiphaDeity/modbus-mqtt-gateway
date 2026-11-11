@@ -1,0 +1,16 @@
+#ifndef UPGRADE_MBEDTLS_CONFIG_H
+#define UPGRADE_MBEDTLS_CONFIG_H
+
+// Boot/App 共用的安全包算法配置，仅启用所需算法及 P-256 分段验签。
+#define MBEDTLS_SHA256_C
+#define MBEDTLS_AES_C
+#define MBEDTLS_GCM_C
+#define MBEDTLS_BIGNUM_C
+#define MBEDTLS_ECP_C
+#define MBEDTLS_ECP_DP_SECP256R1_ENABLED
+#define MBEDTLS_ECDSA_C
+#define MBEDTLS_ECP_RESTARTABLE
+#define MBEDTLS_ASN1_PARSE_C
+#define MBEDTLS_ASN1_WRITE_C
+
+#endif

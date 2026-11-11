@@ -6,6 +6,7 @@
  * 写入时始终覆盖"较旧的那份"，保留较新的一份作为掉电回退。
  */
 
+#include "storage_runtime.h"
 #include "storage_identity.h"
 #include "flash_partition.h"
 #include "spi_flash_w25q128.h"
@@ -28,6 +29,10 @@ _Static_assert(sizeof(identity_record_t) == 48, "identity_record_t must be 48 by
 
 static const uint32_t s_copy_addr[2] = { FLASH_IDENTITY_A_ADDR, FLASH_IDENTITY_B_ADDR };
 
+static bool s_read_error;
+static bool s_copy_blank[2];
+
+
 static bool     s_valid      = false;
 static uint32_t s_generation = 0;
 static char     s_id[GATEWAY_ID_MAX_LEN];
@@ -48,9 +53,14 @@ static uint32_t crc32_calc(const uint8_t *data, uint32_t len)
 /* 读取一个副本，有效则返回 true 并填出记录 */
 static bool copy_read(int idx, identity_record_t *rec)
 {
-    if (spi_flash_w25q128_read(s_copy_addr[idx], (uint8_t *)rec,
+    if (storage_flash_read(s_copy_addr[idx], (uint8_t *)rec,
                                sizeof(*rec)) != HAL_OK) {
+        s_read_error = true;
         return false;
+    }
+    s_copy_blank[idx] = true;
+    for (uint32_t i = 0U; i < sizeof(*rec); i++) {
+        if (((const uint8_t *)rec)[i] != 0xFFU) s_copy_blank[idx] = false;
     }
     if (rec->magic != IDENTITY_MAGIC) return false;
     if (rec->version != IDENTITY_VERSION) return false;
@@ -61,17 +71,22 @@ static bool copy_read(int idx, identity_record_t *rec)
 /* 写入一个副本：先擦扇区，再写记录 */
 static HAL_StatusTypeDef copy_write(int idx, const identity_record_t *rec)
 {
-    HAL_StatusTypeDef st = spi_flash_w25q128_sector_erase(s_copy_addr[idx]);
+    HAL_StatusTypeDef st = storage_flash_erase(s_copy_addr[idx]);
     if (st != HAL_OK) return st;
-    return spi_flash_w25q128_write(s_copy_addr[idx], (const uint8_t *)rec,
+    return storage_flash_write(s_copy_addr[idx], (const uint8_t *)rec,
                                     sizeof(*rec));
 }
 
 HAL_StatusTypeDef storage_identity_init(void)
 {
-    identity_record_t rec_a, rec_b;
+    s_read_error = false;
+    s_copy_blank[0] = s_copy_blank[1] = false;
+    identity_record_t rec_a = {0}, rec_b = {0};
     bool ok_a = copy_read(0, &rec_a);
     bool ok_b = copy_read(1, &rec_b);
+
+    if (s_read_error || (!ok_a && !ok_b && !(s_copy_blank[0] && s_copy_blank[1])))
+        return HAL_ERROR;
 
     s_newer = -1;
     s_valid = false;
@@ -112,7 +127,7 @@ HAL_StatusTypeDef storage_identity_get(char *out, size_t out_size)
     return HAL_OK;
 }
 
-HAL_StatusTypeDef storage_identity_set(const char *gateway_id)
+static HAL_StatusTypeDef storage_identity_set_impl(const char *gateway_id)
 {
     if (gateway_id == NULL) return HAL_ERROR;
 
@@ -143,4 +158,13 @@ HAL_StatusTypeDef storage_identity_set(const char *gateway_id)
     memcpy(s_id, rec.gateway_id, sizeof(s_id));
     s_newer      = target;
     return HAL_OK;
+}
+
+/* 保存新的设备身份并保留另一有效副本。 */
+HAL_StatusTypeDef storage_identity_set(const char *gateway_id)
+{
+    if (!storage_mutation_begin()) return HAL_BUSY;
+    HAL_StatusTypeDef st = storage_identity_set_impl(gateway_id);
+    storage_mutation_end();
+    return st;
 }

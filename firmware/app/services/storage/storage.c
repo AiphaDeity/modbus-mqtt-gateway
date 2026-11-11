@@ -15,6 +15,12 @@
 #include "storage_ctrllog.h"
 #include "storage_record.h"
 #include "storage_m2.h"
+#include "storage_runtime.h"
+#include "storage_upgrade.h"
+#include "app_monitor.h"
+#include "storage_upgrade_q.h"
+#include "storage_upgrade_tf.h"
+#include "upgrade_storage.h"
 #include "m3_selftest.h"
 
 #include "cmsis_os2.h"
@@ -78,8 +84,12 @@ void EXTI3_IRQHandler(void)
     HAL_GPIO_EXTI_IRQHandler(SD_CARD_DET_Pin);
 }
 
+/* 创建队列和基础资源；耗时控制日志恢复由Storage_Task执行。 */
 AppModuleInitResult Storage_Init(void)
 {
+    /* 先创建升级通道，初始化失败不能留下没有消费者的空句柄。 */
+    if (!storage_runtime_init() || !storage_upgrade_q_init() || !storage_upgrade_tf_init())
+        return APP_MODULE_INIT_FAILED;
     /* 1. 创建 I2C1 总线互斥锁 
     * 作用：I2C1是共享总线，SD3078、AHT20、INA226、PCA9555多个外设共用这条总线
     * RTOS下多个任务同时访问I2C会出现总线冲突、数据错乱，所以用互斥锁保证同一时刻只有一个任务操作I2C1
@@ -115,24 +125,7 @@ AppModuleInitResult Storage_Init(void)
     // PD3 EXTI 热插拔：让插拔事件在任何时候都能被捕获
     sdcard_detect_exti_init();
 
-    // 序列号管理 — 从 Flash 恢复高水位（双份冗余取最大）
-    (void)storage_seq_init();
-
-    // 设备身份 — 读取双份 gateway_id，取有效且最新的一份
-    (void)storage_identity_init();
-
-    // 持久时间下界 — 读取双份，取较大的有效值
-    s_floor_ok = s_flash_ok && (storage_timefloor_init() == HAL_OK);
-
-    // 控制日志 — 扫描双区，恢复写入位置与去重键
-    s_log_ok = s_flash_ok && (storage_ctrllog_init() == HAL_OK);
-
-    /*
-     * 注意：不在 Init 里加载配置。
-     * 配置加载放到 Task 里做，因为配置加载可能需要等待 SPI Flash ready，
-     * 而 Init 阶段不能阻塞。
-     */
-
+    /* 持久数据恢复及必要初始化全部留在Storage_Task。 */
     return APP_MODULE_INIT_OK;
 }
 
@@ -147,121 +140,125 @@ static bool sdcard_physical_present(void)
     return (HAL_GPIO_ReadPin(SD_CARD_DET_GPIO_Port, SD_CARD_DET_Pin) == GPIO_PIN_RESET);
 }
 
+/* 存储所有者：恢复业务状态并处理记录、升级和TF文件请求。 */
 void Storage_Task(void *argument)
 {
     (void)argument;
-
-    /*
-     * 1. 确认配置区状态。
-     * M3 不再把整份 JSON 读进 RAM（最大 64KiB 会吃掉一半 RAM），
-     * 这里只打开句柄以触发运行槽选择；真正的字节流由配置维护模块
-     * 按块调用 storage_config_read_chunk() 读取。
-     */
-    storage_config_reader_t cfg_rd;
-    (void)storage_config_open(&cfg_rd);//打开配置，选择运行槽0，传入句柄指针
-
-    // 启动时用当前 RTC 时间推进持久下界（不足阈值时内部自动跳过）
-    uint32_t now = storage_get_unix_time();
-    if (now != 0)
-        (void)storage_timefloor_update(now);
-
-    /* 记录持久化（TF 卡）— 可能需要挂载/格式化，放在 Task 里不阻塞 Init */
-    (void)storage_record_init();
-
-    /* M2↔M3 队列协议（写队列/补传/回执），队列句柄先于卡就绪创建 */
+    if (!storage_runtime_start()) {
+        Monitor_ReportFatal(APP_MODULE_STORAGE);
+        osThreadExit();
+        return;
+    }
+    storage_upgrade_init(s_flash_ok);
     storage_m2_init();
 
-    /* 2. 上报就绪位 */
+    /* 正常启动允许首次配置；试运行仅恢复，不写空白高水位或时间下界。 */
+    bool bootstrap_write = storage_mutation_begin();
+    bool seq_ok = s_flash_ok && storage_seq_init() == HAL_OK;
+    bool identity_ok = s_flash_ok && storage_identity_init() == HAL_OK;
+    bool config_ok = s_flash_ok && storage_config_check() == HAL_OK;
+    s_floor_ok = s_flash_ok && storage_timefloor_init() == HAL_OK;
+    s_log_ok = s_flash_ok && storage_ctrllog_init() == HAL_OK;
+    if (bootstrap_write) storage_mutation_end();
 
-    // 配置存储服务就绪：判据是 SPI Flash 可读写，空设备也算就绪
-    App_SetResourceReady(APP_RESOURCE_STORAGE, s_flash_ok);
+    HAL_StatusTypeDef tf_check = storage_record_restore();
+    /* 序号元数据丢失或倒退时，不能从初始值重新发号覆盖既有记录。 */
+    uint64_t high_watermark = storage_seq_get_high_watermark();
+    bool sequence_consistent = high_watermark > storage_ctrllog_last_seq() &&
+                               high_watermark > storage_record_last_seq();
+    bool core_ok = seq_ok && sequence_consistent && identity_ok && config_ok &&
+                   s_floor_ok && s_log_ok && storage_m2_settled();
+    printf("[M3] restore flash=%u seq=%u id=%u cfg=%u floor=%u log=%u tf=%u\r\n",
+           s_flash_ok, seq_ok, identity_ok, config_ok, s_floor_ok, s_log_ok, (unsigned)tf_check);
+    storage_runtime_finish(core_ok, core_ok && tf_check == HAL_OK);
 
-    // 时间服务就绪（RTC 在走，且时间不早于持久下界）
+    if (core_ok) {
+        const UpgradeStorageBinding binding = {
+            storage_upgrade_req_queue(), storage_upgrade_rsp_queue(), UPGRADE_STORAGE_PROTOCOL_VERSION
+        };
+        UpgradeStageResult st = UpgradeStorage_Bind(&binding);
+        if (st != UPGRADE_STAGE_OK) printf("[UPGQ] bind not ready result=%d\r\n", (int)st);
+    }
+    storage_upgrade_tf_bind();
+    App_SetResourceReady(APP_RESOURCE_STORAGE, core_ok);
     App_SetResourceReady(APP_RESOURCE_TIME, storage_time_is_valid());
-
-    // 控制状态恢复：持久时间下界 + 控制日志（去重表）均已恢复
-    App_SetResourceReady(APP_RESOURCE_CONTROL_STATE, s_floor_ok && s_log_ok);
+    App_SetResourceReady(APP_RESOURCE_CONTROL_STATE, core_ok);
 
 #if M3_SELFTEST_ENABLE
-    // 上板自检：把各层状态一次性打印到日志串口（USART1, 115200）
-    m3_selftest_run();
+    /* 写入诊断只允许显式打开且通过正常启动门控，不参与产品健康判定。 */
+    if (storage_mutation_begin()) {
+        (void)storage_runtime_wait(20000U);
+        m3_selftest_run();
+        storage_mutation_end();
+        storage_runtime_report();
+    }
 #endif
 
-    /* 3. 业务循环 */
-    uint32_t last_floor_tick = HAL_GetTick();
+    uint32_t last_floor_tick = HAL_GetTick() - STORAGE_TIMEFLOOR_STEP_SEC * 1000U;
     uint32_t last_cd_poll_tick = HAL_GetTick();
+    uint32_t last_retry_tick = 0U;
     bool last_card_present = sdcard_physical_present();
 
-    for (;;)
-    {
-        // 每小时推进一次持久时间下界，保证长期运行也能检测到时间回拨
-        if ((HAL_GetTick() - last_floor_tick) >= (STORAGE_TIMEFLOOR_STEP_SEC * 1000U))
-        {
-            last_floor_tick = HAL_GetTick();
-            uint32_t t = storage_get_unix_time();
-            if (t != 0)
-                (void)storage_timefloor_update(t);
+    for (;;) {
+        if (!storage_runtime_wait(5000U)) {
+            Monitor_ReportFatal(APP_MODULE_STORAGE);
+            osThreadExit();
+            return;
         }
 
-        // 推进控制日志整区回收（无回收任务时立即返回）
-        (void)storage_ctrllog_maintenance();
-
-        // M2↔M3 队列：写请求 / 补传拉取 / ack 回执
-        storage_m2_process();
-
-        // 记录环状态节流落盘（段切换时已在 append 内立即落盘）
-        storage_record_maintenance();
-
-        /*
-         * TF 卡热插拔：
-         *   - EXTI 中断优先（PD3 任何边沿变化都设 s_cd_event_flag）
-         *   - 2s 轮询兜底（防止中断偶发丢失）
-         */
         bool now_present = sdcard_physical_present();
-        bool cd_event = false;
-
-        if (s_cd_event_flag) {
-            /* EXTI 捕获到了物理插拔边缘 */
-            s_cd_event_flag = false;
-            cd_event = true;
-        } else if ((HAL_GetTick() - last_cd_poll_tick) >= 2000U) {
-            /* 2s 轮询兜底 */
+        bool cd_event = s_cd_event_flag;
+        s_cd_event_flag = false;
+        if ((uint32_t)(HAL_GetTick() - last_cd_poll_tick) >= 2000U) {
             last_cd_poll_tick = HAL_GetTick();
-            cd_event = (now_present != last_card_present);
+            cd_event = cd_event || now_present != last_card_present;
         }
-
         if (cd_event) {
-            if (!now_present && last_card_present) {
-                /* LOW→HIGH：检测到卡拔出 */
-                printf("[M3] TF card removed (PD3=HIGH) unmounting...\r\n"); fflush(stdout);
-                storage_record_unmount();
-                (void)sdcard_tf_deinit();
-                printf("[M3] TF card unmounted + SDIO deinit done\r\n"); fflush(stdout);
-            } else if (now_present && !last_card_present) {
-                /* HIGH→LOW：检测到卡插入 */
-                printf("[M3] TF card inserted (PD3=LOW) mounting...\r\n"); fflush(stdout);
-                uint32_t t0 = HAL_GetTick();
-                HAL_StatusTypeDef st = storage_record_init();
-                uint32_t dt = HAL_GetTick() - t0;
-                bool ready = storage_record_is_ready();
-                printf("[M3] TF card mount %s (init_st=%d dt=%lums)\r\n",
-                       ready ? "OK" : "FAIL", st, (unsigned long)dt); fflush(stdout);
+            storage_upgrade_tf_invalidate(false);
+            storage_record_unmount();
+            storage_upgrade_tf_invalidate(true);
+            (void)sdcard_tf_deinit();
+            tf_check = now_present ? storage_record_restore() : HAL_OK;
+            storage_runtime_finish(core_ok, core_ok && tf_check == HAL_OK);
+            if (!storage_runtime_wait(5000U)) {
+                Monitor_ReportFatal(APP_MODULE_STORAGE);
+                osThreadExit();
+                return;
             }
             last_card_present = now_present;
-        } else if (now_present && !storage_record_is_ready()) {
-            /* 卡物理在场但逻辑没 ready → 兜底重试（每 10s 一次） */
-            static uint32_t last_retry_tick = 0;
-            if ((HAL_GetTick() - last_retry_tick) >= 10000U) {
-                last_retry_tick = HAL_GetTick();
-                printf("[M3] TF card present but not ready, retry init\r\n"); fflush(stdout);
-                uint32_t t0 = HAL_GetTick();
-                (void)storage_record_init();
-                uint32_t dt = HAL_GetTick() - t0;
-                printf("[M3] retry init done dt=%lums ready=%d\r\n",
-                       (unsigned long)dt, storage_record_is_ready()); fflush(stdout);
-            }
+            printf("[M3] TF media changed present=%u check=%u\r\n",
+                   now_present, (unsigned)tf_check);
         }
 
-        osDelay(1000);
+        if (storage_mutation_begin()) {
+            if ((uint32_t)(HAL_GetTick() - last_floor_tick) >= STORAGE_TIMEFLOOR_STEP_SEC * 1000U) {
+                last_floor_tick = HAL_GetTick();
+                uint32_t now = storage_get_unix_time();
+                if (now != 0U && storage_timefloor_update(now) != HAL_OK)
+                    printf("[M3] time floor update failed\r\n");
+            }
+            (void)storage_ctrllog_maintenance();
+            storage_m2_process();
+            storage_record_maintenance();
+
+            /* 只在正常业务阶段挂载/恢复缓存；失败不会触发自动格式化。 */
+            if (now_present && tf_check == HAL_OK && !storage_record_is_ready() &&
+                (cd_event || (uint32_t)(HAL_GetTick() - last_retry_tick) >= 10000U)) {
+                last_retry_tick = HAL_GetTick();
+                HAL_StatusTypeDef st = storage_record_sync();
+                if (st == HAL_OK) st = storage_record_init();
+                storage_upgrade_tf_invalidate(true);
+                printf("[M3] TF recovery result=%u ready=%u\r\n",
+                       (unsigned)st, storage_record_is_ready());
+            }
+            storage_mutation_end();
+        }
+
+        /* 暂停不停止升级/文件/结算队列，避免等待自己的消费者造成死锁。 */
+        storage_upgrade_q_process(1U);
+        storage_upgrade_tf_process();
+        storage_runtime_process();
+        storage_runtime_report();
+        osDelay(1U);
     }
 }

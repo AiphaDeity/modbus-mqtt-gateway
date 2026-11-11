@@ -70,5 +70,7 @@ HAL_StatusTypeDef storage_ctrllog_maintenance(void);
 
 // 最近一条已提交记录的序列号（无记录时为 0）
 uint64_t storage_ctrllog_last_seq(void);
+/* 有回收尚未完成时必须阻止升级提交。 */
+bool storage_ctrllog_is_busy(void);
 
 #endif /* STORAGE_CTRLLOG_H */

@@ -16,7 +16,7 @@
 #define MODBUS_STACK_SIZE_BYTES  (2U * 1024U)
 #define MQTT_STACK_SIZE_BYTES    (6U * 1024U)   /* netconn + snprintf 调用链深，4K 实测溢出 */
 #define TELEMETRY_STACK_SIZE_BYTES (2560U)       /* snprintf + printf 栈开销大，2.5K */
-#define MONITOR_STACK_SIZE_BYTES (512U)         /* M4 monitor 还没实现，占位 */
+#define MONITOR_STACK_SIZE_BYTES (2U * 1024U) // 监督任务使用 2 KiB 栈。
 
 typedef AppModuleInitResult (*AppModuleInitFn)(void);
 
@@ -35,21 +35,16 @@ typedef struct
 } AppModuleSlot;
 
 /*
- * 五个业务任务的初始栈预算共 16KiB，不含 TCB、启动任务和协议栈线程。
- * 存储、配置和 MQTT 各预留 4KiB 给库调用，Modbus 和监督各预留 2KiB。
- * 这些数值尚非实测峰值，接入后按完整调用链和栈高水位校正。
- * 五个栈、TCB 和启动任务当前均位于普通 SRAM；CCM 保留，暂不迁移任务栈。
- * DMA 缓冲仍须满足对应外设的长度、对齐和生命周期要求。
- * 栈按 Cortex-M4 FreeRTOS 端口要求对齐到 8 字节。
+ * 存储栈使用普通 SRAM，确保栈上的 FIL/缓冲可供 DMA 访问；监督栈也使用普通 SRAM。
+ * 标记 CCMRAM 的其他栈不可供 DMA 访问，其调用链不得把栈缓冲直接交给 DMA。
+ * 所有栈按 Cortex-M4 FreeRTOS 端口要求对齐到 8 B。
  */
-/* 任务栈全部挪到 CCMRAM：栈是 CPU 独占访问（中断切换/函数调用），不被任何 DMA 碰。
- * 64KB CCMRAM 现在 0 占用，正好装下全部 ~15.5KB 栈，给普通 SRAM 腾地方。 */
-_Alignas(8) static StackType_t storage_stack[STORAGE_STACK_SIZE_BYTES / sizeof(StackType_t)]  __attribute__((section(".ccmram")));
+_Alignas(8) static StackType_t storage_stack[STORAGE_STACK_SIZE_BYTES / sizeof(StackType_t)];
 _Alignas(8) static StackType_t config_stack[CONFIG_STACK_SIZE_BYTES / sizeof(StackType_t)]  __attribute__((section(".ccmram")));
 _Alignas(8) static StackType_t modbus_stack[MODBUS_STACK_SIZE_BYTES / sizeof(StackType_t)]  __attribute__((section(".ccmram")));
 _Alignas(8) static StackType_t mqtt_stack[MQTT_STACK_SIZE_BYTES / sizeof(StackType_t)]  __attribute__((section(".ccmram")));
 _Alignas(8) static StackType_t telemetry_stack[TELEMETRY_STACK_SIZE_BYTES / sizeof(StackType_t)]  __attribute__((section(".ccmram")));
-_Alignas(8) static StackType_t monitor_stack[MONITOR_STACK_SIZE_BYTES / sizeof(StackType_t)]  __attribute__((section(".ccmram")));
+_Alignas(8) static StackType_t monitor_stack[MONITOR_STACK_SIZE_BYTES / sizeof(StackType_t)];
 
 static StaticTask_t storage_control_block;
 static StaticTask_t config_control_block;
@@ -116,20 +111,18 @@ static const osThreadAttr_t monitor_attributes =
   .cb_size = sizeof(monitor_control_block),
   .stack_mem = monitor_stack,
   .stack_size = sizeof(monitor_stack),
-  .priority = osPriorityBelowNormal
+  .priority = osPriorityAboveNormal // 高于启动任务；每100ms只做短检查，不执行业务I/O。
 };
 
 /*
- * 每个模块的 init/task 同时为 NULL 表示尚未接入。
- * 源码加入模块构建后，将同一组的两个 NULL 一起替换为已声明的函数：
- * 例如 Storage_Init、Storage_Task；只填其中一个会报告绑定错误。
- * 所有初始化先完成，再统一创建任务，任务入口由包装函数调用。
+ * init/task 必须成对绑定；均为 NULL 表示未接入，只绑定一个视为错误。
+ * 监督任务提前创建；其余任务在基础初始化完成后，经统一入口创建。
  */
 static AppModuleSlot module_slots[APP_MODULE_COUNT] =
 {
   [APP_MODULE_STORAGE] =
   {
-    .init = NULL/*Storage_Init*/, .task = NULL/*Storage_Task*/, .attributes = &storage_attributes,
+    .init = Storage_Init, .task = Storage_Task, .attributes = &storage_attributes,
     .result = APP_MODULE_INIT_NOT_READY, .task_state = APP_MODULE_TASK_NOT_STARTED
   },
   [APP_MODULE_CONFIG] =
@@ -154,7 +147,7 @@ static AppModuleSlot module_slots[APP_MODULE_COUNT] =
   },
   [APP_MODULE_MONITOR] =
   {
-    .init = NULL, .task = NULL, .attributes = &monitor_attributes,
+    .init = Monitor_Init, .task = Monitor_Task, .attributes = &monitor_attributes,
     .result = APP_MODULE_INIT_NOT_READY, .task_state = APP_MODULE_TASK_NOT_STARTED
   }
 };
@@ -169,8 +162,8 @@ static bool modules_initialized;
 static bool modules_started;
 
 /*
- * RTOS 创建任务时使用的统一入口，argument 指向生命周期覆盖运行期的静态模块槽。
- * 转调该模块的业务任务，业务参数当前为 NULL；意外返回时记录状态并停止运行。
+ * 转调模块任务，业务参数为 NULL；意外返回时记录错误并停止该任务。
+ * argument 指向运行期间有效的静态模块槽。
  */
 static void App_ModuleTaskEntry(void *argument)
 {
@@ -182,9 +175,51 @@ static void App_ModuleTaskEntry(void *argument)
 }
 
 /*
- * 由 App_Entry 在调度器启动后调用，按装配表顺序准备各模块的基础资源。
- * 未接入模块跳过，初始化结果保存在模块槽中；重复调用不重新初始化。
- * NOT_READY 允许后续任务处理离线恢复，FAILED 留待启动前的统一检查处理。
+ * 在业务初始化前启动监督任务，使用装配表的静态 TCB 和栈。
+ * 调度锁保证任务首次运行前槽状态完整；失败进入 Error_Handler。
+ */
+void App_MonitorStart(void)
+{
+  AppModuleSlot *slot = &module_slots[APP_MODULE_MONITOR];
+  if (slot->task_state == APP_MODULE_TASK_STARTED)
+  {
+    return;
+  }
+  if (modules_initialized || modules_started || (osKernelGetState() != osKernelRunning)
+      || (slot->init != Monitor_Init) || (slot->task != Monitor_Task))
+  {
+    Error_Handler();
+    return;
+  }
+  if (osKernelLock() < 0)
+  {
+    Error_Handler();
+    return;
+  }
+  slot->result = slot->init();
+  if (slot->result != APP_MODULE_INIT_OK)
+  {
+    slot->task_state = APP_MODULE_TASK_INIT_FAILED;
+    Error_Handler();
+    return;
+  }
+  slot->task_handle = osThreadNew(App_ModuleTaskEntry, slot, slot->attributes);
+  if (slot->task_handle == NULL)
+  {
+    slot->task_state = APP_MODULE_TASK_CREATE_FAILED;
+    Error_Handler();
+    return;
+  }
+  slot->task_state = APP_MODULE_TASK_STARTED;
+  if (osKernelUnlock() < 0)
+  {
+    Error_Handler();
+  }
+}
+
+/*
+ * 按装配表初始化其他模块，跳过未接入和已初始化模块。
+ * NOT_READY 仍允许后续创建任务，由任务等待业务条件。
  */
 void App_ModulesInit(void)
 {
@@ -193,7 +228,8 @@ void App_ModulesInit(void)
     return;
   }
 
-  if (osKernelGetState() != osKernelRunning)
+  if ((osKernelGetState() != osKernelRunning)
+      || (module_slots[APP_MODULE_MONITOR].task_state != APP_MODULE_TASK_STARTED))
   {
     Error_Handler();
     return;
@@ -202,6 +238,11 @@ void App_ModulesInit(void)
   for (unsigned int i = 0; i < APP_MODULE_COUNT; ++i)
   {
     AppModuleSlot *slot = &module_slots[i];
+
+    if (i == APP_MODULE_MONITOR)
+    {
+      continue; // 已提前初始化并创建，不再清空监督状态。
+    }
 
     if ((slot->init == NULL) && (slot->task == NULL))
     {
@@ -239,10 +280,8 @@ void App_ModulesInit(void)
 }
 
 /*
- * 由 App_Entry 在全部基础初始化结束后调用，使用静态 TCB 和栈创建已接入任务。
- * 创建期间暂停任务调度，全部创建成功后恢复，重复调用不重复创建。
- * 绑定、基础初始化、任务创建或调度操作失败时进入 Error_Handler；
- * 创建中途失败时不恢复调度，确保已创建的业务任务不会单独抢先运行。
+ * 基础初始化后创建已绑定任务，重复调用不重复创建。
+ * 创建期间锁定调度，失败保持锁定并进入 Error_Handler，避免部分任务提前运行。
  */
 void App_ModulesStart(void)
 {
@@ -262,6 +301,10 @@ void App_ModulesStart(void)
   {
     AppModuleTaskState state = module_slots[i].task_state;
 
+    if ((i == APP_MODULE_MONITOR) && (state == APP_MODULE_TASK_STARTED))
+    {
+      continue;
+    }
     if ((state != APP_MODULE_TASK_NOT_CONNECTED) &&
         (state != APP_MODULE_TASK_NOT_STARTED))
     {
@@ -281,7 +324,8 @@ void App_ModulesStart(void)
   {
     AppModuleSlot *slot = &module_slots[i];
 
-    if (slot->task_state == APP_MODULE_TASK_NOT_CONNECTED)
+    if ((slot->task_state == APP_MODULE_TASK_NOT_CONNECTED)
+        || ((i == APP_MODULE_MONITOR) && (slot->task_state == APP_MODULE_TASK_STARTED)))
     {
       continue;
     }
@@ -325,4 +369,28 @@ AppModuleTaskState App_GetModuleTaskState(AppModuleId module)
   }
 
   return module_slots[module].task_state;
+}
+
+// 读取已启动模块的历史最小空闲栈，并换算为字节。
+bool App_GetModuleStackFree(AppModuleId module, uint32_t *bytes)
+{
+  if ((bytes == NULL) || ((uint32_t)module >= APP_MODULE_COUNT))
+  {
+    return false;
+  }
+  *bytes = 0U;
+  const AppModuleSlot *slot = &module_slots[module];
+  if ((slot->task_state != APP_MODULE_TASK_STARTED) || (slot->task_handle == NULL))
+  {
+    return false;
+  }
+  *bytes = (uint32_t)uxTaskGetStackHighWaterMark((TaskHandle_t)slot->task_handle) * sizeof(StackType_t);
+  return true;
+}
+
+// 比较当前任务句柄与指定模块的已登记句柄。
+bool App_IsCurrentModuleTask(AppModuleId module)
+{
+  return ((uint32_t)module < APP_MODULE_COUNT) && (module_slots[module].task_handle != NULL)
+      && (osThreadGetId() == module_slots[module].task_handle);
 }
