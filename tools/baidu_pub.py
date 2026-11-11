@@ -30,7 +30,7 @@ import urllib.error
 # ⚠️ git commit 前改成 "xxxxxxx" 占位符
 IOTCORE_ID    = "aeklwww"
 DEVICE_KEY    = "stm32_gw_01"
-DEVICE_SECRET = "YOUR_DEVICE_SECRET"    # git commit 前替换为占位符
+DEVICE_SECRET = "YOUR_DEVICE_SECRET"    # 占位符，测试时替换为真实密钥
 REGION        = "gz"                       # 广州地域，和实例一致
 
 HOST = "{}.iot.{}.baidubce.com".format(IOTCORE_ID, REGION)
