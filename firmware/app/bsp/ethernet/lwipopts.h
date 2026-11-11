@@ -52,8 +52,8 @@
 /* ★协议栈堆内存大小：12KB
    lwip 的动态分配（mem_malloc）都从这块堆走，TCP 发送缓冲等大块内存也在这。
    与 FreeRTOS heap(32KB) 独立。MQTT 客户端 TCP 发送缓冲走 FreeRTOS heap，
-   lwip 这边够 DHCP/UDP/TCPIP mailbox 就行。SRAM 128KB 装得下 MEM_SIZE 12KB + heap 32KB。 */
-#define MEM_SIZE                    (12*1024)
+   lwip 这边够 DHCP/UDP/TCPIP mailbox 就行。M4合并后SRAM紧张，10KB够单MQTT连接用。 */
+#define MEM_SIZE                    (10*1024)
 
 /* 内存池数量（Day3 裁剪：单 MQTT 连接够用） */
 #define MEMP_NUM_PBUF               6     /* 原 15：原始 pbuf，只给 IP 分片用，6 够 */

@@ -50,13 +50,16 @@ typedef struct
     uint32_t          total_size;  /* 供进度计算 */
 } nw_download_ctx_t;
 
+/* ===== 前向声明（内部函数） ===== */
+static void NetworkUpgrade_Task(void *argument);
+
 /* ===== 模块状态 ===== */
 static volatile bool s_initialized = false;
 static volatile bool s_task_started = false;
 
 /* 升级执行任务同步：Notify 设 request + 释放信号量，Task 获取后执行 */
 static osSemaphoreId_t s_notify_sem = NULL;
-static nw_upgrade_request_t s_pending_req;   /* Notify 写，Task 读（单生产单消费） */
+static nw_upgrade_request_t s_pending_req __attribute__((section(".ccmram")));   /* Notify 写，Task 读（单生产单消费） */
 static volatile bool s_upgrade_in_progress = false;
 
 /* 当前升级阶段（供状态上报） */
@@ -66,11 +69,11 @@ static volatile int s_phase = 0;   /* 0=idle 1=downloading 2=verifying 3=ready 4
 static volatile uint32_t s_epoch_counter = 0;
 
 /* ota_status topic（Init 时拼好，百度云模式 $iot/{dk}/user/ota_status） */
-static char s_ota_status_topic[96] = {0};
+static char s_ota_status_topic[96] __attribute__((section(".ccmram"))) = {0};
 
-/* ===== 升级执行任务静态资源（8KiB 普通 SRAM 栈） ===== */
-_Alignas(8) static StackType_t s_upgrade_stack[NETWORK_UPGRADE_TASK_STACK_BYTES / sizeof(StackType_t)];
-static StaticTask_t s_upgrade_control_block;
+/* ===== 升级执行任务静态资源（6KiB，放 CCMRAM 不挤占 SRAM） ===== */
+_Alignas(8) static StackType_t s_upgrade_stack[NETWORK_UPGRADE_TASK_STACK_BYTES / sizeof(StackType_t)] __attribute__((section(".ccmram")));
+static StaticTask_t s_upgrade_control_block __attribute__((section(".ccmram")));
 static const osThreadAttr_t s_upgrade_attributes =
 {
     .name = "nw_upgrade",
@@ -376,7 +379,7 @@ int NetworkUpgrade_Notify(const char *json)
 }
 
 /* ===== 升级执行任务 ===== */
-void NetworkUpgrade_Task(void *argument)
+static void NetworkUpgrade_Task(void *argument)
 {
     (void)argument;
 
@@ -499,7 +502,14 @@ void NetworkUpgrade_Task(void *argument)
     }
 }
 
-/* ===== 重启后结果上报 ===== */
+/* ===== 重启后结果上报 =====
+ * 重启后 ReportFinalResult 被调用时：
+ * - is_trial == false → 正常启动，不上报最终结果
+ * - is_trial == true  → 升级后首次启动，代码能跑到这 = 新 App 健康 = 升级成功
+ *   Boot 写了 TRIAL 但 CONFIRM 由 Monitor 任务在健康 1s 后写入。
+ *   GetStatus 查 phase + commit_state 判断当前确认进度。
+ *   task_id 重启后丢失（RAM 数据没了），用 boot identity 的 sequence 代替。
+ */
 void NetworkUpgrade_ReportFinalResult(void)
 {
     if (!s_initialized) return;
@@ -512,15 +522,17 @@ void NetworkUpgrade_ReportFinalResult(void)
         return;
     }
 
-    /* 查 Boot 身份 */
+    /* 查 Boot 身份（获取 sequence 作为 task_id 标识） */
     UpgradeMessage msg;
+    char task_id_buf[32] = {0};
     if (App_UpgradeGetBootIdentity(&msg))
     {
         printf("[NWUPG] trial boot: seq=%u attempts=%u\r\n",
                (unsigned)msg.sequence, (unsigned)msg.trial_attempts);
+        snprintf(task_id_buf, sizeof(task_id_buf), "seq%u", (unsigned)msg.sequence);
     }
 
-    /* 查 GetStatus */
+    /* 查 GetStatus（不访问存储，只读 RAM 快照） */
     UpgradeEntryPeer peer =
     {
         .source = UPGRADE_STAGE_SOURCE_NETWORK,
@@ -528,32 +540,52 @@ void NetworkUpgrade_ReportFinalResult(void)
     };
     UpgradeStageStatus status;
     UpgradeStageResult ret = UpgradeEntry_GetStatus(&peer, &status);
-    if (ret == UPGRADE_STAGE_OK)
-    {
-        /* 根据状态判断安装结果 */
-        /* TODO: 从 UpgradeStageStatus 解析 phase 和结果 */
-        printf("[NWUPG] GetStatus OK: phase=%d\r\n", (int)status.phase);
-
-        if (status.phase == UPGRADE_STAGE_VERIFIED || status.phase == UPGRADE_STAGE_REBOOT_PENDING)
-        {
-            /* 还在试运行，等确认 */
-            s_phase = 5;   /* installed（待确认） */
-            report_status("", "installed", "trial");
-        }
-        else if (status.phase == UPGRADE_STAGE_IDLE)
-        {
-            /* 已确认或回退完成 */
-            s_phase = 5;
-            report_status("", "installed", "success");
-        }
-        else if (status.phase == UPGRADE_STAGE_ERROR)
-        {
-            s_phase = 6;
-            report_status("", "failed", "E_HEALTH_CHECK");
-        }
-    }
-    else
+    if (ret != UPGRADE_STAGE_OK)
     {
         printf("[NWUPG] GetStatus fail: %s\r\n", UpgradeEntry_ErrorName(ret));
+        /* GetStatus 失败也上报（is_trial=true 说明新 App 在运行） */
+        s_phase = 5;
+        report_status(task_id_buf, "installed", "trial");
+        return;
+    }
+
+    printf("[NWUPG] GetStatus: phase=%s commit=%d err=%s\r\n",
+           UpgradeEntry_PhaseName(status.phase),
+           (int)status.commit_state,
+           UpgradeEntry_ErrorName(status.error));
+
+    /* 根据 phase + commit_state 判断安装结果 */
+    switch (status.phase)
+    {
+        case UPGRADE_STAGE_VERIFIED:
+        case UPGRADE_STAGE_REBOOT_PENDING:
+            /* READY 已提交，试运行中。commit_state 判断 Boot 是否已写确认 */
+            s_phase = 5;
+            if (status.commit_state == UPGRADE_COMMIT_WRITTEN)
+                report_status(task_id_buf, "installed", "confirmed");
+            else
+                report_status(task_id_buf, "installed", "trial");
+            break;
+
+        case UPGRADE_STAGE_IDLE:
+            /* 已确认完成或回退完成。is_trial=true 说明是试运行启动，不是回退 */
+            s_phase = 5;
+            if (status.commit_state == UPGRADE_COMMIT_WRITTEN)
+                report_status(task_id_buf, "installed", "success");
+            else
+                report_status(task_id_buf, "installed", "trial");
+            break;
+
+        case UPGRADE_STAGE_ERROR:
+            /* 健康检查失败 */
+            s_phase = 6;
+            report_status(task_id_buf, "failed", UpgradeEntry_ErrorName(status.error));
+            break;
+
+        default:
+            /* QUIESCING/STAGING 等中间状态 */
+            s_phase = 5;
+            report_status(task_id_buf, "installed", "in_progress");
+            break;
     }
 }

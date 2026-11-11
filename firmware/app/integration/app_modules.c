@@ -44,7 +44,7 @@ _Alignas(8) static StackType_t config_stack[CONFIG_STACK_SIZE_BYTES / sizeof(Sta
 _Alignas(8) static StackType_t modbus_stack[MODBUS_STACK_SIZE_BYTES / sizeof(StackType_t)]  __attribute__((section(".ccmram")));
 _Alignas(8) static StackType_t mqtt_stack[MQTT_STACK_SIZE_BYTES / sizeof(StackType_t)]  __attribute__((section(".ccmram")));
 _Alignas(8) static StackType_t telemetry_stack[TELEMETRY_STACK_SIZE_BYTES / sizeof(StackType_t)]  __attribute__((section(".ccmram")));
-_Alignas(8) static StackType_t monitor_stack[MONITOR_STACK_SIZE_BYTES / sizeof(StackType_t)];
+_Alignas(8) static StackType_t monitor_stack[MONITOR_STACK_SIZE_BYTES / sizeof(StackType_t)] __attribute__((section(".ccmram")));
 
 static StaticTask_t storage_control_block;
 static StaticTask_t config_control_block;

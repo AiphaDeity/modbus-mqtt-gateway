@@ -42,7 +42,7 @@ extern "C" {
 #endif
 
 /* ===== 升级执行任务栈（README 要求 ≥6KiB 普通SRAM，UPGRADE_EXECUTOR_MIN_FREE_STACK_BYTES=4096） ===== */
-#define NETWORK_UPGRADE_TASK_STACK_BYTES  (8U * 1024U)   /* 8KiB，含 HTTP 下载 + SHA + 日志 */
+#define NETWORK_UPGRADE_TASK_STACK_BYTES  (6U * 1024U)   /* 6KiB，README 最低要求 */
 #define NETWORK_UPGRADE_TASK_PRIORITY     osPriorityBelowNormal  /* 低于 MQTT/Telemetry，不抢业务 */
 
 /* ===== 升级通知 JSON 字段上限（防止缓冲溢出） ===== */

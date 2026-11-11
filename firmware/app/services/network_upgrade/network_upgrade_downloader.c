@@ -128,7 +128,6 @@ nw_dl_status_t NetworkDownloader_Fetch(const nw_dl_params_t *params)
         return NW_DL_ERR_CONNECT;
     }
     netconn_set_recvtimeout(conn, 10000);  /* 10s recv 超时 */
-    netconn_set_sendtimeout(conn, 10000);
 
     err = netconn_connect(conn, &ip, port);
     if (err != ERR_OK)
@@ -163,13 +162,13 @@ nw_dl_status_t NetworkDownloader_Fetch(const nw_dl_params_t *params)
     }
 
     /* 5. 收响应头（循环收直到找到 \r\n\r\n） */
-    static char hdr_buf[512];   /* 响应头缓冲 */
+    static char hdr_buf[512] __attribute__((section(".ccmram")));   /* 响应头缓冲 */
     int hdr_len = 0;
     int header_end_pos = -1;    /* \r\n\r\n 结束位置（body 起始在 hdr_buf 中的偏移） */
     struct netbuf *nbuf = NULL;
 
     /* body 残余：如果 header 和 body 在同一个 netbuf，保留 header 后面的 body 数据 */
-    static uint8_t body_residual[NW_DL_RX_BUF_SIZE];
+    static uint8_t body_residual[NW_DL_RX_BUF_SIZE] __attribute__((section(".ccmram")));
     uint32_t body_residual_len = 0;
 
     while (header_end_pos < 0 && hdr_len < (int)sizeof(hdr_buf) - 1)
@@ -203,7 +202,7 @@ nw_dl_status_t NetworkDownloader_Fetch(const nw_dl_params_t *params)
         if (header_end_pos >= 0)
         {
             /* header 后面的残余数据是 body 的开头 */
-            int residual_start = header_end_pos + 1;  /* \r\n\r\n 后第一个字节 */
+            int residual_start = header_end_pos;  /* body 起始在 hdr_buf 中的偏移 */
             /* 但残余可能不在 hdr_buf 里（如果 copy 被截断了），而是还在 netbuf 里 */
             if (copy < dlen)
             {
@@ -261,7 +260,7 @@ nw_dl_status_t NetworkDownloader_Fetch(const nw_dl_params_t *params)
     printf("[NWDL] HTTP %d, Content-Length=%ld\r\n", status, (long)content_len);
 
     /* 7. 循环收 body，每 chunk_size 调回调 */
-    static uint8_t chunk_buf[NW_DL_RX_BUF_SIZE];  /* body 分块缓冲 */
+    static uint8_t chunk_buf[NW_DL_RX_BUF_SIZE] __attribute__((section(".ccmram")));  /* body 分块缓冲 */
     uint32_t offset = 0;
     uint32_t chunk_accum = 0;   /* 当前 chunk 累积字节数 */
 
@@ -298,11 +297,12 @@ nw_dl_status_t NetworkDownloader_Fetch(const nw_dl_params_t *params)
         }
 
         /* 遍历 netbuf 的所有段（pbuf 链可能有多段） */
-        void *seg_data;
-        uint16_t seg_len;
-        netbuf_data(nbuf, &seg_data, &seg_len);
+        void *seg_data = NULL;
+        uint16_t seg_len = 0;
 
         do {
+            /* 每段重新获取数据指针（netbuf_next 后 seg_data/seg_len 失效） */
+            netbuf_data(nbuf, &seg_data, &seg_len);
             uint16_t seg_consumed = 0;
             while (seg_consumed < seg_len && offset + chunk_accum < (uint32_t)content_len)
             {
@@ -329,7 +329,7 @@ nw_dl_status_t NetworkDownloader_Fetch(const nw_dl_params_t *params)
                     chunk_accum = 0;
                 }
             }
-        } while (netbuf_next(nbuf) == ERR_OK);  /* 移到下一段 */
+        } while (netbuf_next(nbuf) == ERR_OK);  /* 移到下一段，回 do 开头重新调 netbuf_data */
 
         netbuf_free(nbuf);
         nbuf = NULL;
