@@ -18,6 +18,7 @@
 #include "stm32f4xx_hal_spi.h"
 #include "main.h"   // 取 SPI_FLASH_CS_Pin / SPI_FLASH_CS_GPIO_Port
 #include <stdio.h>
+#include <string.h>
 
 extern SPI_HandleTypeDef hspi2;
 
@@ -447,4 +448,166 @@ HAL_StatusTypeDef spi_flash_w25q128_write(uint32_t addr, const uint8_t *buf, uin
     flash_unlock();
 
     return HAL_OK;
+}
+
+
+/* ---------- 升级有界I/O ---------- */
+
+/* 绝对期限的间隔必须小于INT32_MAX ms，支持HAL tick回绕。 */
+static uint32_t flash_remaining(uint32_t deadline_ms)
+{
+    int32_t remaining = (int32_t)(deadline_ms - HAL_GetTick());
+    return remaining > 0 ? (uint32_t)remaining : 0U;
+}
+
+/* 使用剩余预算取SPI锁，不沿用普通接口的无限等待。 */
+static HAL_StatusTypeDef flash_lock_until(uint32_t deadline_ms)
+{
+    uint32_t remaining = flash_remaining(deadline_ms);
+    if (remaining == 0U) return HAL_TIMEOUT;
+    if (g_m3_spi2_mutex == NULL) return HAL_ERROR;
+
+    uint64_t ticks = ((uint64_t)remaining * osKernelGetTickFreq() + 999U) / 1000U;
+    osStatus_t st = osMutexAcquire(g_m3_spi2_mutex, (uint32_t)ticks);
+    if (st != osOK) return st == osErrorTimeout ? HAL_TIMEOUT : HAL_ERROR;
+    if (flash_remaining(deadline_ms) == 0U || hspi2.State != HAL_SPI_STATE_READY) {
+        flash_unlock();
+        return flash_remaining(deadline_ms) == 0U ? HAL_TIMEOUT : HAL_BUSY;
+    }
+    return HAL_OK;
+}
+
+/* 一次CS窗口内完成命令与数据，失败仍释放片选。调用方已持锁。 */
+static HAL_StatusTypeDef flash_transfer_until(uint8_t *tx, uint8_t *rx,
+                                              uint16_t len, uint32_t deadline_ms)
+{
+    uint32_t remaining = flash_remaining(deadline_ms);
+    if (remaining == 0U) return HAL_TIMEOUT;
+    flash_cs_low();
+    HAL_StatusTypeDef st = HAL_SPI_TransmitReceive(&hspi2, tx, rx, len, remaining);
+    while ((hspi2.Instance->SR & SPI_SR_BSY) != 0U) {
+        if (flash_remaining(deadline_ms) == 0U) {
+            st = HAL_TIMEOUT;
+            break;
+        }
+    }
+    HAL_GPIO_WritePin(SPI_FLASH_CS_GPIO_Port, SPI_FLASH_CS_Pin, GPIO_PIN_SET);
+    flash_cs_deadtime();
+    return flash_remaining(deadline_ms) == 0U ? HAL_TIMEOUT : st;
+}
+
+/* 读取SR1；传输失败不得用未更新的状态字节判断空闲。 */
+static HAL_StatusTypeDef flash_status_until(uint8_t *status, uint32_t deadline_ms)
+{
+    uint8_t tx[2] = {0x05, 0xFF};
+    uint8_t rx[2] = {0, 0};
+    HAL_StatusTypeDef st = flash_transfer_until(tx, rx, 2U, deadline_ms);
+    if (st == HAL_OK) *status = rx[1];
+    return st;
+}
+
+/* 等待两次连续空闲，避免命令刚发出时BUSY尚未置位；不延长原期限。 */
+static HAL_StatusTypeDef flash_ready_until(uint32_t deadline_ms)
+{
+    uint32_t ready = 0U;
+    do {
+        uint8_t status;
+        HAL_StatusTypeDef st = flash_status_until(&status, deadline_ms);
+        if (st != HAL_OK) return st;
+        ready = (status & 1U) == 0U ? ready + 1U : 0U;
+        if (ready == 2U) return HAL_OK;
+        osDelay(1U);
+    } while (flash_remaining(deadline_ms) != 0U);
+    return HAL_TIMEOUT;
+}
+
+/* 写使能后核对WEL；读失败或保护状态异常时不发修改命令。 */
+static HAL_StatusTypeDef flash_enable_until(uint32_t deadline_ms)
+{
+    uint8_t tx = 0x06;
+    uint8_t rx;
+    uint8_t status;
+    HAL_StatusTypeDef st = flash_ready_until(deadline_ms);
+    if (st == HAL_OK) st = flash_transfer_until(&tx, &rx, 1U, deadline_ms);
+    if (st == HAL_OK) st = flash_status_until(&status, deadline_ms);
+    if (st == HAL_OK && (status & 2U) == 0U) st = HAL_ERROR;
+    return st;
+}
+
+/* 读取一块升级数据；地址、长度及所有等待都受同一期限限制。 */
+HAL_StatusTypeDef spi_flash_w25q128_read_until(uint32_t addr, uint8_t *buf,
+                                             uint32_t len, uint32_t deadline_ms)
+{
+    if (buf == NULL || len == 0U || len > W25Q128_PAGE_SIZE_BYTES ||
+        addr >= W25Q128_FLASH_SIZE_BYTES || len > W25Q128_FLASH_SIZE_BYTES - addr)
+        return HAL_ERROR;
+
+    HAL_StatusTypeDef st = flash_lock_until(deadline_ms);
+    if (st != HAL_OK) return st;
+    uint8_t tx[4 + W25Q128_PAGE_SIZE_BYTES];
+    uint8_t rx[4 + W25Q128_PAGE_SIZE_BYTES];
+    tx[0] = 0x03;
+    tx[1] = (uint8_t)(addr >> 16);
+    tx[2] = (uint8_t)(addr >> 8);
+    tx[3] = (uint8_t)addr;
+    memset(tx + 4, 0xFF, len);
+    uint8_t status;
+    st = flash_status_until(&status, deadline_ms);
+    if (st == HAL_OK && (status & 1U) != 0U) st = flash_ready_until(deadline_ms);
+    if (st == HAL_OK) st = flash_transfer_until(tx, rx, (uint16_t)(4U + len), deadline_ms);
+    if (st == HAL_OK) memcpy(buf, rx + 4, len);
+    flash_unlock();
+    return st;
+}
+
+/* 分页编程；每页开始前复查期限，原命令超时后不继续下一页。 */
+HAL_StatusTypeDef spi_flash_w25q128_write_until(uint32_t addr, const uint8_t *buf,
+                                              uint32_t len, uint32_t deadline_ms)
+{
+    if (buf == NULL || len == 0U || len > W25Q128_PAGE_SIZE_BYTES ||
+        addr >= W25Q128_FLASH_SIZE_BYTES || len > W25Q128_FLASH_SIZE_BYTES - addr)
+        return HAL_ERROR;
+
+    HAL_StatusTypeDef st = flash_lock_until(deadline_ms);
+    if (st != HAL_OK) return st;
+    uint8_t tx[4 + W25Q128_PAGE_SIZE_BYTES];
+    uint8_t rx[4 + W25Q128_PAGE_SIZE_BYTES];
+    uint32_t done = 0U;
+    while (done < len) {
+        uint32_t address = addr + done;
+        uint32_t chunk = W25Q128_PAGE_SIZE_BYTES - address % W25Q128_PAGE_SIZE_BYTES;
+        if (chunk > len - done) chunk = len - done;
+        tx[0] = 0x02;
+        tx[1] = (uint8_t)(address >> 16);
+        tx[2] = (uint8_t)(address >> 8);
+        tx[3] = (uint8_t)address;
+        memcpy(tx + 4, buf + done, chunk);
+        st = flash_enable_until(deadline_ms);
+        if (st == HAL_OK) st = flash_transfer_until(tx, rx, (uint16_t)(4U + chunk), deadline_ms);
+        if (st == HAL_OK) st = flash_ready_until(deadline_ms);
+        if (st != HAL_OK) break;
+        done += chunk;
+    }
+    flash_unlock();
+    return st;
+}
+
+/* 擦除一个对齐扇区或块；不把超时解释为擦除已取消。 */
+HAL_StatusTypeDef spi_flash_w25q128_erase_until(uint32_t addr, bool block64,
+                                              uint32_t deadline_ms)
+{
+    uint32_t size = block64 ? 65536U : W25Q128_SECTOR_SIZE_BYTES;
+    if (addr >= W25Q128_FLASH_SIZE_BYTES || addr % size != 0U ||
+        size > W25Q128_FLASH_SIZE_BYTES - addr) return HAL_ERROR;
+
+    HAL_StatusTypeDef st = flash_lock_until(deadline_ms);
+    if (st != HAL_OK) return st;
+    uint8_t tx[4] = {block64 ? 0xD8 : 0x20,
+                    (uint8_t)(addr >> 16), (uint8_t)(addr >> 8), (uint8_t)addr};
+    uint8_t rx[4];
+    st = flash_enable_until(deadline_ms);
+    if (st == HAL_OK) st = flash_transfer_until(tx, rx, 4U, deadline_ms);
+    if (st == HAL_OK) st = flash_ready_until(deadline_ms);
+    flash_unlock();
+    return st;
 }

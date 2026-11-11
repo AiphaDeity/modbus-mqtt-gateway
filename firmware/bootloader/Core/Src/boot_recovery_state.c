@@ -140,14 +140,12 @@ Boot_UpgradeResult Boot_RecoveryBegin(uint32_t slot, uint32_t package_size, bool
   {
     return BOOT_UPGRADE_IO_ERROR;
   }
-#if UPGRADE_PERSISTENCE_VERSION == 2
   next.operation = UPGRADE_OPERATION_RECOVERY;
   Boot_UpgradeResult reserved = Boot_UpgradeReserveTransaction(&next.tx_id);
   if (reserved != BOOT_UPGRADE_OK)
   {
     return reserved;
   }
-#endif
   // 屏障先落盘，后面即使修复日志中断，也不能把空白记录当作可正常启动。
   const uint8_t active = 0U;
   if (Boot_FlashRecoveryJournalProgram(BARRIER_BASE, &active, 1U) != HAL_OK)

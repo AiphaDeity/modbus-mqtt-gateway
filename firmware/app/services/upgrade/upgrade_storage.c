@@ -610,7 +610,7 @@ UpgradeStageResult UpgradeStorage_Bind(const UpgradeStorageBinding *binding)
   {
     return UPGRADE_STAGE_BUSY;
   }
-  if ((UPGRADE_PERSISTENCE_VERSION != 2U) || !UpgradeTrust_IsReady()
+  if (!UpgradeTrust_IsReady()
       || (binding->protocol_version != UPGRADE_STORAGE_PROTOCOL_VERSION)
       || (osMessageQueueGetMsgSize(binding->requests) != sizeof(UpgradeStorageRequest))
       || (osMessageQueueGetMsgSize(binding->responses) != sizeof(UpgradeStorageResponse)))

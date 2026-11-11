@@ -9,6 +9,7 @@ option(M3_ENABLE_FLASH_PROBE "编译 W25Q128 分层探测（排障专用）" OFF
 
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/storage.c
+    ${CMAKE_CURRENT_LIST_DIR}/storage_runtime.c
     ${CMAKE_CURRENT_LIST_DIR}/storage_time.c
     ${CMAKE_CURRENT_LIST_DIR}/storage_config.c
     ${CMAKE_CURRENT_LIST_DIR}/storage_seq.c
@@ -17,6 +18,9 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/storage_ctrllog.c
     ${CMAKE_CURRENT_LIST_DIR}/storage_record.c
     ${CMAKE_CURRENT_LIST_DIR}/storage_m2.c
+    ${CMAKE_CURRENT_LIST_DIR}/storage_upgrade.c
+    ${CMAKE_CURRENT_LIST_DIR}/storage_upgrade_q.c
+    ${CMAKE_CURRENT_LIST_DIR}/storage_upgrade_tf.c
     ${CMAKE_CURRENT_LIST_DIR}/m3_selftest.c
 )
 

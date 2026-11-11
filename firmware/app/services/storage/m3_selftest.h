@@ -11,7 +11,7 @@
  * 就是只读遍历）。量产时把 M3_SELFTEST_ENABLE 置 0 即可完全移除。
  */
 #ifndef M3_SELFTEST_ENABLE
-#define M3_SELFTEST_ENABLE 1
+#define M3_SELFTEST_ENABLE 0
 #endif
 
 #if M3_SELFTEST_ENABLE

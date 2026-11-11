@@ -82,6 +82,8 @@ Boot 与偏移 App 使用以下预设，从仓库根目录选择并构建：
 | BootReceiveTest | 只读 Flash 一致性诊断，结束后停留 Boot，不接收升级包或跳转 App |
 | BootRecoveryTest | 使用本机测试夹具的串口收包和恢复验证 |
 
+Boot、App及配套工具统一使用持久兼容号2，其他版本拒绝，不自动迁移旧日志。首次部署及M3对接约定见[升级模块说明](firmware/app/services/upgrade/README.md)。
+
 例如在根目录终端执行 `cube-cmake --preset AppDebug`，再执行 `cube-cmake --build --preset AppDebug`。Boot 测试预设需要本机自备 `.local/upgrade-fixture/boot_test_keys.h`，该夹具不随仓库分发。普通 Boot/App 的可信密钥映射通过 `GATEWAY_UPGRADE_TRUST_SOURCE` 接入；未配置时升级入口保持关闭。正常固件构建不依赖测试夹具。
 
 调整目录或切换工具链后，如缓存仍引用旧路径，在命令面板执行 `CMake: Delete Build Directory and Reconfigure`，再执行生成。该操作清除所选构建目录，不影响源码。

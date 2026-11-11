@@ -62,5 +62,9 @@ uint32_t storage_config_get_generation(void);
 
 // 是否存在有效配置
 bool storage_config_has_valid(void);
+/* 只读恢复：全空视为未配置，读取失败或已提交记录损坏返回错误。 */
+HAL_StatusTypeDef storage_config_check(void);
+/* Storage_Task结算时检查RAM配置事务，不代替调用方取消。 */
+bool storage_config_tx_active(void);
 
 #endif /* STORAGE_CONFIG_H */

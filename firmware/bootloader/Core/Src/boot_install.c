@@ -139,12 +139,8 @@ Boot_InstallResult Boot_InstallEnroll(const Boot_PackageFlashSource *source,
     return BOOT_INSTALL_APP_ERROR;
   }
   state.phase = BOOT_UPGRADE_CONFIRMED;
-#if UPGRADE_PERSISTENCE_VERSION == 2
   state.tx_id = tx_id;
   state.operation = UPGRADE_OPERATION_ENROLL;
-#else
-  (void)tx_id;
-#endif
   return (Boot_UpgradeSave(&state) == BOOT_UPGRADE_OK)
        ? BOOT_INSTALL_BOOT_EXISTING : BOOT_INSTALL_STATE_ERROR;
 }
@@ -241,14 +237,12 @@ static Boot_InstallResult Restore(Boot_UpgradeState *state, const uint8_t *publi
   }
   if (state->phase != BOOT_UPGRADE_RESTORING)
   {
-#if UPGRADE_PERSISTENCE_VERSION == 2
     if ((state->phase == BOOT_UPGRADE_CONFIRMED)
         && (Boot_UpgradeReserveTransaction(&state->tx_id) != BOOT_UPGRADE_OK))
     {
       return BOOT_INSTALL_STATE_ERROR;
     }
     state->operation = UPGRADE_OPERATION_RESTORE;
-#endif
     state->phase = BOOT_UPGRADE_RESTORING;
     if (Boot_UpgradeSave(state) != BOOT_UPGRADE_OK)
     {
@@ -307,7 +301,6 @@ Boot_InstallResult Boot_InstallRun(const uint8_t *public_key, const uint8_t *aes
   }
   if (state.phase == BOOT_UPGRADE_TRIAL)
   {
-#if UPGRADE_PERSISTENCE_VERSION == 2
     if (state.trial_attempts < UPGRADE_TRIAL_LIMIT)
     {
       Boot_PackageFlashSource candidate;
@@ -321,7 +314,6 @@ Boot_InstallResult Boot_InstallRun(const uint8_t *public_key, const uint8_t *aes
              ? BOOT_INSTALL_TRIAL_STARTED : BOOT_INSTALL_STATE_ERROR;
       }
     }
-#endif
     return Restore(&state, public_key, aes_key);
   }
   if (state.phase == BOOT_UPGRADE_RESTORING)
@@ -362,9 +354,7 @@ Boot_InstallResult Boot_InstallRun(const uint8_t *public_key, const uint8_t *aes
     return Restore(&state, public_key, aes_key);
   }
   state.phase = BOOT_UPGRADE_TRIAL;
-#if UPGRADE_PERSISTENCE_VERSION == 2
   state.trial_attempts = 1U;
-#endif
   // 先持久消耗放行机会，才允许后续邮箱和跳转；记录后掉电也计入次数。
   return (Boot_UpgradeSave(&state) == BOOT_UPGRADE_OK)
        ? BOOT_INSTALL_TRIAL_STARTED : BOOT_INSTALL_STATE_ERROR;

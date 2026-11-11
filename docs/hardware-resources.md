@@ -53,7 +53,7 @@ NVIC 使用 4 位抢占优先级、无子优先级。**NVIC 数字越小优先�
 | SDIO RX/TX | DMA2 Stream3 / Ch4 | Peripheral Flow Control / Very High；Word、FIFO Full、INCR4 | 5 / SDIO=5 |
 | USART1 TX | DMA2 Stream7 / Ch4 | Normal / Low | 7 / USART1=7 |
 
-SDIO 读写复用一个 DMA 流，由 M3 串行使用并切换方向。SPI2 后续若增加 DMA，须重新检查与 USART3 TX 等流的冲突。ETH 使用独立 DMA，ETH IRQ=5；TIM7 IRQ=5；TIM6、SysTick 和 PendSV 为 15。
+SDIO生成配置保留一个复用DMA流；当前Storage_Task文件路径使用限时同步轮询回调。SPI2 后续若增加 DMA，须重新检查与 USART3 TX 等流的冲突。ETH 使用独立 DMA，ETH IRQ=5；TIM7 IRQ=5；TIM6、SysTick 和 PendSV 为 15。
 
 ## 任务入口与初始预算
 
@@ -69,6 +69,6 @@ SDIO 读写复用一个 DMA 流，由 M3 串行使用并切换方向。SPI2 后�
 | M4 监督 | `Monitor_Init` / `Monitor_Task` | AboveNormal，32 | 2KiB |
 | 默认启动任务 | `StartDefaultTask` → `App_Entry` | Normal，24 | 2KiB |
 
-Modbus和监督已绑定；Storage、Config、MQTT、Telemetry入口仍为`NULL`，不会由装配层创建这些任务。六组模块栈的源码配置合计19KiB，实际保留量受链接回收影响，以map为准。存储及监督栈使用普通SRAM，其余模块栈标记为CCM，不能将栈缓冲交给DMA。默认启动任务装配完成后退出；监督任务在网络及业务初始化前启动。ETH接收/tcpip线程由网络适配创建，优先级约定为High（40）/AboveNormal（32），不在装配层重复创建。
+Storage、Modbus和监督已绑定；Config、MQTT、Telemetry入口仍为`NULL`。六组模块栈的源码配置合计19KiB，实际保留量受链接回收影响，以map为准。存储及监督栈使用普通SRAM，其余模块栈标记为CCM，不能将栈缓冲交给DMA。默认启动任务装配完成后退出；监督任务在网络及业务初始化前启动。ETH接收/tcpip线程由网络适配创建，优先级约定为High（40）/AboveNormal（32），不在装配层重复创建。
 
-初始化在调度器运行后准备本模块基础对象，耗时恢复放进所属任务。就绪状态通过 `app_readiness.h` 上报；初始化或任务创建成功不等于外设/业务就绪。升级入口仍待真实存储、权限和暂停回调绑定，业务健康进展须由所属任务报告。
+初始化在调度器运行后准备本模块基础对象，耗时恢复放进所属任务。就绪状态通过 `app_readiness.h` 上报；初始化或任务创建成功不等于外设/业务就绪。存储队列、暂停/结算/同步和健康报告已接入；真实信任资料、权限及其他模块回调仍待齐备。

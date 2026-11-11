@@ -421,13 +421,11 @@ BootReceiveResult Boot_ReceivePackage(const uint8_t *public_key, const uint8_t *
     return BOOT_RECEIVE_COMMAND;
   }
   uint64_t tx_id = 0U;
-#if UPGRADE_PERSISTENCE_VERSION == 2
   if (Boot_UpgradeReserveTransaction(&tx_id) != BOOT_UPGRADE_OK)
   {
     (void)Boot_ReceiveReply("PKG TX_NOT_READY\r\n");
     return BOOT_RECEIVE_COMMAND;
   }
-#endif
   char reply[80];
   (void)snprintf(reply, sizeof(reply), "PKG READY %08lX\r\n", (unsigned long)source.address);
   if (!Boot_ReceiveReply(reply))
@@ -477,11 +475,9 @@ BootReceiveResult Boot_ReceivePackage(const uint8_t *public_key, const uint8_t *
     return BOOT_RECEIVE_COMMAND;
   }
   state.phase = BOOT_UPGRADE_READY;
-#if UPGRADE_PERSISTENCE_VERSION == 2
   state.tx_id = tx_id;
   state.trial_attempts = 0U;
   state.operation = UPGRADE_OPERATION_INSTALL;
-#endif
   state.candidate.slot = (source.address == FLASH_PART_FW_A_BASE) ? 1U : 2U;
   state.candidate.size = source.size;
   memcpy(state.candidate.digest, manifest + 60U, sizeof(state.candidate.digest));

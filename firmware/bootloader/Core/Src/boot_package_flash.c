@@ -350,33 +350,23 @@ HAL_StatusTypeDef Boot_FlashRead(uint32_t address, uint8_t *data, uint16_t size)
 // 用减法先检查区间，再计算物理偏移，避免不可信长度触发加法溢出。
 HAL_StatusTypeDef Boot_FlashTransactionErase(uint32_t address)
 {
-#if UPGRADE_PERSISTENCE_VERSION == 2
   uint32_t start = FLASH_PART_UPGLOG_BASE + UPGRADE_STATE_TRANSACTION_OFFSET;
   if ((address == start) || (address == start + BOOT_FLASH_SECTOR_SIZE))
   {
     return Boot_FlashEraseChecked(address);
   }
-#else
-  (void)address;
-#endif
   return HAL_ERROR;
 }
 
 // 仅在事务号双副本区编程数据。
 HAL_StatusTypeDef Boot_FlashTransactionProgram(uint32_t address, const uint8_t *data, uint16_t size)
 {
-#if UPGRADE_PERSISTENCE_VERSION == 2
   uint32_t start = FLASH_PART_UPGLOG_BASE + UPGRADE_STATE_TRANSACTION_OFFSET;
   uint32_t end = start + 2U * BOOT_FLASH_SECTOR_SIZE;
   if ((address >= start) && (address < end) && (size <= end - address))
   {
     return Boot_FlashProgramChecked(address, data, size);
   }
-#else
-  (void)address;
-  (void)data;
-  (void)size;
-#endif
   return HAL_ERROR;
 }
 

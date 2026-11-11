@@ -43,13 +43,9 @@ bool UpgradeMailbox_Read(const volatile uint32_t *buffer, UpgradeMessage *messag
   if ((words[0] != MAILBOX_MAGIC) || (buffer[0] != MAILBOX_MAGIC)
       || (words[1] != UPGRADE_PERSISTENCE_VERSION) || (words[2] < UPGRADE_MESSAGE_NORMAL)
       || (words[2] > UPGRADE_MESSAGE_RECOVERY_CONFIRM)
-#if UPGRADE_PERSISTENCE_VERSION == 1
-      || (words[12] != 0U) || (words[13] != 0U) || (words[14] != 0U)
-#else
       || ((words[12] == 0U) && (words[13] == 0U)) || (words[3] == 0U)
       || (words[14] > UPGRADE_TRIAL_LIMIT)
       || ((words[2] != UPGRADE_MESSAGE_NORMAL) && (words[14] == 0U))
-#endif
       || (words[15] != MessageCrc(words)))
   {
     return false;
@@ -85,11 +81,9 @@ void UpgradeMailbox_Write(volatile uint32_t *buffer, const UpgradeMessage *messa
   words[1] = UPGRADE_PERSISTENCE_VERSION;
   words[2] = (uint32_t)message->kind;
   words[3] = message->sequence;
-#if UPGRADE_PERSISTENCE_VERSION == 2
   words[12] = (uint32_t)message->tx_id;
   words[13] = (uint32_t)(message->tx_id >> 32U);
   words[14] = message->trial_attempts;
-#endif
   for (uint32_t i = 0U; i < sizeof(message->digest); i++)
   {
     words[4U + i / 4U] |= (uint32_t)message->digest[i] << (8U * (i % 4U));

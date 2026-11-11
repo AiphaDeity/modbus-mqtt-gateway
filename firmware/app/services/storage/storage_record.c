@@ -13,6 +13,9 @@
  *   - 删除（ack）只推进水位，不重写文件；段复用时未 ack 记录计入 dropped
  */
 
+#include "storage_runtime.h"
+#include "sdcard_tf.h"
+#include "main.h"
 #include "storage_record.h"
 #include "flash_partition.h"
 #include "spi_flash_w25q128.h"
@@ -67,6 +70,7 @@ static uint64_t s_last_pos_seq   = 0;
 
 static FIL      s_cur_file;
 static bool     s_file_open = false;
+static bool     s_sync_failed;
 
 /* 环状态节流落盘 */
 static bool     s_state_dirty  = false;
@@ -313,76 +317,65 @@ static bool state_unpack(const uint8_t *buf, ring_state_t *st)
 }
 
 /* 立即落盘环状态（写 gen 较旧的副本） */
-static void state_store_now(void)
+static HAL_StatusTypeDef state_store_now(void)
 {
-    ring_state_t st = {
-        .gen        = s_gen + 1U,
-        .cur_seg    = s_cur_seg,
-        .next_slot  = s_next_slot,
-        .ack_wm     = s_ack_wm,
-        .last_seq   = s_last_seq,
-        .dropped    = s_dropped,
-        .fetch_seg  = s_fetch_seg,
-        .fetch_slot = s_fetch_slot,
+    if (s_gen == UINT32_MAX || s_cur_seg < 0) return HAL_ERROR;
+    ring_state_t state = {
+        .gen = s_gen + 1U, .cur_seg = s_cur_seg, .next_slot = s_next_slot,
+        .ack_wm = s_ack_wm, .last_seq = s_last_seq, .dropped = s_dropped,
+        .fetch_seg = s_fetch_seg, .fetch_slot = s_fetch_slot
     };
-
-    uint8_t buf[RSTATE_SIZE];
-    state_pack(buf, &st);
-
-    int target = (s_rstate_newer == 0) ? 1 : 0;
-    const uint32_t addr[2] = { FLASH_RING_STATE_A_ADDR, FLASH_RING_STATE_B_ADDR };
-
-    bool ok = false;
-    if (spi_flash_w25q128_sector_erase(addr[target]) == HAL_OK) {
-        if (spi_flash_w25q128_write(addr[target], buf, sizeof(buf)) == HAL_OK) {
-            s_rstate_newer = target;
-            s_gen   = st.gen;
-            ok = true;
-        }
+    uint8_t data[RSTATE_SIZE], check[RSTATE_SIZE];
+    state_pack(data, &state);
+    const uint32_t addr[2] = {FLASH_RING_STATE_A_ADDR, FLASH_RING_STATE_B_ADDR};
+    int target = s_rstate_newer == 0 ? 1 : 0;
+    HAL_StatusTypeDef st = storage_flash_erase(addr[target]);
+    if (st == HAL_OK) st = storage_flash_write(addr[target], data, sizeof(data));
+    if (st == HAL_OK) st = storage_flash_read(addr[target], check, sizeof(check));
+    if (st == HAL_OK && memcmp(data, check, sizeof(data)) != 0) st = HAL_ERROR;
+    if (st == HAL_OK) {
+        s_rstate_newer = target;
+        s_gen = state.gen;
+        s_state_dirty = false;
+        s_appends_since = 0U;
     }
-
-    /*
-     * 只有写成功才清 dirty。原实现无条件清，一旦擦除/写入失败，
-     * 这块状态就再不会被重试 —— ack 水位、cur_seg 会永久停在旧值，
-     * 直到下一次段切换才可能被救回来。
-     */
-    if (ok) {
-        s_state_dirty   = false;
-        s_appends_since = 0;
-    }
-    /* 失败时也要刷新时间戳，否则 maintenance 每轮都会重试 */
     s_last_persist_tick = HAL_GetTick();
+    return st;
 }
 
 /* 上电读环状态：双副本取 gen 较大的有效份 */
-static bool state_load(ring_state_t *out)
+static HAL_StatusTypeDef state_load(ring_state_t *out, bool *found)
 {
-    static const uint32_t addr[2] = { FLASH_RING_STATE_A_ADDR, FLASH_RING_STATE_B_ADDR };
-    uint8_t buf[RSTATE_SIZE];
-    ring_state_t st[2];
-    bool ok[2] = { false, false };
-
+    const uint32_t addr[2] = {FLASH_RING_STATE_A_ADDR, FLASH_RING_STATE_B_ADDR};
+    uint8_t data[RSTATE_SIZE];
+    ring_state_t copies[2];
+    bool valid[2] = {false, false};
+    bool blank[2] = {true, true};
+    *found = false;
     for (int i = 0; i < 2; i++) {
-        if (spi_flash_w25q128_read(addr[i], buf, sizeof(buf)) != HAL_OK) continue;
-        if (!state_unpack(buf, &st[i])) continue;
-        ok[i] = true;
+        HAL_StatusTypeDef st = storage_flash_read(addr[i], data, sizeof(data));
+        if (st != HAL_OK) return st;
+        for (uint32_t j = 0U; j < sizeof(data); j++)
+            if (data[j] != 0xFFU) blank[i] = false;
+        valid[i] = state_unpack(data, &copies[i]);
     }
-
-    int sel = -1;
-    if (ok[0] && ok[1])      sel = (st[1].gen > st[0].gen) ? 1 : 0;
-    else if (ok[0])          sel = 0;
-    else if (ok[1])          sel = 1;
-    if (sel < 0) return false;
-
-    *out = st[sel];
-    s_rstate_newer = sel;   /* 让 state_store_now 下一次写"较旧的那份" */
-    return true;
+    if (!valid[0] && !valid[1]) return blank[0] && blank[1] ? HAL_OK : HAL_ERROR;
+    int selected = !valid[0] || (valid[1] && copies[1].gen > copies[0].gen) ? 1 : 0;
+    *out = copies[selected];
+    s_rstate_newer = selected;
+    *found = true;
+    return HAL_OK;
 }
 
 /* ---------- 对外 API ---------- */
 
-HAL_StatusTypeDef storage_record_init(void)
+static HAL_StatusTypeDef storage_record_init_impl(void)
 {
+    if (s_state_dirty || s_sync_failed) return HAL_BUSY;
+    if (s_file_open) {
+        if (f_close(&s_cur_file) != FR_OK) return HAL_ERROR;
+        s_file_open = false;
+    }
     FRESULT fr;
 
     s_ready   = false;
@@ -415,14 +408,7 @@ HAL_StatusTypeDef storage_record_init(void)
     if (fr == FR_INVALID_DRIVE) {
         return HAL_ERROR;
     }
-    if (fr != FR_OK) {
-        /* 可能是全新卡：主动格式化一次再挂载 */
-        uint8_t workbuf[512];
-        fr = f_mkfs(SDPath, 0, 0, workbuf, sizeof(workbuf));
-        if (fr != FR_OK) return HAL_ERROR;
-        fr = f_mount(&SDFatFS, SDPath, 1);
-        if (fr != FR_OK) return HAL_ERROR;
-    }
+    if (fr != FR_OK) return HAL_ERROR;   /* 不因读失败自动格式化介质。 */
 
     fr = f_mkdir("/records");
     if (fr != FR_OK && fr != FR_EXIST) return HAL_ERROR;
@@ -430,11 +416,16 @@ HAL_StatusTypeDef storage_record_init(void)
     /* —— 快路径：用 W25Q128 环状态恢复 —— */
     ring_state_t st;
 
-    if (state_load(&st)) {
+    bool found;
+    HAL_StatusTypeDef load = state_load(&st, &found);
+    if (load != HAL_OK) return load;
+    if (found) {
         char path[64];
         seg_path(st.cur_seg, path, sizeof(path));
         FILINFO fi;
-        bool seg_exists = (f_stat(path, &fi) == FR_OK && fi.fsize > 0);
+        fr = f_stat(path, &fi);
+        if (fr != FR_OK) return HAL_ERROR;
+        bool seg_exists = fi.fsize > 0;
 
         if (seg_exists && open_segment(st.cur_seg, false) == FR_OK) {
             /* 兼容旧环状态（曾从 0 起算）：把水位抬到基准值 */
@@ -451,14 +442,15 @@ HAL_StatusTypeDef storage_record_init(void)
             s_fetch_slot = st.fetch_slot;
 
             uint32_t ns = 0;
-            if (scan_seg_forward(&s_cur_file, s_next_slot, &ns, &s_last_seq) == FR_OK) {
-                s_next_slot = ns;
-            }
+            if (scan_seg_forward(&s_cur_file, s_next_slot, &ns, &s_last_seq) != FR_OK)
+                return HAL_ERROR;
+            s_next_slot = ns;
 
             s_ready = true;
             s_state_dirty = true;
-            state_store_now();   /* 把修正后的 next_slot/last_seq 立即落盘 */
-            return HAL_OK;
+            HAL_StatusTypeDef saved = state_store_now();
+            if (saved != HAL_OK) s_ready = false;
+            return saved;
         }
         /* 段文件丢了 → 落到下面的全盘扫描 */
     }
@@ -468,7 +460,7 @@ HAL_StatusTypeDef storage_record_init(void)
     uint32_t found_last_slot = 0;
     uint64_t max_seq_all = 0;
 
-    for (int i = 0; i < RECORD_SEGMENT_COUNT; i++) {
+    for (int i = 0; i < (int)RECORD_SEGMENT_COUNT; i++) {
         FILINFO fi;
         char path[64];
         seg_path(i, path, sizeof(path));
@@ -501,11 +493,12 @@ HAL_StatusTypeDef storage_record_init(void)
 
     s_ready = true;
     s_state_dirty = true;
-    state_store_now();
-    return HAL_OK;
+    HAL_StatusTypeDef saved = state_store_now();
+    if (saved != HAL_OK) s_ready = false;
+    return saved;
 }
 
-HAL_StatusTypeDef storage_record_append(uint8_t kind, uint64_t seq,
+static HAL_StatusTypeDef storage_record_append_impl(uint8_t kind, uint64_t seq,
                                         uint64_t captured_at_ms,
                                         const void *payload, uint16_t len)
 {
@@ -574,7 +567,11 @@ HAL_StatusTypeDef storage_record_append(uint8_t kind, uint64_t seq,
         s_state_dirty = true;
         return HAL_ERROR;
     }
-    f_sync(&s_cur_file);
+    if (f_sync(&s_cur_file) != FR_OK) {
+        s_sync_failed = true;
+        s_state_dirty = true;
+        return HAL_ERROR;
+    }
 
     /* 2) 最后写提交尾标 */
     uint32_t commit = RECORD_COMMIT;
@@ -589,7 +586,11 @@ HAL_StatusTypeDef storage_record_append(uint8_t kind, uint64_t seq,
         s_state_dirty = true;
         return HAL_ERROR;
     }
-    f_sync(&s_cur_file);
+    if (f_sync(&s_cur_file) != FR_OK) {
+        s_sync_failed = true;
+        s_state_dirty = true;
+        return HAL_ERROR;
+    }
 
     s_next_slot++;
     s_appends_since++;
@@ -597,7 +598,7 @@ HAL_StatusTypeDef storage_record_append(uint8_t kind, uint64_t seq,
     return HAL_OK;
 }
 
-void storage_record_ack_upto(uint64_t ack_upto_seq)
+static void storage_record_ack_upto_impl(uint64_t ack_upto_seq)
 {
     if (!s_ready) return;
     if (ack_upto_seq <= s_ack_wm) return;
@@ -758,7 +759,7 @@ uint64_t storage_record_last_seq(void)
     return s_last_seq;
 }
 
-void storage_record_maintenance(void)
+static void storage_record_maintenance_impl(void)
 {
     if (!s_ready || !s_state_dirty) return;
     if (s_appends_since >= RSTATE_PERSIST_APPENDS ||
@@ -776,24 +777,101 @@ bool storage_record_is_ready(void)
 
 void storage_record_unmount(void)
 {
-    /* 1. 关闭当前段文件（如果打开） */
-    if (s_file_open) {
-        (void)f_close(&s_cur_file);
-        s_file_open = false;
-    }
-
-    /* 2. 强制把 Flash 环状态落盘（以防上次 dirty 没写） */
-    if (s_state_dirty) {
-        state_store_now();
-        s_state_dirty = false;
-    }
-
-    /* 3. FatFs 卸载 — 释放对底层 SDIO 的引用 */
+    /* 物理介质已变化，不向新卡或失联卡补写旧FILE缓存。 */
     (void)f_mount(NULL, SDPath, 0);
-
-    /* 4. 清所有状态 — init() 会重新填充 */
+    s_file_open = false;
     s_ready = false;
-    s_cur_seg = -1;
+    if (!s_state_dirty) s_cur_seg = -1;
     s_last_pos_valid = false;
-    s_state_dirty = false;
+}
+
+/* 在正常业务阶段恢复记录环，不自动格式化异常介质。 */
+HAL_StatusTypeDef storage_record_init(void)
+{
+    if (!storage_mutation_begin()) return HAL_BUSY;
+    HAL_StatusTypeDef st = storage_record_init_impl();
+    storage_mutation_end();
+    return st;
+}
+
+/* 持久保存记录正文及提交尾标，文件同步失败不报成功。 */
+HAL_StatusTypeDef storage_record_append(uint8_t kind, uint64_t seq, uint64_t captured_at_ms, const void *payload, uint16_t len)
+{
+    if (!storage_mutation_begin()) return HAL_BUSY;
+    HAL_StatusTypeDef st = storage_record_append_impl(kind, seq, captured_at_ms, payload, len);
+    storage_mutation_end();
+    return st;
+}
+
+/* 登记已确认水位和待保存游标，暂停时保留原状态。 */
+void storage_record_ack_upto(uint64_t ack_upto_seq)
+{
+    if (!storage_mutation_begin()) return;
+    storage_record_ack_upto_impl(ack_upto_seq);
+    storage_mutation_end();
+}
+
+/* 按既定阈值刷新脏环状态，失败保留重试依据。 */
+void storage_record_maintenance(void)
+{
+    if (!storage_mutation_begin()) return;
+    storage_record_maintenance_impl();
+    storage_mutation_end();
+}
+
+/* 只读恢复不建目录、不建段、不迁移、不推进游标或写回环状态。 */
+HAL_StatusTypeDef storage_record_restore(void)
+{
+    s_ready = false;
+    if (HAL_GPIO_ReadPin(SD_CARD_DET_GPIO_Port, SD_CARD_DET_Pin) != GPIO_PIN_RESET) return HAL_OK;
+    FRESULT fr = f_mount(&SDFatFS, SDPath, 1);
+    if (fr == FR_NOT_READY || fr == FR_NO_FILESYSTEM) {
+        printf("[M3] TF read-only mount unavailable fr=%u\r\n", (unsigned)fr);
+        return HAL_OK;
+    }
+    if (fr != FR_OK) return HAL_ERROR;
+    ring_state_t state;
+    bool found;
+    s_last_seq = RECORD_SEQ_INITIAL_WM;
+    HAL_StatusTypeDef st = state_load(&state, &found);
+    if (st != HAL_OK) return st;
+    if (!found) {
+        for (int i = 0; i < (int)RECORD_SEGMENT_COUNT; i++) {
+            char path[64];
+            FILINFO info;
+            seg_path(i, path, sizeof(path));
+            fr = f_stat(path, &info);
+            if (fr == FR_OK && info.fsize != 0U) return HAL_ERROR;
+            if (fr != FR_OK && fr != FR_NO_FILE && fr != FR_NO_PATH) return HAL_ERROR;
+        }
+        return HAL_OK;
+    }
+    s_last_seq = state.last_seq;
+    char path[64];
+    seg_path(state.cur_seg, path, sizeof(path));
+    FIL file;
+    fr = f_open(&file, path, FA_READ);
+    if (fr != FR_OK) return HAL_ERROR;
+    bool valid = f_size(&file) <= RECORD_SEGMENT_SIZE &&
+                 f_size(&file) >= (FSIZE_t)state.next_slot * RECORD_SLOT_SIZE;
+    if (valid && state.next_slot != 0U) {
+        uint8_t slot[RECORD_SLOT_SIZE];
+        UINT actual = 0U;
+        fr = f_lseek(&file, (FSIZE_t)(state.next_slot - 1U) * RECORD_SLOT_SIZE);
+        if (fr == FR_OK) fr = f_read(&file, slot, sizeof(slot), &actual);
+        valid = fr == FR_OK && actual == sizeof(slot) && parse_slot(slot, NULL);
+    }
+    if (f_close(&file) != FR_OK) return HAL_ERROR;
+    return valid && !storage_runtime_expired() ? HAL_OK : HAL_ERROR;
+}
+
+/* 已暂停生产且没有在途变更后，刷文件及环状态；缺卡且无对象可正常降级。 */
+HAL_StatusTypeDef storage_record_sync(void)
+{
+    if (!storage_runtime_is_owner()) return HAL_BUSY;
+    if (s_sync_failed) return HAL_ERROR;
+    if (s_file_open && f_sync(&s_cur_file) != FR_OK) return HAL_ERROR;
+    if (storage_runtime_expired()) return HAL_TIMEOUT;
+    if (s_state_dirty) return state_store_now();
+    return HAL_OK;
 }

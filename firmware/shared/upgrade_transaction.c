@@ -2,7 +2,6 @@
 
 #include <string.h>
 
-#if UPGRADE_PERSISTENCE_VERSION == 2
 #define RECORD_SIZE 128U
 #define COMMIT_OFFSET 256U
 #define SECTOR_SIZE 4096U
@@ -151,7 +150,6 @@ static UpgradeStateResult Commit(const UpgradeTransactionStorage *storage,
       && (check.last_allocated == state->last_allocated)
        ? UPGRADE_STATE_OK : UPGRADE_STATE_CORRUPT;
 }
-#endif
 
 // 按当前持久基线读取事务号高水位。
 UpgradeStateResult UpgradeTransaction_Load(const UpgradeTransactionStorage *storage,
@@ -166,12 +164,8 @@ UpgradeStateResult UpgradeTransaction_Load(const UpgradeTransactionStorage *stor
   {
     return UPGRADE_STATE_INVALID;
   }
-#if UPGRADE_PERSISTENCE_VERSION == 2
   uint32_t selected = 0U;
   return Load(storage, state, &selected);
-#else
-  return UPGRADE_STATE_UNSUPPORTED;
-#endif
 }
 
 // 持久递增事务号高水位，读回成功后才交付编号。
@@ -188,7 +182,6 @@ UpgradeStateResult UpgradeTransaction_Reserve(const UpgradeTransactionStorage *s
   {
     return UPGRADE_STATE_INVALID;
   }
-#if UPGRADE_PERSISTENCE_VERSION == 2
   UpgradeTransactionState state;
   uint32_t selected = 0U;
   UpgradeStateResult result = Load(storage, &state, &selected);
@@ -208,9 +201,6 @@ UpgradeStateResult UpgradeTransaction_Reserve(const UpgradeTransactionStorage *s
     *tx_id = state.last_allocated;
   }
   return result;
-#else
-  return UPGRADE_STATE_UNSUPPORTED;
-#endif
 }
 
 // 确认升级元数据全为空白后，建立初始事务号记录。
@@ -220,7 +210,6 @@ UpgradeStateResult UpgradeTransaction_Initialize(const UpgradeTransactionStorage
   {
     return UPGRADE_STATE_INVALID;
   }
-#if UPGRADE_PERSISTENCE_VERSION == 2
   uint8_t data[256];
   // 首次配置还须确认状态日志/屏障全空；不能给已有事务却丢了高水位的设备归零。
   for (uint32_t offset = 0U;
@@ -237,7 +226,4 @@ UpgradeStateResult UpgradeTransaction_Initialize(const UpgradeTransactionStorage
   }
   UpgradeTransactionState initial = {1U, 0U};
   return Commit(storage, &initial, 0U, false);
-#else
-  return UPGRADE_STATE_UNSUPPORTED;
-#endif
 }

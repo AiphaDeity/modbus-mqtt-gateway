@@ -38,17 +38,15 @@ def query_status(port):
     try:
         fields = dict(item.split("=", 1) for item in line.split()[2:])
         status = {key: int(fields[key]) for key in
-                  ("normal", "recovery", "phase", "sequence", "protected", "source")}
+                  ("normal", "recovery", "phase", "sequence", "protected", "source", "compat")}
     except (KeyError, ValueError) as error:
         raise RuntimeError("设备状态响应不完整") from error
     if (status["normal"] not in (0, 1, 2, 3, 5) or status["recovery"] not in (0, 1, 2, 3, 5)
             or status["phase"] not in range(8) or status["protected"] not in range(3)
             or status["source"] not in range(3) or not 0 <= status["sequence"] <= 0xFFFFFFFF):
         raise RuntimeError("设备状态值不受当前协议支持")
-    if "compat" in fields:
-        status["compat"] = int(fields["compat"])
-        if status["compat"] not in (1, 2):
-            raise RuntimeError("设备持久基线不受支持")
+    if status["compat"] != 2:
+        raise RuntimeError("设备持久兼容版本必须为2，未发送擦写请求")
     for key in ("tx_state", "tx_generation", "normal_phase", "normal_sequence", "attempts"):
         if key in fields:
             status[key] = int(fields[key])
@@ -57,9 +55,9 @@ def query_status(port):
     return status
 
 
-def check_package(package, persistence_version=1):
+def check_package(package, persistence_version=2):
     """发送前只做格式准入检查，不能替代设备端的完整认证。"""
-    if persistence_version not in (1, 2):
+    if persistence_version != 2:
         raise ValueError("不支持的持久兼容版本")
     if not 216 <= len(package) <= 448 * 1024 + 208 or package[:8] != b"GWUPD001":
         raise ValueError("输入必须是包含 App 向量的 V2 加密 .upd 包，不能是原始 bin")
@@ -78,19 +76,19 @@ def check_package(package, persistence_version=1):
 
 
 # 读取加密包并执行发送前格式检查。
-def read_package(path, persistence_version=1):
+def read_package(path, persistence_version=2):
     package = path.read_bytes()
     check_package(package, persistence_version)
     return package
 
 
 # 核对设备保护状态，向指定槽发送恢复包并等待首次试运行结果。
-def recover(port, package, slot, allow_unknown=False, persistence_version=1):
+def recover(port, package, slot, allow_unknown=False, persistence_version=2):
     if slot not in ("A", "B"):
         raise ValueError("恢复槽只能为 A 或 B")
     check_package(package, persistence_version)
     status = query_status(port)
-    if status.get("compat", 1) != persistence_version:
+    if status["compat"] != persistence_version:
         raise RuntimeError("设备、包与选择的持久基线不一致，未发送擦写请求")
     if status["normal"] == 5 or status["recovery"] == 5:
         raise RuntimeError("现有日志版本不支持，普通恢复不能隐式迁移或清除它")
@@ -136,18 +134,16 @@ def main():
     action.add_argument("--info", action="store_true", help="只查询，设备留在恢复服务等待命令")
     action.add_argument("--run", action="store_true", help="重试持久事务；正常状态下退出服务启动 App")
     action.add_argument("--initialize-transactions", action="store_true",
-                        help="基线2首次配置事务号；要求全部升级元数据为空白，不擦除已有数据")
+                        help="首次配置事务号；要求全部升级元数据为空白，不擦除已有数据")
     action.add_argument("--package", type=Path, help="要恢复的加密 .upd 包")
     parser.add_argument("--erase-slot", choices=("A", "B"), help="明确允许覆盖的整个固件包槽")
     parser.add_argument("--allow-unknown-state", action="store_true", help="显式允许处理损坏元数据，不绕过读错误或旧包保护")
-    parser.add_argument("--persistence-version", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--persistence-version", type=int, choices=(2,), default=2)
     args = parser.parse_args()
     if args.package and not args.erase_slot:
         parser.error("发送恢复包必须明确指定 --erase-slot A 或 B")
     if not args.package and (args.erase_slot or args.allow_unknown_state):
         parser.error("擦写选项只能与 --package 一起使用")
-    if args.initialize_transactions and args.persistence_version != 2:
-        parser.error("事务号首次配置仅适用于明确选择的持久基线2")
     package = read_package(args.package, args.persistence_version) if args.package else None
     import serial
 
@@ -159,8 +155,6 @@ def main():
             status = query_status(port)
             print(status)
             if args.initialize_transactions:
-                if status.get("compat", 1) != 2:
-                    raise RuntimeError("设备不是持久基线2，未发送初始化请求")
                 if (status["normal"] != 0 or status["recovery"] != 0 or status.get("tx_state") != 0):
                     raise RuntimeError("升级元数据不是首次全空状态，未发送初始化请求")
                 send_request(port, b"GWRTINIT")

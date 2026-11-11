@@ -122,7 +122,7 @@ static AppModuleSlot module_slots[APP_MODULE_COUNT] =
 {
   [APP_MODULE_STORAGE] =
   {
-    .init = NULL/*Storage_Init*/, .task = NULL/*Storage_Task*/, .attributes = &storage_attributes,
+    .init = Storage_Init, .task = Storage_Task, .attributes = &storage_attributes,
     .result = APP_MODULE_INIT_NOT_READY, .task_state = APP_MODULE_TASK_NOT_STARTED
   },
   [APP_MODULE_CONFIG] =

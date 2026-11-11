@@ -8,7 +8,8 @@
             "binaryDir": "${sourceDir}/build/${presetName}",
             "toolchainFile": "${sourceDir}/firmware/app/cmake/gcc-arm-none-eabi.cmake",
             "cacheVariables": {
-                "GATEWAY_FIRMWARE": "app"
+                "GATEWAY_FIRMWARE": "app",
+                "GATEWAY_UPGRADE_PERSISTENCE_VERSION": "2"
             }
         },
         {

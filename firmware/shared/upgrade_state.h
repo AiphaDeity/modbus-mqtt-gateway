@@ -21,15 +21,9 @@
 #define UPGRADE_STATE_RECOVERY_OFFSET 0x2000U
 #define UPGRADE_STATE_BARRIER_OFFSET 0x4000U
 #define UPGRADE_STATE_TRANSACTION_OFFSET 0x5000U
-#if UPGRADE_PERSISTENCE_VERSION == 2
 #define UPGRADE_STATE_METADATA_SIZE 0x7000U
 #define UPGRADE_STATE_NORMAL_MAGIC "GWSTATE2"
 #define UPGRADE_STATE_RECOVERY_MAGIC "GWRCLOG2"
-#else
-#define UPGRADE_STATE_METADATA_SIZE 0x5000U
-#define UPGRADE_STATE_NORMAL_MAGIC "GWSTATE1"
-#define UPGRADE_STATE_RECOVERY_MAGIC "GWRCLOG1"
-#endif
 #define UPGRADE_STATE_NORMAL_COMMIT "CMIT"
 #define UPGRADE_STATE_RECOVERY_COMMIT "RCMT"
 #define UPGRADE_STATE_SLOT_A_MASK 0x01U
@@ -80,8 +74,8 @@ typedef struct
   UpgradeStatePhase phase;
   UpgradeStatePackage confirmed;
   UpgradeStatePackage candidate;
-  uint64_t tx_id;             // 稳定事务号，与每次提交递增的sequence不同；基线1必须为0。
-  uint32_t trial_attempts;    // 已提交的放行机会，跳转前递增；基线1必须为0。
+  uint64_t tx_id;             // 稳定事务号，与每次提交递增的sequence不同。
+  uint32_t trial_attempts;    // 已提交的放行机会，跳转前递增。
   UpgradeStateOperation operation;
 } UpgradeStateRecord;
 

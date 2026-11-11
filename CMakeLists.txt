@@ -7,10 +7,10 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(GATEWAY_FIRMWARE "app" CACHE STRING " Firmware to build: app or bootloader")
 
 # 升级状态记录的格式版本；Boot、App 和制包工具须使用相同版本。
-set(GATEWAY_UPGRADE_PERSISTENCE_VERSION "1" CACHE STRING "Upgrade persistence baseline (1 or 2)")
-set_property(CACHE GATEWAY_UPGRADE_PERSISTENCE_VERSION PROPERTY STRINGS 1 2)
-if(NOT GATEWAY_UPGRADE_PERSISTENCE_VERSION MATCHES "^[12]$")
-    message(FATAL_ERROR "GATEWAY_UPGRADE_PERSISTENCE_VERSION must be 1 or 2")
+set(GATEWAY_UPGRADE_PERSISTENCE_VERSION "2" CACHE STRING "Upgrade persistence version (2 only)")
+set_property(CACHE GATEWAY_UPGRADE_PERSISTENCE_VERSION PROPERTY STRINGS 2)
+if(NOT GATEWAY_UPGRADE_PERSISTENCE_VERSION STREQUAL "2")
+    message(FATAL_ERROR "Only upgrade persistence version 2 is supported; reconfigure with version 2")
 endif()
 
 add_compile_definitions(GATEWAY_UPGRADE_PERSISTENCE_VERSION=${GATEWAY_UPGRADE_PERSISTENCE_VERSION})

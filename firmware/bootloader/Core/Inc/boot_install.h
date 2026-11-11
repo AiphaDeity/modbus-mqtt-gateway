@@ -22,7 +22,7 @@ typedef enum
 /*
  * 仅空白升级日志允许首次建档：认证包，并比较当前 App 的长度范围内摘要和向量。
  * source->address 必须为 A/B 槽起点，source->size 为完整包字节数；不擦写片内 App。
- * 基线2的tx_id须在收包前持久预留，基线1传0；失败不能回收已消耗的ID。
+ * tx_id须在收包前持久预留；失败不能回收已消耗的ID。
  * 成功返回 BOOT_INSTALL_BOOT_EXISTING，其余返回失败原因；不自动信任已存在包。
  */
 Boot_InstallResult Boot_InstallEnroll(const Boot_PackageFlashSource *source,
@@ -31,7 +31,7 @@ Boot_InstallResult Boot_InstallEnroll(const Boot_PackageFlashSource *source,
 /*
  * 根据日志完成安装、重装、回退或恢复，不自行跳转 App。
  * 仅 BOOT_EXISTING、TRIAL_STARTED、RESTORED 允许继续最终认证和跳转检查。
- * TRIAL_STARTED 只允许本次启动；基线 1/2 分别允许一/两次已持久记录的试运行。
+ * TRIAL_STARTED 只允许本次启动；最多放行两次，每次都须先持久记录次数。
  * 健康确认仅接受与当前事务匹配的软件复位请求。
  */
 Boot_InstallResult Boot_InstallRun(const uint8_t *public_key, const uint8_t *aes_key);

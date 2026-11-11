@@ -139,14 +139,12 @@ Boot_InstallResult Boot_RecoveryRun(const uint8_t *public_key, const uint8_t *ae
     if (!Boot_TrialRecoveryConfirmationMatches(&state)
         || !app_matches)
     {
-#if UPGRADE_PERSISTENCE_VERSION == 2
       if ((state.trial_attempts < UPGRADE_TRIAL_LIMIT) && app_matches)
       {
         state.trial_attempts++;
         return Boot_RecoverySave(&state) == BOOT_UPGRADE_OK
              ? BOOT_INSTALL_TRIAL_STARTED : BOOT_INSTALL_STATE_ERROR;
       }
-#endif
       state.phase = BOOT_RECOVERY_BLOCKED;
       // BLOCKED便于诊断；即使保存失败，原TRIAL也不会再次放行未确认App。
       (void)Boot_RecoverySave(&state);
@@ -172,9 +170,7 @@ Boot_InstallResult Boot_RecoveryRun(const uint8_t *public_key, const uint8_t *ae
     return BOOT_INSTALL_APP_ERROR;
   }
   state.phase = BOOT_RECOVERY_TRIAL;
-#if UPGRADE_PERSISTENCE_VERSION == 2
   state.trial_attempts = 1U;
-#endif
   return (Boot_RecoverySave(&state) == BOOT_UPGRADE_OK)
        ? BOOT_INSTALL_TRIAL_STARTED : BOOT_INSTALL_STATE_ERROR;
 }

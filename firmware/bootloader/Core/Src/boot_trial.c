@@ -66,10 +66,7 @@ bool Boot_TrialPrepareApp(volatile uint32_t *mailbox)
   UpgradeMessage message = {0};
   if (result == BOOT_UPGRADE_EMPTY)
   {
-#if UPGRADE_PERSISTENCE_VERSION == 2
     return false;
-#endif
-    message.kind = UPGRADE_MESSAGE_NORMAL;
   }
   else if ((result == BOOT_UPGRADE_OK) && (state.phase == BOOT_UPGRADE_CONFIRMED))
   {

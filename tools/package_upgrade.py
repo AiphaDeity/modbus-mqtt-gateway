@@ -62,9 +62,9 @@ def reserve_nonce(path, aes_key):
         return prefix + struct.pack(">Q", counter)
 
 
-def make_package(firmware, signing_key, aes_key, nonce, *, persistence_version, firmware_version):
+def make_package(firmware, signing_key, aes_key, nonce, *, firmware_version, persistence_version=2):
     """只返回加密包，不写出原始bin、私钥、AES密钥或解密明文。"""
-    if persistence_version not in (1, 2) or not 1 <= firmware_version <= 0xFFFFFFFF:
+    if persistence_version != 2 or not 1 <= firmware_version <= 0xFFFFFFFF:
         raise ValueError("持久兼容版本或固件版本非法")
     if not 8 <= len(firmware) <= 448 * 1024:
         raise ValueError("App必须包含向量，且不超过448 KiB")
@@ -107,17 +107,17 @@ def main():
     parser.add_argument("--signing-key", type=Path, help="受控的P-256 PEM私钥")
     parser.add_argument("--signing-password-env", help="读取该环境变量中的PEM密码，不将密码放进命令行")
     parser.add_argument("--output", type=Path, help="输出加密包；目标必须不存在")
-    parser.add_argument("--persistence-version", type=int, choices=(1, 2))
+    parser.add_argument("--persistence-version", type=int, choices=(2,), default=2)
     parser.add_argument("--firmware-version", type=int)
     parser.add_argument("--iwdg-handoff", action="store_true", help="确认实际App已实现看门狗接管")
     args = parser.parse_args()
     if args.initialize_ledger:
-        if any((args.input, args.signing_key, args.signing_password_env, args.output, args.persistence_version,
+        if any((args.input, args.signing_key, args.signing_password_env, args.output,
                 args.firmware_version, args.iwdg_handoff)):
             parser.error("初始化账本不能同时制作包")
     elif not all((args.input, args.signing_key, args.output, args.persistence_version,
                   args.firmware_version, args.iwdg_handoff)):
-        parser.error("制作包须明确输入/签名私钥/输出/持久版本/固件版本和--iwdg-handoff")
+        parser.error("制作包须明确输入/签名私钥/输出/固件版本和--iwdg-handoff")
     paths = [args.aes_key, args.nonce_ledger, args.input, args.signing_key, args.output]
     resolved = [path.resolve() for path in paths if path is not None]
     if len(resolved) != len(set(resolved)):

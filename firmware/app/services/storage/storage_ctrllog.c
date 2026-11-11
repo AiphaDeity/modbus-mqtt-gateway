@@ -12,6 +12,7 @@
  *     两个区重放恢复；因此重启后仍能抑制重复执行。
  */
 
+#include "storage_runtime.h"
 #include "storage_ctrllog.h"
 #include "flash_partition.h"
 #include "spi_flash_w25q128.h"
@@ -45,6 +46,7 @@ static bool     s_inited   = false;
 static int      s_active   = 0;   /* 当前写入区 */
 static uint32_t s_next_slot = 0;  /* 当前区下一个候选槽 */
 static uint64_t s_last_seq = 0;
+static uint32_t s_erase_offset;
 static int      s_erasing  = -1;  /* >=0 表示正在回收该区 */
 
 /* 去重索引（最近 128 条） */
@@ -141,7 +143,7 @@ static bool parse_slot(const uint8_t *buf, ctrllog_record_t *rec)
 static bool slot_read_valid(int zone, uint32_t index, ctrllog_record_t *rec)
 {
     uint8_t buf[CTRLLOG_SLOT_SIZE];
-    if (spi_flash_w25q128_read(slot_addr(zone, index), buf, CTRLLOG_SLOT_SIZE) != HAL_OK)
+    if (storage_flash_read(slot_addr(zone, index), buf, CTRLLOG_SLOT_SIZE) != HAL_OK)
         return false;
     return parse_slot(buf, rec);
 }
@@ -157,11 +159,14 @@ static HAL_StatusTypeDef scan_zone(int zone, uint32_t *count,
     *max_seq_slot = 0;
 
     for (uint32_t i = 0; i < CTRLLOG_SLOT_COUNT; i++) {
-        if (spi_flash_w25q128_read(slot_addr(zone, i), buf, CTRLLOG_SLOT_SIZE) != HAL_OK)
+        if (storage_flash_read(slot_addr(zone, i), buf, CTRLLOG_SLOT_SIZE) != HAL_OK)
             return HAL_ERROR;
 
         ctrllog_record_t rec;
-        if (!parse_slot(buf, &rec)) continue;
+        if (!parse_slot(buf, &rec)) {
+            if (get_u32(buf + CTRLLOG_COMMIT_OFF) == CTRLLOG_COMMIT) return HAL_ERROR;
+            continue;
+        }
 
         (*count)++;
         if (rec.seq >= *max_seq) {
@@ -178,7 +183,7 @@ static bool find_writable_slot(void)
     uint8_t buf[CTRLLOG_SLOT_SIZE];
 
     for (uint32_t i = s_next_slot; i < CTRLLOG_SLOT_COUNT; i++) {
-        if (spi_flash_w25q128_read(slot_addr(s_active, i), buf, CTRLLOG_SLOT_SIZE) != HAL_OK)
+        if (storage_flash_read(slot_addr(s_active, i), buf, CTRLLOG_SLOT_SIZE) != HAL_OK)
             return false;
         if (slot_is_erased(buf)) {
             s_next_slot = i;
@@ -220,6 +225,7 @@ static void dedup_insert(uint16_t stream, uint64_t key)
 
 HAL_StatusTypeDef storage_ctrllog_init(void)
 {
+    s_erase_offset = 0U;
     uint64_t seq0 = 0, seq1 = 0;
     uint32_t slot0 = 0, slot1 = 0;
     uint32_t cnt0 = 0, cnt1 = 0;
@@ -256,9 +262,12 @@ HAL_StatusTypeDef storage_ctrllog_init(void)
         for (uint32_t i = 0; i < CTRLLOG_SLOT_COUNT; i++) {
             ctrllog_record_t rec;
             uint8_t buf[CTRLLOG_SLOT_SIZE];
-            if (spi_flash_w25q128_read(slot_addr(order[k], i), buf, CTRLLOG_SLOT_SIZE) != HAL_OK)
+            if (storage_flash_read(slot_addr(order[k], i), buf, CTRLLOG_SLOT_SIZE) != HAL_OK)
                 return HAL_ERROR;
-            if (!parse_slot(buf, &rec)) continue;
+            if (!parse_slot(buf, &rec)) {
+            if (get_u32(buf + CTRLLOG_COMMIT_OFF) == CTRLLOG_COMMIT) return HAL_ERROR;
+            continue;
+        }
             dedup_insert(rec.stream, rec.dedup_key);
         }
     }
@@ -267,7 +276,7 @@ HAL_StatusTypeDef storage_ctrllog_init(void)
     return HAL_OK;
 }
 
-HAL_StatusTypeDef storage_ctrllog_append(uint16_t stream, uint64_t dedup_key,
+static HAL_StatusTypeDef storage_ctrllog_append_impl(uint16_t stream, uint64_t dedup_key,
                                          const void *payload, uint16_t len,
                                          bool *is_duplicate)
 {
@@ -288,6 +297,7 @@ HAL_StatusTypeDef storage_ctrllog_append(uint16_t stream, uint64_t dedup_key,
 
     /* 当前区写满则启动回收，本次返回忙 */
     if (s_next_slot >= CTRLLOG_SLOT_COUNT || !find_writable_slot()) {
+        s_erase_offset = 0U;
         s_erasing = 1 - s_active;
         return HAL_BUSY;
     }
@@ -314,12 +324,12 @@ HAL_StatusTypeDef storage_ctrllog_append(uint16_t stream, uint64_t dedup_key,
     uint32_t addr = slot_addr(s_active, s_next_slot);
 
     /* 1) 写内容（header + payload + crc） */
-    if (spi_flash_w25q128_write(addr, slot, crc_off + sizeof(uint32_t)) != HAL_OK)
+    if (storage_flash_write(addr, slot, crc_off + sizeof(uint32_t)) != HAL_OK)
         return HAL_ERROR;
 
     /* 2) 最后写提交尾标 */
     uint32_t commit = CTRLLOG_COMMIT;
-    if (spi_flash_w25q128_write(addr + CTRLLOG_COMMIT_OFF,
+    if (storage_flash_write(addr + CTRLLOG_COMMIT_OFF,
                                 (const uint8_t *)&commit, sizeof(commit)) != HAL_OK)
         return HAL_ERROR;
 
@@ -350,15 +360,17 @@ HAL_StatusTypeDef storage_ctrllog_foreach(ctrllog_visit_fn fn, void *user)
     return HAL_OK;
 }
 
-HAL_StatusTypeDef storage_ctrllog_maintenance(void)
+static HAL_StatusTypeDef storage_ctrllog_maintenance_impl(void)
 {
     if (s_erasing < 0) return HAL_OK;
 
     uint32_t base = area_base(s_erasing);
-    for (uint32_t off = 0; off < FLASH_CTRLLOG_AREA_SIZE; off += 0x10000U) {
-        if (spi_flash_w25q128_block64_erase(base + off) != HAL_OK)
-            return HAL_ERROR;   /* 保留状态，下次重试 */
-    }
+    /* 一轮只擦一个块，给取消、监督和其他队列留出处理机会。 */
+    if (storage_flash_erase64(base + s_erase_offset) != HAL_OK)
+        return HAL_ERROR;
+    s_erase_offset += 0x10000U;
+    if (s_erase_offset < FLASH_CTRLLOG_AREA_SIZE) return HAL_BUSY;
+    s_erase_offset = 0U;
 
     s_active = s_erasing;
     s_next_slot = 0;
@@ -369,4 +381,28 @@ HAL_StatusTypeDef storage_ctrllog_maintenance(void)
 uint64_t storage_ctrllog_last_seq(void)
 {
     return s_last_seq;
+}
+
+/* 追加带去重键的控制记录，完整提交后才更新索引。 */
+HAL_StatusTypeDef storage_ctrllog_append(uint16_t stream, uint64_t dedup_key, const void *payload, uint16_t len, bool *is_duplicate)
+{
+    if (!storage_mutation_begin()) return HAL_BUSY;
+    HAL_StatusTypeDef st = storage_ctrllog_append_impl(stream, dedup_key, payload, len, is_duplicate);
+    storage_mutation_end();
+    return st;
+}
+
+/* 推进一个回收块，未完成时保留回收状态。 */
+HAL_StatusTypeDef storage_ctrllog_maintenance(void)
+{
+    if (!storage_mutation_begin()) return HAL_BUSY;
+    HAL_StatusTypeDef st = storage_ctrllog_maintenance_impl();
+    storage_mutation_end();
+    return st;
+}
+
+/* 已启动但尚未完成的整区回收不能被升级安装截断。 */
+bool storage_ctrllog_is_busy(void)
+{
+    return s_erasing >= 0;
 }

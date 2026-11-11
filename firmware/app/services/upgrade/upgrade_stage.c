@@ -330,12 +330,10 @@ UpgradeStageResult UpgradeStage_Begin(UpgradeStageSource source, uint32_t total_
   {
     result = UPGRADE_STAGE_INTERNAL;
   }
-#if UPGRADE_PERSISTENCE_VERSION == 2
   if ((result == UPGRADE_STAGE_OK) && (session.tx_id == 0U))
   {
     result = UPGRADE_STAGE_INTERNAL;
   }
-#endif
   uint32_t completed_ms = HAL_GetTick();
   if ((uint32_t)(completed_ms - started_ms) >= UPGRADE_STAGE_PREPARE_TIMEOUT_MS)
   {

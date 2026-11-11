@@ -11,10 +11,8 @@ _Static_assert(UPGRADE_STATE_BARRIER_OFFSET + UPGRADE_STATE_SECTOR_SIZE
 _Static_assert((UPGRADE_STATE_COMMIT_OFFSET >= UPGRADE_STATE_RECORD_SIZE)
                  && (UPGRADE_STATE_COMMIT_OFFSET + UPGRADE_STATE_COMMIT_SIZE
                      <= UPGRADE_STATE_SECTOR_SIZE), "Commit marker outside its page/sector");
-#if UPGRADE_PERSISTENCE_VERSION == 2
 _Static_assert(UPGRADE_STATE_TRANSACTION_OFFSET + 2U * UPGRADE_STATE_SECTOR_SIZE
                  == UPGRADE_STATE_METADATA_SIZE, "Transaction extent mismatch");
-#endif
 
 // 从记录字节缓冲读取小端 32 位整数。
 static uint32_t Read32(const uint8_t *p)
@@ -32,7 +30,6 @@ static void Write32(uint8_t *p, uint32_t value)
   }
 }
 
-#if UPGRADE_PERSISTENCE_VERSION == 2
 // 从两个小端 32 位字段还原 64 位整数。
 static uint64_t Read64(const uint8_t *p)
 {
@@ -45,7 +42,6 @@ static void Write64(uint8_t *p, uint64_t value)
   Write32(p, (uint32_t)value);
   Write32(p + 4U, (uint32_t)(value >> 32U));
 }
-#endif
 
 // CRC-32/ISO-HDLC只检测记录意外损坏，不替代包认证。
 static uint32_t RecordCrc(const uint8_t *p, uint32_t size)
@@ -82,7 +78,7 @@ static bool PackageValid(const UpgradeStatePackage *package)
   {
     return (package->size == 0U) && AllValue(package->digest, 32U, 0U);
   }
-  return (package->slot <= 2U) && (package->size >= (UPGRADE_PERSISTENCE_VERSION == 2 ? 216U : 209U))
+  return (package->slot <= 2U) && (package->size >= 216U)
       && (package->size <= 448U * 1024U + 208U);
 }
 
@@ -93,7 +89,6 @@ bool UpgradeState_RecordValid(const UpgradeStateRecord *state)
   {
     return false;
   }
-#if UPGRADE_PERSISTENCE_VERSION == 2
   if ((state->tx_id == 0U) || (state->trial_attempts > UPGRADE_TRIAL_LIMIT))
   {
     return false;
@@ -125,12 +120,6 @@ bool UpgradeState_RecordValid(const UpgradeStateRecord *state)
   {
     return false;
   }
-#else
-  if ((state->tx_id != 0U) || (state->trial_attempts != 0U) || (state->operation != UPGRADE_OPERATION_NONE))
-  {
-    return false;
-  }
-#endif
   if (!PackageValid(&state->confirmed) || !PackageValid(&state->candidate)
       || ((state->confirmed.slot != 0U)
           && (state->confirmed.slot == state->candidate.slot)))
@@ -189,7 +178,6 @@ bool UpgradeState_TransitionValid(const UpgradeStateRecord *old, const UpgradeSt
   }
   bool same_confirmed = UpgradeState_PackageEqual(&old->confirmed, &next->confirmed);
   bool same_candidate = UpgradeState_PackageEqual(&old->candidate, &next->candidate);
-#if UPGRADE_PERSISTENCE_VERSION == 2
   if (old->phase == UPGRADE_STATE_CONFIRMED)
   {
     if ((next->tx_id <= old->tx_id) || (next->trial_attempts != 0U))
@@ -219,7 +207,6 @@ bool UpgradeState_TransitionValid(const UpgradeStateRecord *old, const UpgradeSt
   {
     return false;
   }
-#endif
   if (old->phase == UPGRADE_STATE_CONFIRMED)
   {
     if (!same_confirmed)
@@ -263,20 +250,12 @@ bool UpgradeState_TransitionValid(const UpgradeStateRecord *old, const UpgradeSt
 // 检查恢复记录的阶段、包信息及事务字段。
 bool UpgradeRecovery_RecordValid(const UpgradeRecoveryRecord *state)
 {
-#if UPGRADE_PERSISTENCE_VERSION == 2
   if ((state == NULL) || (state->tx_id == 0U) || (state->operation != UPGRADE_OPERATION_RECOVERY)
       || (state->trial_attempts > UPGRADE_TRIAL_LIMIT)
       || ((state->phase <= UPGRADE_RECOVERY_INSTALLING) != (state->trial_attempts == 0U)))
   {
     return false;
   }
-#else
-  if ((state == NULL) || (state->tx_id != 0U) || (state->trial_attempts != 0U)
-      || (state->operation != UPGRADE_OPERATION_NONE))
-  {
-    return false;
-  }
-#endif
   return (state != NULL) && (state->phase >= UPGRADE_RECOVERY_RECEIVING)
       && (state->phase <= UPGRADE_RECOVERY_BLOCKED)
       && (state->package.slot >= 1U) && (state->package.slot <= 2U)
@@ -290,7 +269,6 @@ bool UpgradeRecovery_TransitionValid(const UpgradeRecoveryRecord *old, const Upg
   {
     return false;
   }
-#if UPGRADE_PERSISTENCE_VERSION == 2
   if (next->phase == UPGRADE_RECOVERY_RECEIVING)
   {
     return next->tx_id > old->tx_id;
@@ -309,12 +287,6 @@ bool UpgradeRecovery_TransitionValid(const UpgradeRecoveryRecord *old, const Upg
   if (next->trial_attempts != attempts)
   {
     return false;
-  }
-#endif
-  if (next->phase == UPGRADE_RECOVERY_RECEIVING)
-  {
-    // 只由Begin在显式授权和旧包保护检查后发起新的接收事务。
-    return true;
   }
   if ((old->package.slot != next->package.slot) || (old->package.size != next->package.size))
   {
@@ -362,11 +334,9 @@ bool UpgradeState_Encode(const UpgradeStateRecord *state, uint32_t sequence, uin
   Write32(data + 16U, (uint32_t)state->phase);
   EncodePackage(data + 20U, &state->confirmed);
   EncodePackage(data + 60U, &state->candidate);
-#if UPGRADE_PERSISTENCE_VERSION == 2
   Write64(data + 100U, state->tx_id);
   Write32(data + 108U, state->trial_attempts);
   Write32(data + 112U, state->operation);
-#endif
   Write32(data + 124U, RecordCrc(data, 124U));
   return true;
 }
@@ -382,11 +352,7 @@ bool UpgradeState_Decode(const uint8_t *data, UpgradeStateRecord *state)
   if ((data == NULL) || (memcmp(data, UPGRADE_STATE_NORMAL_MAGIC, 8U) != 0)
       || (Read32(data + 8U) != UPGRADE_PERSISTENCE_VERSION)
       || (Read32(data + 124U) != RecordCrc(data, 124U))
-#if UPGRADE_PERSISTENCE_VERSION == 2
       || !AllValue(data + 116U, 8U, 0U))
-#else
-      || !AllValue(data + 100U, 24U, 0U))
-#endif
   {
     return false;
   }
@@ -395,11 +361,9 @@ bool UpgradeState_Decode(const uint8_t *data, UpgradeStateRecord *state)
   decoded.phase = (UpgradeStatePhase)Read32(data + 16U);
   DecodePackage(data + 20U, &decoded.confirmed);
   DecodePackage(data + 60U, &decoded.candidate);
-#if UPGRADE_PERSISTENCE_VERSION == 2
   decoded.tx_id = Read64(data + 100U);
   decoded.trial_attempts = Read32(data + 108U);
   decoded.operation = (UpgradeStateOperation)Read32(data + 112U);
-#endif
   if ((decoded.sequence == 0U) || !UpgradeState_RecordValid(&decoded))
   {
     return false;
@@ -427,11 +391,9 @@ bool UpgradeRecovery_Encode(const UpgradeRecoveryRecord *state, uint32_t sequenc
   Write32(data + 20U, state->package.slot);
   Write32(data + 24U, state->package.size);
   memcpy(data + 28U, state->package.digest, 32U);
-#if UPGRADE_PERSISTENCE_VERSION == 2
   Write64(data + 60U, state->tx_id);
   Write32(data + 68U, state->trial_attempts);
   Write32(data + 72U, state->operation);
-#endif
   Write32(data + 124U, RecordCrc(data, 124U));
   return true;
 }
@@ -447,11 +409,7 @@ bool UpgradeRecovery_Decode(const uint8_t *data, UpgradeRecoveryRecord *state)
   if ((data == NULL) || (memcmp(data, UPGRADE_STATE_RECOVERY_MAGIC, 8U) != 0)
       || (Read32(data + 8U) != UPGRADE_PERSISTENCE_VERSION)
       || (Read32(data + 124U) != RecordCrc(data, 124U))
-#if UPGRADE_PERSISTENCE_VERSION == 2
       || !AllValue(data + 76U, 48U, 0U))
-#else
-      || !AllValue(data + 60U, 64U, 0U))
-#endif
   {
     return false;
   }
@@ -461,11 +419,9 @@ bool UpgradeRecovery_Decode(const uint8_t *data, UpgradeRecoveryRecord *state)
   decoded.package.slot = Read32(data + 20U);
   decoded.package.size = Read32(data + 24U);
   memcpy(decoded.package.digest, data + 28U, 32U);
-#if UPGRADE_PERSISTENCE_VERSION == 2
   decoded.tx_id = Read64(data + 60U);
   decoded.trial_attempts = Read32(data + 68U);
   decoded.operation = (UpgradeStateOperation)Read32(data + 72U);
-#endif
   if ((decoded.sequence == 0U) || !UpgradeRecovery_RecordValid(&decoded))
   {
     return false;
