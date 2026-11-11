@@ -12,6 +12,11 @@
  *   - 上电先读 Flash，CRC 校验不对就用默认值
  */
 #include "app_config.h"
+#include "upgrade_quiesce.h"
+#include "FreeRTOS.h"
+#include "task.h"
+#include "cmsis_os2.h"
+#include "stm32f4xx.h"
 #include <string.h>
 
 /* 默认配置：第一次上电、或者 Flash 里配置损坏时用这个 */
@@ -66,8 +71,15 @@ const app_config_t *AppConfig_Get(void)
 /**
  * @brief  设置当前配置（从 Flash 加载完调用）
  * @param  cfg 新配置
+ * @return false表示空参数或变更门控关闭；true仅表示RAM更新完成
  */
-void AppConfig_Set(const app_config_t *cfg)
+bool AppConfig_Set(const app_config_t *cfg)
 {
-    memcpy(&s_config, cfg, sizeof(app_config_t));
+    if (cfg == NULL || __get_IPSR() != 0U || osKernelGetState() != osKernelRunning)
+        return false;
+    taskENTER_CRITICAL();
+    bool allowed = UpgradeQuiesce_AllowsMutation();
+    if (allowed) memcpy(&s_config, cfg, sizeof(app_config_t));
+    taskEXIT_CRITICAL();
+    return allowed;
 }

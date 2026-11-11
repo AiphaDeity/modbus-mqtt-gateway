@@ -7,6 +7,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/app_monitor.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../shared/upgrade_mailbox.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../shared/watchdog.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../shared/maint_frame.c
 )
 if(GATEWAY_ENABLE_M2)
     target_sources(${CMAKE_PROJECT_NAME} PRIVATE

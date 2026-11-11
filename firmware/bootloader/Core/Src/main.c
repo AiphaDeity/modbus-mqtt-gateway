@@ -353,6 +353,7 @@ int main(void)
   MX_GPIO_Init();
   MX_USART1_UART_Init();
   MX_SPI2_Init();
+  MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
 
 #if !defined(BOOT_FLASH_READ_DIAGNOSTIC)
@@ -521,7 +522,7 @@ int main(void)
   // 新安装的试运行只放行一次，不能在同一次启动中再次Run而误判为未确认重启。
   while ((install_result != BOOT_INSTALL_TRIAL_STARTED) || !allow_app)
   {
-    BootReceiveResult received = Boot_ReceivePackage(public_key, aes_key);
+    BootReceiveResult received = Boot_RecoveryReceive(public_key, aes_key);
     Boot_ResetIfWatchdogFailed("receive");
     if (received == BOOT_RECEIVE_COMMAND)
     {
@@ -539,7 +540,7 @@ int main(void)
     }
     install_result = keys_ready ? Boot_InstallRun(public_key, aes_key) : BOOT_INSTALL_STATE_ERROR;
     Boot_ResetIfWatchdogFailed("install");
-    printf("RCV RESULT %u\r\n", (unsigned int)install_result);
+    Boot_RecoveryReplyResult(install_result);
     allow_app = ((install_result == BOOT_INSTALL_BOOT_EXISTING)
                  || (install_result == BOOT_INSTALL_TRIAL_STARTED)
                  || (install_result == BOOT_INSTALL_RESTORED)) && Boot_CheckAppVector();

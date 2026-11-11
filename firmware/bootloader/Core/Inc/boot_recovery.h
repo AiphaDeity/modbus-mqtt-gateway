@@ -44,8 +44,9 @@ Boot_InstallResult Boot_RecoveryRun(const uint8_t *public_key, const uint8_t *ae
 bool Boot_RecoveryNormalWritesAllowed(void);
 bool Boot_RecoveryWriteAllowed(uint32_t address, uint32_t size);
 
-// 请求为12B固定头；keys沿用认证接口，调用期间有效；仅本地恢复服务调用。
-BootReceiveResult Boot_RecoveryHandleRequest(const uint8_t *request,
-                                            const uint8_t *public_key, const uint8_t *aes_key);
+// Boot主线程同步处理维护帧；keys调用期间有效，NULL时仅允许查询和首次初始化。
+BootReceiveResult Boot_RecoveryReceive(const uint8_t *public_key, const uint8_t *aes_key);
+// 回应最近FINISH的安装结果；调用前必须已收到BOOT_RECEIVE_PACKAGE。
+void Boot_RecoveryReplyResult(Boot_InstallResult result);
 
 #endif

@@ -65,6 +65,8 @@ void Error_Handler(void);
 #define SPI2_MISO_GPIO_Port GPIOC
 #define SPI2_MOSI_Pin GPIO_PIN_3
 #define SPI2_MOSI_GPIO_Port GPIOC
+#define TF_UPGRADE_KEY_Pin GPIO_PIN_0
+#define TF_UPGRADE_KEY_GPIO_Port GPIOA
 #define ETH_REF_CLK_Pin GPIO_PIN_1
 #define ETH_REF_CLK_GPIO_Port GPIOA
 #define ETH_MDIO_Pin GPIO_PIN_2

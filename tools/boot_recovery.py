@@ -1,57 +1,115 @@
-"""Boot本地串口恢复工具；设备必须配置与安全包匹配的可信密钥。"""
+"""Boot维护帧V1恢复工具；设备必须配置与安全包匹配的可信密钥。"""
 
 import argparse
+import json
 from pathlib import Path
+import secrets
 import struct
 import time
+import zlib
 
 
-# 发送 8 B 命令及小端参数，确认请求已完整交给串口。
-def send_request(port, command, argument=0):
-    request = command + struct.pack("<I", argument)
-    if len(command) != 8 or port.write(request) != len(request):
-        raise IOError("恢复命令未完整发送")
-    port.flush()
+# 帧头与固件maint_frame一致；CRC覆盖version到payload。
+def encode_frame(opcode, request_id, payload):
+    if len(payload) > 1024:
+        raise ValueError("维护帧载荷超过1024 B")
+    body = struct.pack("<BBBIH", 1, opcode, 0, request_id, len(payload)) + payload
+    return b"\xa5\x5a" + body + struct.pack("<I", zlib.crc32(body))
 
 
-# 在固定期限内等待指定响应前缀，严格模式拒绝非预期恢复状态。
-def wait_line(port, prefix, seconds, strict=True):
-    deadline = time.monotonic() + seconds
-    while time.monotonic() < deadline:
-        line = port.readline().decode("ascii", errors="replace").strip()
-        if not line:
-            continue
-        print(line)
-        if line.startswith(prefix):
-            return line
-        if strict and line.startswith("RCV ") and not line.startswith(("RCV SLOT ", "RCV ERASING ", "RCV VERIFYING")):
-            raise RuntimeError(f"恢复失败或响应阶段不符：{line}")
-    raise TimeoutError(f"等待 {prefix} 超时；Boot 会保留恢复状态，不要把超时当作成功")
+class RecoveryLink:
+    """单次串口连接的帧缓存和请求关联，不自动重试擦写操作。"""
+
+    def __init__(self, port):
+        self.port = port
+        self.request_id = secrets.randbelow(0xFFFFFFFE) + 1
+        self.buffer = bytearray()
+        self.partial_started = None
+
+    # 每条请求使用新编号；分块载荷由调用方提供，其余为JSON。
+    def send(self, opcode, arguments):
+        self.request_id = (self.request_id + 1) & 0xFFFFFFFF
+        payload = arguments if isinstance(arguments, bytes) else json.dumps(
+            arguments, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+        frame = encode_frame(opcode, self.request_id, payload)
+        if self.port.write(frame) != len(frame):
+            raise IOError("维护帧未完整发送")
+        self.port.flush()
+        return self.request_id
+
+    # 有界等待、过滤日志/迟到应答，并校验CRC及帧内外的请求号。
+    def wait(self, opcode, request_id, seconds):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if self.partial_started is not None and time.monotonic() - self.partial_started >= 2:
+                self.buffer.clear()
+                self.partial_started = None
+            if self.buffer:
+                index = self.buffer.find(b"\xa5\x5a")
+                if index < 0:
+                    self.buffer[:] = b"\xa5" if self.buffer[-1] == 0xA5 else b""
+                elif index:
+                    del self.buffer[:index]
+                if len(self.buffer) >= 11:
+                    version, received_op, flags, received_id, length = struct.unpack_from(
+                        "<BBBIH", self.buffer, 2)
+                    if version != 1 or flags != 1 or length > 1024:
+                        del self.buffer[0]
+                        continue
+                    total = 15 + length
+                    if len(self.buffer) >= total:
+                        wire = bytes(self.buffer[:total])
+                        if zlib.crc32(wire[2:-4]) != struct.unpack_from("<I", wire, total - 4)[0]:
+                            del self.buffer[0]
+                            continue
+                        del self.buffer[:total]
+                        self.partial_started = None
+                        if received_op != opcode or received_id != request_id:
+                            continue
+                        try:
+                            response = json.loads(wire[11:-4].decode("utf-8"))
+                        except (ValueError, UnicodeError) as error:
+                            raise RuntimeError("设备响应不是合法JSON") from error
+                        if (not isinstance(response, dict)
+                                or type(response.get("request_id")) is not int
+                                or response["request_id"] != request_id
+                                or response.get("status") not in ("OK", "ACCEPTED", "ERROR")
+                                or "error" not in response):
+                            raise RuntimeError("设备响应字段不完整或请求号不匹配")
+                        if response["status"] == "ERROR" or response["error"] is not None:
+                            raise RuntimeError(f"设备拒绝：{response}")
+                        return response
+            before = time.monotonic()
+            chunk = self.port.read(1)
+            if chunk:
+                if not self.buffer:
+                    self.partial_started = before
+                self.buffer.extend(chunk)
+        raise TimeoutError("等待维护帧响应超时；未确认成功，不自动重发擦写请求")
+
+    # 请求与响应串行，只有完成本次调用才能复用缓冲或发送下一块。
+    def request(self, opcode, arguments, seconds=10):
+        request_id = self.send(opcode, arguments)
+        return self.wait(opcode, request_id, seconds)
 
 
-# 查询设备包槽、升级日志及持久兼容版本，拒绝不完整或不支持的状态。
-def query_status(port):
-    # 尚未发送请求，先等待新的接收窗口；不把上次事务残留响应当作本次结果。
-    wait_line(port, "PKG WAIT", 900, strict=False)
-    send_request(port, b"GWRCINFO")
-    line = wait_line(port, "RCV INFO ", 10)
-    try:
-        fields = dict(item.split("=", 1) for item in line.split()[2:])
-        status = {key: int(fields[key]) for key in
-                  ("normal", "recovery", "phase", "sequence", "protected", "source", "compat")}
-    except (KeyError, ValueError) as error:
-        raise RuntimeError("设备状态响应不完整") from error
-    if (status["normal"] not in (0, 1, 2, 3, 5) or status["recovery"] not in (0, 1, 2, 3, 5)
-            or status["phase"] not in range(8) or status["protected"] not in range(3)
-            or status["source"] not in range(3) or not 0 <= status["sequence"] <= 0xFFFFFFFF):
-        raise RuntimeError("设备状态值不受当前协议支持")
-    if status["compat"] != 2:
-        raise RuntimeError("设备持久兼容版本必须为2，未发送擦写请求")
-    for key in ("tx_state", "tx_generation", "normal_phase", "normal_sequence", "attempts"):
-        if key in fields:
-            status[key] = int(fields[key])
-    if "tx_state" in status and status["tx_state"] not in (0, 1, 2, 3, 5):
-        raise RuntimeError("事务号日志状态不受支持")
+# 仅只读INFO允许重试等待设备复位；收到响应后严格核对模式与持久版本。
+def query_status(link):
+    deadline = time.monotonic() + 900
+    while True:
+        try:
+            status = link.request(0x01, {}, min(2, max(0, deadline - time.monotonic())))
+            break
+        except TimeoutError:
+            if time.monotonic() >= deadline:
+                raise
+    if status.get("mode") != "BOOT" or status.get("compat") != 2:
+        raise RuntimeError("设备不是Boot恢复模式或持久版本不是2，未发送擦写请求")
+    for key, allowed in (("normal", (0, 1, 2, 3, 5)), ("recovery", (0, 1, 2, 3, 5)),
+                         ("phase", range(8)), ("protected", range(3)),
+                         ("source", range(3)), ("tx_state", (0, 1, 2, 3, 5))):
+        if type(status.get(key)) is not int or status[key] not in allowed:
+            raise RuntimeError(f"设备状态字段无效：{key}")
     return status
 
 
@@ -82,62 +140,59 @@ def read_package(path, persistence_version=2):
     return package
 
 
-# 核对设备保护状态，向指定槽发送恢复包并等待首次试运行结果。
-def recover(port, package, slot, allow_unknown=False, persistence_version=2):
+# 核对保护状态，经BEGIN/CHUNK/FINISH发送同一安全包；设备仍执行完整认证。
+def recover(link, package, slot, allow_unknown=False, persistence_version=2):
     if slot not in ("A", "B"):
         raise ValueError("恢复槽只能为 A 或 B")
     check_package(package, persistence_version)
-    status = query_status(port)
-    if status["compat"] != persistence_version:
-        raise RuntimeError("设备、包与选择的持久基线不一致，未发送擦写请求")
+    status = query_status(link)
     if status["normal"] == 5 or status["recovery"] == 5:
         raise RuntimeError("现有日志版本不支持，普通恢复不能隐式迁移或清除它")
-    selected = 1 if slot == "A" else 2
     if status["normal"] == 2 or status["recovery"] == 2:
-        raise RuntimeError("元数据读取失败，禁止擦写；--allow-unknown-state 也不能绕过")
+        raise RuntimeError("元数据读取失败，禁止擦写")
+    selected = 1 if slot == "A" else 2
     if status["protected"] == selected:
-        raise RuntimeError(f"槽 {slot} 是可信已确认包，禁止覆盖；请选择另一槽")
+        raise RuntimeError(f"槽 {slot} 是可信已确认包，禁止覆盖")
     if (status["normal"] == 3 or status["recovery"] == 3) and not allow_unknown:
-        raise RuntimeError("元数据损坏；核对需保留内容后，显式指定 --allow-unknown-state")
+        raise RuntimeError("元数据损坏，需显式指定 --allow-unknown-state")
     start = 0x180000 if selected == 1 else 0x280000
-    print(f"恢复将擦写槽 {slot}：[0x{start:06X}, 0x{start + 0x100000:06X})，容量 1 MiB。")
-    print("另使用恢复日志区 [0x382000, 0x385000)；健康确认成功后才重建普通升级日志。")
-    command = (b"GWRCFR" if allow_unknown else b"GWRCVR") + slot.encode("ascii") + b"1"
-    send_request(port, command, len(package))
-    # 256个4KiB扇区，每次有界等待及读回；这是等待上限，不是固定延时。
-    ready = wait_line(port, "RCV READY ", 360)
-    if ready != f"RCV READY {selected} {len(package)}":
-        raise RuntimeError("设备目标槽或长度与请求不符")
+    print(f"恢复擦写槽 {slot}：[0x{start:06X}, 0x{start + 0x100000:06X})。")
+    print("恢复元数据使用 [0x382000, 0x385000)，健康确认后才重建普通日志。")
+    ready = link.request(0x30, {"slot": selected, "total_len": len(package),
+                               "allow_unknown_state": bool(allow_unknown)}, 360)
+    session_id = ready.get("session_id")
+    if (ready["status"] != "OK" or type(session_id) is not int or not 0 < session_id <= 0xFFFFFFFF
+            or ready.get("slot") != selected or ready.get("total_len") != len(package)
+            or ready.get("next_offset") != 0):
+        raise RuntimeError("设备目标槽、会话或长度与请求不符")
     for offset in range(0, len(package), 256):
         chunk = package[offset:offset + 256]
-        if port.write(chunk) != len(chunk):
-            raise IOError(f"数据未完整发送，offset={offset}")
-        port.flush()
-        if wait_line(port, "RCV ACK ", 5) != f"RCV ACK {offset + len(chunk)}":
-            raise RuntimeError("设备写入进度不符")
-    verified = wait_line(port, "RCV VERIFIED ", 210)
-    if verified != f"RCV VERIFIED {len(package) - 208} {selected}":
-        raise RuntimeError("设备认证结果与请求不符")
-    # 覆盖源包认证180s、擦除/安装/摘要240s及持久提交；不是实测耗时。
-    result = wait_line(port, "RCV RESULT ", 480)
-    if result != "RCV RESULT 1":
-        raise RuntimeError(f"候选已保存，但安装未进入首次试运行：{result}")
-    print("安装和片内校验完成，正在首次试运行；尚未完成产品健康确认。")
-    print("无可信旧包时，未确认重启将留在 Boot 等待恢复，不会自动信任本包。")
+        response = link.request(0x31, struct.pack("<II", session_id, offset) + chunk, 5)
+        if (response["status"] != "OK" or response.get("session_id") != session_id
+                or response.get("next_offset") != offset + len(chunk)):
+            raise RuntimeError("设备会话或写入进度不符")
+    request_id = link.send(0x32, {"session_id": session_id})
+    accepted = link.wait(0x32, request_id, 210)
+    if accepted["status"] != "ACCEPTED" or accepted.get("phase") != "READY":
+        raise RuntimeError("设备没有确认安全包已持久提交")
+    result = link.wait(0x32, request_id, 480)
+    if result["status"] != "OK" or result.get("install_result") != 1 or result.get("phase") != "TRIAL":
+        raise RuntimeError("安装未进入首次试运行")
+    print("安装和片内校验完成，准备首次试运行；尚未完成实际启动和产品健康确认。")
 
 
-# 解析恢复操作参数，独占串口完成查询、首次配置或恢复。
+# 工具独占串口；查询不擦写，初始化和恢复必须由命令行明确选择。
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", required=True, help="实际串口，例如 COM11")
     action = parser.add_mutually_exclusive_group(required=True)
-    action.add_argument("--info", action="store_true", help="只查询，设备留在恢复服务等待命令")
-    action.add_argument("--run", action="store_true", help="重试持久事务；正常状态下退出服务启动 App")
+    action.add_argument("--info", action="store_true", help="只查询，设备留在恢复服务")
+    action.add_argument("--run", action="store_true", help="重启Boot，重新判断持久事务及App")
     action.add_argument("--initialize-transactions", action="store_true",
                         help="首次配置事务号；要求全部升级元数据为空白，不擦除已有数据")
-    action.add_argument("--package", type=Path, help="要恢复的加密 .upd 包")
-    parser.add_argument("--erase-slot", choices=("A", "B"), help="明确允许覆盖的整个固件包槽")
-    parser.add_argument("--allow-unknown-state", action="store_true", help="显式允许处理损坏元数据，不绕过读错误或旧包保护")
+    action.add_argument("--package", type=Path, help="加密 .upd 包")
+    parser.add_argument("--erase-slot", choices=("A", "B"), help="明确允许覆盖的整个包槽")
+    parser.add_argument("--allow-unknown-state", action="store_true", help="允许损坏元数据，不绕过读错误或旧包保护")
     parser.add_argument("--persistence-version", type=int, choices=(2,), default=2)
     args = parser.parse_args()
     if args.package and not args.erase_slot:
@@ -147,24 +202,26 @@ def main():
     package = read_package(args.package, args.persistence_version) if args.package else None
     import serial
 
-    print("关闭串口监视器；本工具独占串口。打开后复位设备，Boot须已配置信任映射。")
-    with serial.Serial(args.port, 115200, timeout=0.5, write_timeout=3) as port:
+    print("连接USART2维护口：USB转串口RX接PD5、TX接PD6，共地，使用3.3V电平。")
+    print("关闭维护口串口监视器；工具独占该口，打开后复位设备。USART1只输出日志。")
+    with serial.Serial(args.port, 115200, timeout=0.1, write_timeout=3) as port:
+        link = RecoveryLink(port)
         if package is not None:
-            recover(port, package, args.erase_slot, args.allow_unknown_state, args.persistence_version)
+            recover(link, package, args.erase_slot, args.allow_unknown_state, args.persistence_version)
         else:
-            status = query_status(port)
+            status = query_status(link)
             print(status)
             if args.initialize_transactions:
-                if (status["normal"] != 0 or status["recovery"] != 0 or status.get("tx_state") != 0):
+                if status["normal"] != 0 or status["recovery"] != 0 or status["tx_state"] != 0:
                     raise RuntimeError("升级元数据不是首次全空状态，未发送初始化请求")
-                send_request(port, b"GWRTINIT")
-                if wait_line(port, "RCV TX_INIT ", 15) != "RCV TX_INIT result=1":
-                    raise RuntimeError("事务号未完成首次配置；不清空或重试擦除")
+                result = link.request(0x30, {"initialize_transactions": True}, 15)
+                if result["status"] != "OK":
+                    raise RuntimeError("事务号未完成首次配置")
             if args.run:
-                send_request(port, b"GWRCRUN1")
-                result = wait_line(port, "RCV RESULT ", 900)
-                if result not in ("RCV RESULT 0", "RCV RESULT 1", "RCV RESULT 2"):
-                    raise RuntimeError(f"设备仍留在恢复服务：{result}")
+                result = link.request(0x16, {})
+                if result["status"] != "OK":
+                    raise RuntimeError("设备未确认重启请求")
+                print("设备已接收重启请求；App是否启动须核对后续运行结果。")
 
 
 if __name__ == "__main__":

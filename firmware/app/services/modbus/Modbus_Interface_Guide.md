@@ -1,6 +1,6 @@
 # Modbus 模块对外接口文档
 
-> 版本：v2.0
+> 版本：v2.2（2026-11-11升级接入）
 > 适用对象：**MQTT 数据上报方**、**Web/平台配置方**、**持久化存储方**
 > 对外头文件：`#include "mb_api.h"`（点位相关另加 `#include "mb_pointmap.h"`）
 
@@ -22,10 +22,13 @@
 - [11. 错误码](#11-错误码)
 - [12. 日志等级](#12-日志等级)
 - [13. FAQ](#13-faq)
+- [14. 升级暂停、监督与维护帧](#14-升级暂停监督与维护帧)
 
 ---
 
 ## 1. 模块职责与文件结构
+
+容量固定为4个从站，每站16个解析点位（全机最多64点），每站保留32个寄存器缓存。初始化一次分配4个槽位，运行期不扩容；新增第5个从站返回MB_REALLOC_STATUS_ERR且不修改原表。满表仍可更新已有站，删除后的槽位可复用，新站点位及采集状态清零。完整配置文件解析及持久保存仍未接通。
 
 ```
 services/modbus/
@@ -39,6 +42,7 @@ services/modbus/
 ├── mb_poll.c                  状态机 + 硬件初始化 + poll 任务（无 malloc）
 ├── mb_slave.c                 句柄分配 + 从站 CRUD + 配置回调（唯一 malloc/free）
 ├── mb_api.c                   pull 接口：遍历 / 快照 / 注入写
+├── mb_runtime.c               升级暂停、最终发送准入与Poll/Master进展
 │
 ├── mb_pointmap.h/.c           点位表类型 + 换算（已实现）
 └── mb_pointmap_flash.h        持久化接口（只有声明，实现由存储方提供）
@@ -125,7 +129,7 @@ services/modbus/
         │ slave_list[i]           │ ◀───────┤        │                     │
         │  ├─ telegram            │  读      │        ▼                     │
         │  ├─ reg_data_buf[32]    │         │  MQTTPublish(topic, json)   │
-        │  ├─ points[32]          │         └──────────────────────────────┘
+        │  ├─ points[16]          │         └──────────────────────────────┘
         │  └─ data_valid/...      │
         └─────────────────────────┘
                       ▲ 写
@@ -208,7 +212,7 @@ struct mb_slave_runtime
     mb_errot_t collect_status;                    // 上次采集结果（ERR_OK_QUERY 等）
     uint8_t  data_valid;                          // ★ 1=有新鲜数据
 
-    mb_point_t points[MB_POINTS_PER_SLAVE];       // ★ 点位表（32 个）
+    mb_point_t points[MB_POINTS_PER_SLAVE];       // ★ 点位表（16 个）
 };
 ```
 
@@ -250,9 +254,9 @@ typedef struct
 ### 3.4 点位配置 / 解析结果
 
 ```c
-#define MB_POINT_NAME_MAX    16
+#define MB_POINT_NAME_MAX     8
 #define MB_POINT_UNIT_MAX     8
-#define MB_POINTS_PER_SLAVE  32
+#define MB_POINTS_PER_SLAVE  16
 
 typedef enum {
     MB_DT_UINT16  = 0,   // 1 个寄存器
@@ -381,7 +385,7 @@ int ret = mb_pointmap_set_slave_points(1, points);
 
 要点：
 
-- 必须整表传 32 项，空位 `valid = 0`。
+- 必须整表传 MB_POINTS_PER_SLAVE（16）项，空位 `valid = 0`。
 - 从站必须**先** `mb_add_slave` 注册，**再**下发点位表。
 - 写入即生效，下一次 `mb_pointmap_parse_slave` 就用新配置，无需重启。
 - 写入成功后会触发 `MB_CFG_CHANGE_UPDATE` 回调（`slave_id` = 目标从站）。
@@ -391,7 +395,7 @@ int ret = mb_pointmap_set_slave_points(1, points);
 ```c
 mb_point_t out[MB_POINTS_PER_SLAVE];
 int n = mb_pointmap_get_slave_points(1, out);
-// n >= 0 : 该从站有效点位数量（out 全量 32 项已填）
+// n >= 0 : 该从站有效点位数量（out 全量 16 项已填）
 // n == -1: 从站不存在 / out 为 NULL
 ```
 
@@ -439,7 +443,7 @@ typedef enum {
 ❌ mb_pointmap_parse_slave()
 ❌ mb_pointmap_get_slave_points()
 ❌ mb_take_slave_snapshot()
-❌ mb_add_slave() / mb_delete_slave() / mb_realloc_slave_list()
+❌ mb_add_slave() / mb_delete_slave()
 ```
 
 回调里**可以**安全做的事：
@@ -455,7 +459,7 @@ typedef enum {
 **阶段一**：只收集 ID；**阶段二**：脱离遍历后逐个拉数据、解析、发布。
 
 ```c
-#define MAX_SLAVES  16
+#define MAX_SLAVES  MB_SLAVE_HARD_MAX
 
 typedef struct {
     uint8_t ids[MAX_SLAVES];
@@ -572,7 +576,7 @@ mb_status_e mb_inject_write(uint8_t slave_id,
                             const uint16_t *write_values,
                             osSemaphoreId_t result_sem,     // NULL = 异步
                             mb_errot_t *result_err_out,     // NULL = 不要结果
-                            uint32_t result_timeout_ms);    // 同步等待超时（ms），0=永久等待
+                            uint32_t result_timeout_ms);    // 同步等待超时（ms），0使用有界默认值
 ```
 
 **写线圈**：`write_values` 传 0/1。FC05 由移植库自动转 0xFF00/0x0000；
@@ -581,9 +585,9 @@ FC15 由 `mb_inject_write` 内部把 0/1 数组打包成 bit 字（bit i = 第 i
 
 ### 7.1 同步写（等结果 + 防永久阻塞）
 
-传入 `result_sem` 时，`mb_inject_write` **内部会阻塞等待**（入队成功后由 poll 任务 release，函数自己 acquire），返回即代表本次写已完成。
+传入 `result_sem` 时，`mb_inject_write` 在函数内等待模块持有的结果票据。该参数仅保留原同步调用形态，后台不保存或访问调用者信号量/结果地址。同步返回MB_STATUS_OK后仍须检查err；它不等于从站写成功。
 
-> ⚠️ **务必设置 `result_timeout_ms`**：传 0 表示永久等待（兼容旧行为），但 poll 任务挂了会卡死。建议 2000~5000ms。
+等待期限单位ms，0使用TIMEOUT_MODBUS+1000 ms；超时返回MB_WAIT_TIMEOUT_ERR并输出ERR_UNKNOWN。尚未发送的超时请求在最终TX前拒绝；已经发送的写不自动重试。
 
 ```c
 mb_errot_t result = 0;
@@ -592,11 +596,11 @@ osSemaphoreId_t sem = osSemaphoreNew(1, 0, NULL);   // 调用方创建
 mb_status_e ret = mb_inject_write(1, MB_FC_WRITE_REGISTER, 100, 1,
                                   &value, sem, &result, 3000);   /* 3s 超时 */
 
-osSemaphoreDelete(sem);      // 用完立即删除，函数已内部取走信号
+osSemaphoreDelete(sem);      // 返回后可删除，后台不保存该对象
 
-if (ret == MB_WAIT_TIMEOUT_ERR)   /* ★ 同步等待超时，poll 任务可能挂了 */
+if (ret == MB_WAIT_TIMEOUT_ERR || (ret == MB_STATUS_OK && result == ERR_UNKNOWN))
 {
-    ack_timeout();
+    // 上报UNKNOWN并保留关联身份，不自动重试从站写。
     return;
 }
 if (ret != MB_STATUS_OK)     // 入队阶段就失败（队列满/参数错），result 未填
@@ -609,13 +613,13 @@ if (result == ERR_OK_QUERY) ack_ok();
 else                        ack_fail(result);
 ```
 
-> ⚠️ 调用方**不要**再 `osSemaphoreAcquire` 一次。信号量容量为 1，函数内部取走后计数归零，再取会永久阻塞。
+调用方不要在返回后再等待该信号量；结果已由本函数返回。调用者对象只需在调用期间有效，超时返回后后台仅处理内部票据。
 
 ### 7.2 异步写
 
 ```c
 mb_inject_write(slave_id, MB_FC_WRITE_MULTIPLE_REGISTERS, 100, 2,
-                values, NULL, NULL, 0);   /* 不关心结果，timeout 随便填 */
+                values, NULL, NULL, 0);   /* 异步不返回执行结果，timeout置0 */
 
 // 写线圈也一样：合上线圈 35，分断线圈 36~39
 uint16_t sw[5] = { 1, 0, 0, 0, 0 };
@@ -633,7 +637,7 @@ mb_inject_write(slave_id, MB_FC_WRITE_MULTIPLE_COILS, 35, 5,
 | 队列深度 | `MB_WRITE_QUEUE_DEPTH = 4` |
 | 返回值 | `MB_STATUS_OK` / `MB_HANDLE_STATUS_ERR` / `MB_NOT_SUPPORT_FC_ERR` / `MB_BUILD_REQUEST_ERR` / `MB_QUEUE_FULL_ERR` / `MB_WAIT_TIMEOUT_ERR` |
 
-> 🚨 **ModbusQueryInject 清空队列副作用**：底层 `ModbusQueryInject` 会 `xQueueReset` 清空整个读请求队列（见移植库 `modbus.c:782`）。当前队列深度 2 不太会触发丢包，但如果后续业务扩展到多从站、队列更深，建议把写请求走独立队列避免丢读请求。
+ModbusQueryInject只做有界头插，不再清空读请求队列；准入拒绝或队列满时明确通知请求任务，不能静默丢帧冒充结算。
 
 ---
 
@@ -847,12 +851,12 @@ collect_status / state / waiting_slave / pending_write
 
 ### 10.2 增删从站的线程约束
 
-`mb_add_slave` / `mb_delete_slave` / `mb_realloc_slave_list` **内部已内置 cfg 锁**（加锁 → 调 `_nolock` 内部版 → 解锁 → 锁外触发回调）。
+`mb_add_slave` / `mb_delete_slave` **内部已内置 cfg 锁**（加锁 → 调 `_nolock` 内部版 → 解锁 → 锁外触发回调）。
 
 因此：
 
 - **初始化阶段**（poll 任务未启动）：随便调；
-- **运行期**：API 已**内置 cfg 锁**，外部直接调用 `mb_add_slave` / `mb_delete_slave` / `mb_realloc_slave_list` 即可，无需自己加锁；
+- **运行期**：API 已**内置 cfg 锁**，外部直接调用 `mb_add_slave` / `mb_delete_slave` 即可，无需自己加锁；
 - 但在 `mb_for_each_valid_slave` 回调里**仍然不能调**这些函数（回调期间持锁，自死锁），见第 10.1 节死锁清单；
 - 配置变更回调在**锁外**触发，回调里不要反过来再调 CRUD 函数。
 
@@ -866,7 +870,7 @@ collect_status / state / waiting_slave / pending_write
 typedef enum {
     MB_STATUS_OK = 0,        // 成功
     MB_INIT_STATUS_ERR,      // 初始化失败（malloc/mutex 失败等）
-    MB_REALLOC_STATUS_ERR,   // 扩容失败
+    MB_REALLOC_STATUS_ERR,   // 从站槽位已满
     MB_HANDLE_STATUS_ERR,    // mb_handle 未初始化 / NULL
     MB_SLAVE_NOT_FOUND_ERR,  // 从站不存在或未启用
     MB_PARSE_STATUS_ERR,     // 解析失败
@@ -926,9 +930,8 @@ MB_LOGD(fmt, ...)   // 调试
 **Q5：float32 为什么用 memcpy？**
 规避严格别名（strict aliasing）未定义行为，编译器优化下强转指针可能读到错误值。
 
-**Q6：32 个点位不够怎么办？**
-`MB_POINTS_PER_SLAVE` 与 `MB_REG_MAX_PER_SLAVE` 都硬编码 32。要扩容需同时改：
-`mb_pointmap.h` 的 `MB_POINTS_PER_SLAVE`、`mb_api.h` 的 `MB_REG_MAX_PER_SLAVE` 与 `reg_data_buf[]` 尺寸、`mb_write_request_t.write_values[]` 尺寸。注意 RAM 已用约 86%，扩容前先评估。
+**Q6：从站和点位的容量是多少？**
+固定4个从站、每站16点，共64点；每站32个寄存器用于容纳16个双寄存器值。选择所需点位时应满足当前连续读取区间限制。没有运行期扩容接口；后续增加容量须重新核算整机内存。
 
 **Q7：上报模式能不能每个从站单独设？**
 不能，当前是全局一份。若需要按从站区分，需把 `s_report_mode` 移进 `mb_slave_runtime_t` 并同步持久化。
@@ -962,3 +965,20 @@ MB_LOGD(fmt, ...)   // 调试
 | v2.1 | 2026-11-05 | **Bug3 修复**：`mb_inject_write` 增加 `result_timeout_ms` 参数，传 0 兼容旧行为（永久等待），超时返回新错误码 `MB_WAIT_TIMEOUT_ERR` | `mb_api.h` / `mb_api.c` |
 | v2.1 | 2026-11-05 | **优化2**：新增 `MB_CFG_CHANGE_GLOBAL` 枚举值，区分"从站变更"与"全局配置变更"；`mb_config_batch_end`、`mb_notify_reload_complete`、`mb_pointmap_set_report_mode` 统一使用 GLOBAL 语义 | `mb_api.h` / `mb_slave.c` / `mb_pointmap.c` |
 | v2.1 | 2026-11-05 | **文档补充**：功能码集中表、CRUD 加锁说明更新、`ModbusQueryInject` 清空队列副作用标红、同步等待加超时示例 | 本文件 |
+
+
+## 14. 升级暂停、监督与维护帧
+
+本节仅覆盖升级接入。完整配置JSON解析、保存、串口配置命令及ControlValidate业务规则不在本轮补写范围；Config_Task仍未绑定，Config暂停角色与健康报告不使用成功桩，因此缺依赖时升级继续NOT_READY。
+
+Modbus_Init核对句柄和底层资源后绑定MODBUS角色；装配包装器根据mb_runtime_ready返回真实初始化结果。Pause先关闭新轮询和写准入；Poll明确拒绝未发送的队列写，Master结束已发送事务。Settle同时检查两个请求队列、Poll/Master在途状态、UART TX状态、配置调用计数及未消费结果票据。Sync不做Flash操作，只在所有结果已交还且总线空闲后完成；失败保持暂停，Resume也不得越过在途处理。不会通过重置队列或挂起工作线程假装结算。
+
+真正启动UART发送时，在短临界区内重查本地暂停、试运行/全局变更门控及同步票据，再设置RS485方向和启动IT/DMA。试运行允许只读采样，控制写禁止；读重试也受暂停约束。发送后的应答不明输出ERR_UNKNOWN，不自动再次执行写。缺少应有的帧结束/超时通知是执行链故障，不按普通从站离线继续发送。
+
+Poll完成状态推进后报告MODBUS进展，并检查内部Master自己的进展。当前登记进展/单次等待上限3000 ms；等待应答有界，空队列和从站超时是合法降级。Master停止推进、配置调用长期不退出或UART启动失败会锁存监督故障。该软件期限不是实测IWDG复位时间。
+
+从站增删改、点位表和上报模式变更通过同一配置准入；总线在途、试运行或暂停时返回MB_UPGRADE_BUSY_ERR。准入计数覆盖调用和配置回调，已接纳的同任务嵌套操作可以结算。回调只通知Storage_Task，不在网络/轮询线程擦写Flash。AppConfig_Set改为bool，仅任务上下文更新RAM，门控拒绝返回false；true也不代表持久保存。
+
+共用编解码为firmware/shared/maint_frame.c/.h，已显式加入App和Boot源码列表；未接管UART、未新增配置任务。V1布局固定A5 5A、version=1、opcode、flags(bit0=response)、request_id(u32LE)、payload_len(u16LE≤1024)、payload及CRC32LE，总开销15 B，CRC覆盖version至payload。
+
+maint_frame_decode成功时payload引用输入缓冲；调用方先处理再按consumed移动缓冲。MORE保留剩余数据并等待；格式/版本/长度/CRC错误按consumed丢弃前缀再解析，因此支持前导噪声、粘帧和重新同步。调用方须落实2000 ms半帧和30000 ms会话期限、请求/响应方向及模式权限；编解码本身不执行命令、不拥有会话。Boot的0x30～0x32封装及App配置处理仍须使用实际入口接线，不能把共用源码存在当作串口互通通过。

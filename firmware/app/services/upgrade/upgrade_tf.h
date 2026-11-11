@@ -2,6 +2,11 @@
 #define UPGRADE_TF_H
 
 #include "upgrade_entry.h"
+#include "app_modules.h"
+
+// 装配时绑定按键操作授权；任务轮询PA0，长按至少3s后松开导入固定文件。
+AppModuleInitResult UpgradeTf_Init(void);
+void UpgradeTf_Task(void *argument);
 
 typedef struct
 {

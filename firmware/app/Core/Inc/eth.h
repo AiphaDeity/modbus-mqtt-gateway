@@ -35,7 +35,11 @@ extern "C" {
 extern ETH_HandleTypeDef heth;
 
 /* USER CODE BEGIN Private defines */
-
+// PHY无响应时限制单次MDIO等待为50 ms，避免阻塞其他任务。
+#undef PHY_READ_TO
+#undef PHY_WRITE_TO
+#define PHY_READ_TO 50U
+#define PHY_WRITE_TO 50U
 /* USER CODE END Private defines */
 
 void MX_ETH_Init(void);

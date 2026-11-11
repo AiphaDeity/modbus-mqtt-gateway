@@ -2,6 +2,7 @@
 #define APP_CONFIG_H
 
 #include <stdint.h>
+#include <stdbool.h>
 
 /*
  * 应用全局配置结构体。
@@ -56,7 +57,7 @@ typedef struct
 void AppConfig_GetDefault(app_config_t *cfg);
 /* 获取当前生效配置指针（只读）；未加载时返回默认配置 */
 const app_config_t *AppConfig_Get(void);
-/* 覆盖当前配置（内存拷贝，不落 Flash；持久化由 M3 负责） */
-void AppConfig_Set(const app_config_t *cfg);
+/* 仅任务上下文更新RAM；试运行/升级暂停返回false，不表示已持久保存。 */
+bool AppConfig_Set(const app_config_t *cfg);
 
 #endif /* APP_CONFIG_H */

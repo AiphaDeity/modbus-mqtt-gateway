@@ -32,8 +32,7 @@
 /* ========= 常量 ========= */
 #define MB_POINT_NAME_MAX   8   // 点位名称最大长度（含 '\0'）
 #define MB_POINT_UNIT_MAX    8   // 单位最大长度
-#define MB_POINTS_PER_SLAVE 16   // 每个从站最多 16 个点位
-                                 // （等于 MB_REG_MAX_PER_SLAVE，最多覆盖所有寄存器）
+#define MB_POINTS_PER_SLAVE 16   // 每站最多16个点位；32个寄存器可容纳16个双寄存器值
 
 /* ========= 数据类型枚举 ========= */
 /**
@@ -127,7 +126,7 @@ int mb_pointmap_parse_slave(uint8_t slave_id, mb_parsed_point_t *out);
 /**
  * @brief 全局设置上报模式
  */
-void mb_pointmap_set_report_mode(mb_report_mode_t mode);
+int mb_pointmap_set_report_mode(mb_report_mode_t mode);
 
 /**
  * @brief 读取当前上报模式

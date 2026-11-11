@@ -92,7 +92,7 @@ int mb_pointmap_set_slave_points_nolock(uint8_t slave_id, const mb_point_t *poin
 /**
  * @brief 设置点位表（公开加锁版）
  */
-int mb_pointmap_set_slave_points(uint8_t slave_id, const mb_point_t *points)
+static int mb_pointmap_set_slave_points_impl(uint8_t slave_id, const mb_point_t *points)
 {
     if (points == NULL) return MB_BUILD_REQUEST_ERR;
 
@@ -205,13 +205,25 @@ int mb_pointmap_parse_slave(uint8_t slave_id, mb_parsed_point_t *out)
 }
 
 /* ========= 全局上报模式 ========= */
-void mb_pointmap_set_report_mode(mb_report_mode_t mode)
+int mb_pointmap_set_report_mode(mb_report_mode_t mode)
 {
+    if (!mb_runtime_config_begin()) return MB_UPGRADE_BUSY_ERR;
     s_report_mode = mode;
     mb_fire_cfg_change(MB_CFG_CHANGE_GLOBAL, 0);   /* 全局配置变更，slave_id=0 */
+    mb_runtime_config_end();
+    return MB_STATUS_OK;
 }
 
 mb_report_mode_t mb_pointmap_get_report_mode(void)
 {
     return s_report_mode;
+}
+
+/** @brief 更新点位表与配置通知作为一个受门控保护的完整操作。 */
+int mb_pointmap_set_slave_points(uint8_t slave_id, const mb_point_t *points)
+{
+    if (!mb_runtime_config_begin()) return MB_UPGRADE_BUSY_ERR;
+    int result = mb_pointmap_set_slave_points_impl(slave_id, points);
+    mb_runtime_config_end();
+    return result;
 }

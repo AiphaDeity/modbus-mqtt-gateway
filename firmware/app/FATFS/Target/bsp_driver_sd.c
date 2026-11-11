@@ -55,84 +55,16 @@ __weak uint8_t BSP_SD_Init(void)
   {
     return MSD_ERROR;
   }
-
-  /*
-   * ================================================================
-   * 热插拔后 SDIO 子系统可能处于脏状态：
-   *   1. SDIO 核心寄存器 (CR1, CLKCR, FIFO 等) 可能在拔出瞬间被污染
-   *   2. DMA2_Stream3 (SDIO RX DMA) 可能还在 active 跑
-   *   3. 物理卡没断电但被之前的命令序列搞乱内部状态机
-   *
-   * 之前的方案（POWER=0, ICR/MASK 清, hsd.State=RESET）都不够——
-   * SDIO_Init 虽然重配了核心寄存器，但 DMA 可能还在捣乱。
-   *
-   * 最彻底的方案：
-   *   a) 停 DMA stream
-   *   b) RCC reset SDIO + DMA2 外设（所有寄存器回到 reset 默认值）
-   *   c) 重跑 MX_SDIO_SD_Init（CubeMX 生成的完整初始化，和 boot 路径一致）
-   *   d) MX_SDIO_SD_Init 里的 USER CODE BEGIN 2 已经调了 HAL_SD_Init
-   *      → HAL_SD_MspInit (GPIO/DMA/IRQ 幂等重配)
-   *      → HAL_SD_InitCard (SD_PowerON: CMD0+CMD8+ACMD41)
-   * ================================================================
-   */
-  __HAL_RCC_SDIO_CLK_ENABLE();
-  __HAL_RCC_DMA2_CLK_ENABLE();
-
-  /* a) 先停 DMA2_Stream3 (防止 DMA 在 reset 过程中访问 SDIO FIFO) */
-  (void)HAL_DMA_Abort(hsd.hdmarx);
-
-  /* b) RCC reset SDIO (APB2) + DMA2 (AHB1) — 所有寄存器回到 boot 默认值 */
-  __HAL_RCC_SDIO_FORCE_RESET();
-  __HAL_RCC_DMA2_FORCE_RESET();
-  __NOP(); __NOP(); __NOP(); __NOP();
-  __HAL_RCC_SDIO_RELEASE_RESET();
-  __HAL_RCC_DMA2_RELEASE_RESET();
-  __NOP(); __NOP(); __NOP(); __NOP();
-
-  /* 给卡一个稳定窗口（拔插后卡内部需要时间 reset） */
-  HAL_Delay(30);
-
-  /* 强制 HAL 句柄回到 RESET — 让 HAL_SD_Init 里能重新调 HAL_SD_MspInit
-   * （刚才 RCC reset DMA2 了，必须让 HAL 重新配置 DMA stream）
-   */
-  hsd.State = HAL_SD_STATE_RESET;
-  hsd.ErrorCode = HAL_SD_ERROR_NONE;
-
-  /* c) 完整重跑 MX_SDIO_SD_Init — 和 boot 时路径完全一致
-   *    MX_SDIO_SD_Init 内部 USER CODE BEGIN 2 调了 HAL_SD_Init
-   *    → HAL_SD_MspInit (GPIO + DMA2_Stream3 + IRQ 全部重配)
-   *    → HAL_SD_InitCard (SDIO_Init + SD_PowerON: CMD0+CMD8+ACMD41)
-   *
-   *    注意：MX_SDIO_SD_Init 只配 PC8-PC12 (SDIO) + PD2 (CMD)
-   *    不会碰 PD3 (SD 卡检测 EXTI)，所以 EXTI 配置安全
-   */
-  MX_SDIO_SD_Init();
-
-  /* 检查 HAL_SD_InitCard 结果 */
-  if (hsd.State == HAL_SD_STATE_READY || hsd.State == HAL_SD_STATE_TRANSFER)
+  /* HAL SD initialization */
+  sd_state = HAL_SD_Init(&hsd);
+  /* Configure SD Bus width (4 bits mode selected) */
+  if (sd_state == MSD_OK)
   {
-    sd_state = MSD_OK;
-  }
-  else
-  {
-    sd_state = MSD_ERROR;
-  }
-
-  /* 真实数据通路验证：直接轮询读扇区 0。
-   * 热插拔后 HAL_SD_GetCardState() 常返回非 TRANSFER，
-   * 但卡本身可能是好的 —— 只有真实读一次才能确定。
-   * 读失败就直接返回错误，让 FatFs 立刻拿到 STA_NOINIT，
-   * 避免它用坏句柄去读并在 SD_TIMEOUT(30s) 上死等。
-   */
-  {
-    static uint8_t probe_buf[512];
-    HAL_StatusTypeDef st = HAL_SD_ReadBlocks(&hsd, probe_buf, 0U, 1U, 1000U);
-
-    if (st != HAL_OK)
+    /* Enable wide operation */
+    if (HAL_SD_ConfigWideBusOperation(&hsd, SDIO_BUS_WIDE_4B) != HAL_OK)
     {
-      return MSD_ERROR;
+      sd_state = MSD_ERROR;
     }
-    sd_state = MSD_OK;
   }
 
   return sd_state;
@@ -373,11 +305,10 @@ __weak uint8_t BSP_SD_IsDetected(void)
 {
   __IO uint8_t status = SD_PRESENT;
 
-  /* USER CODE BEGIN 1 */
-  /* PD3 卡座检测（硬件：卡插入时机械开关拉低 DET 引脚） */
-  return (HAL_GPIO_ReadPin(SD_CARD_DET_GPIO_Port, SD_CARD_DET_Pin) == GPIO_PIN_RESET)
-         ? SD_PRESENT : SD_NOT_PRESENT;
-  /* USER CODE END 1 */
+  if (BSP_PlatformIsDetected() == 0x0)
+  {
+    status = SD_NOT_PRESENT;
+  }
 
   return status;
 }

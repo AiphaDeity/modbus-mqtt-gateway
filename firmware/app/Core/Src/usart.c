@@ -104,10 +104,10 @@ void MX_USART3_UART_Init(void)
 
   /* USER CODE END USART3_Init 1 */
   huart3.Instance = USART3;
-  huart3.Init.BaudRate = 115200;
-  huart3.Init.WordLength = UART_WORDLENGTH_8B;
+  huart3.Init.BaudRate = 19200;
+  huart3.Init.WordLength = UART_WORDLENGTH_9B;
   huart3.Init.StopBits = UART_STOPBITS_1;
-  huart3.Init.Parity = UART_PARITY_NONE;
+  huart3.Init.Parity = UART_PARITY_EVEN;
   huart3.Init.Mode = UART_MODE_TX_RX;
   huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
   huart3.Init.OverSampling = UART_OVERSAMPLING_16;
@@ -292,12 +292,8 @@ void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
 
     __HAL_LINKDMA(uartHandle,hdmatx,hdma_usart3_tx);
 
-    /* ★USART3 中断优先级设为 6（数值越大优先级越低）。
-     * configMAX_SYSCALL_INTERRUPT_PRIORITY = 5<<4 = 0x50 = BASEPRI
-     * BASEPRI 屏蔽所有优先级编码 >= BASEPRI 的中断。
-     * 优先级 5 → 编码 0x50 = BASEPRI → 被永久屏蔽！
-     * 优先级 6 → 编码 0x60 > BASEPRI → 不被屏蔽 ✅ */
-    HAL_NVIC_SetPriority(USART3_IRQn, 6, 0);
+    /* USART3 interrupt Init */
+    HAL_NVIC_SetPriority(USART3_IRQn, 5, 0);
     HAL_NVIC_EnableIRQ(USART3_IRQn);
   /* USER CODE BEGIN USART3_MspInit 1 */
 

@@ -159,6 +159,24 @@ void Monitor_ReportFatal(AppModuleId module)
   }
 }
 
+// 仅由升级任务报告实际进展，其他执行上下文不代报。
+bool Monitor_UpgradeProgress(void)
+{
+  return !App_IsCurrentModuleTask(APP_MODULE_UPGRADE)
+      || Monitor_ReportProgress(APP_MODULE_UPGRADE, true);
+}
+
+// 升级任务声明当前同步操作的有界等待，不从其他任务代报其心跳。
+bool Monitor_UpgradeWait(uint32_t timeout_ms)
+{
+  if (!App_IsCurrentModuleTask(APP_MODULE_UPGRADE))
+  {
+    return true;
+  }
+  return (timeout_ms > 0U) && (timeout_ms <= UPGRADE_STAGE_PREPARE_TIMEOUT_MS)
+      && Monitor_BeginWait(APP_MODULE_UPGRADE, timeout_ms + 1000U);
+}
+
 // 检查各模块进展和栈余量，输出平台及产品就绪结果。
 static bool CheckModuleHealth(bool startup_complete, bool *product_ready)
 {

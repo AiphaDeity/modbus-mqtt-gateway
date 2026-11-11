@@ -228,11 +228,8 @@
 /* PHY Configuration delay */
 #define PHY_CONFIG_DELAY                0x00000FFFU
 
-/* MDIO 忙等超时(ms)。默认 0xFFFF=65535ms，PHY 无响应时会把调用任务
- * (eth_link，优先级 3)钉死 65 秒，期间优先级更低的 FreeRTOS 定时器任务
- * 拿不到 CPU，Modbus 超时/T35 定时器停摆。改为 50ms。 */
-#define PHY_READ_TO                     50U
-#define PHY_WRITE_TO                    50U
+#define PHY_READ_TO                     0x0000FFFFU
+#define PHY_WRITE_TO                    0x0000FFFFU
 
 /* Section 3: Common PHY Registers */
 

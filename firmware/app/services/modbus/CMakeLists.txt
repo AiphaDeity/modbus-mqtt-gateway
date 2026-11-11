@@ -4,6 +4,7 @@ set(MODBUS_SRCS
     ${CMAKE_CURRENT_SOURCE_DIR}/mb_slave.c
     ${CMAKE_CURRENT_SOURCE_DIR}/mb_api.c
     ${CMAKE_CURRENT_SOURCE_DIR}/mb_pointmap.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/mb_runtime.c
 )
 
 add_library(modbus STATIC ${MODBUS_SRCS})
@@ -24,3 +25,9 @@ target_include_directories(modbus PUBLIC
 )
 
 target_link_libraries(modbus PUBLIC stm32cubemx)
+
+target_include_directories(modbus PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../integration
+    ${CMAKE_CURRENT_SOURCE_DIR}/../upgrade
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../shared
+)

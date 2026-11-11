@@ -3,6 +3,7 @@
 #include "upgrade_stage_auth.h"
 #include "upgrade_trust.h"
 #include "app_upgrade.h"
+#include "app_monitor.h"
 #include "stm32f4xx_hal.h"
 #include "FreeRTOS.h"
 #include "task.h"
@@ -124,7 +125,7 @@ static void PublishDiagnostic(bool waiting, UpgradeStageResult result)
 }
 
 // 等待匹配请求的应答，丢弃迟到消息并检查原期限。
-static UpgradeStageResult WaitResponse(bool *enqueued)
+static UpgradeStageResult AwaitResponse(bool *enqueued)
 {
   memset(&storage.response, 0, sizeof(storage.response));
   if (enqueued != NULL)
@@ -202,6 +203,26 @@ static UpgradeStageResult WaitResponse(bool *enqueued)
     }
     return result;
   }
+}
+
+// 仅对升级任务登记本次队列等待；返回处理结果后报告实际进展。
+static UpgradeStageResult WaitResponse(bool *enqueued)
+{
+  if (enqueued != NULL)
+  {
+    *enqueued = false;
+  }
+  uint32_t remaining = Remaining();
+  if (remaining == 0U)
+  {
+    return UPGRADE_STAGE_TIMEOUT;
+  }
+  if (!Monitor_UpgradeWait(remaining))
+  {
+    return UPGRADE_STAGE_INTERNAL;
+  }
+  UpgradeStageResult result = AwaitResponse(enqueued);
+  return Monitor_UpgradeProgress() ? result : UPGRADE_STAGE_INTERNAL;
 }
 
 // 在共享期限内提交请求并等待对应应答。

@@ -17,9 +17,6 @@
   */
 /* USER CODE END Header */
 #include "fatfs.h"
-#include "storage_time.h"
-
-#include <stdbool.h>
 
 uint8_t retSD;    /* Return value for SD */
 char SDPath[4];   /* SD logical drive path */
@@ -43,7 +40,7 @@ void MX_FATFS_Init(void)
 /**
   * @brief  Gets Time from RTC
   * @param  None
-  * @retval Time in DWORD (FatFs packed format)
+  * @retval Time in DWORD
   */
 DWORD get_fattime(void)
 {

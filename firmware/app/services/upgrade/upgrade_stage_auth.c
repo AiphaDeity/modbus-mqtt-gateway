@@ -1,6 +1,7 @@
 #include "upgrade_stage_auth.h"
 
 #include "upgrade_package.h"
+#include "app_monitor.h"
 #include "stm32f4xx_hal.h"
 #include "cmsis_os2.h"
 
@@ -43,7 +44,7 @@ static bool Checkpoint(void *context, uint32_t started_ms, uint32_t timeout_ms, 
   {
     return false;
   }
-  if (progress && (osThreadYield() != osOK))
+  if (progress && (!Monitor_UpgradeProgress() || (osThreadYield() != osOK)))
   {
     auth->io_result = UPGRADE_STAGE_INTERNAL;
     return false;

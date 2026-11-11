@@ -12,6 +12,8 @@
 #include <stdlib.h>
 #include <stdio.h>
 
+static osThreadId_t s_batch_owner;
+
 /* ========= 内部函数 ========= */
 
 /**
@@ -43,12 +45,13 @@ mb_status_e mb_handle_init(void)
     if (mb_handle == NULL) return MB_INIT_STATUS_ERR;
     memset(mb_handle, 0, sizeof(mb_handle_t));
 
-    mb_handle->slave_max_num   = MB_SLAVE_INIT_CAP;
+    mb_handle->slave_max_num   = MB_SLAVE_HARD_MAX;
     mb_handle->slave_actual_num = 0;
     mb_handle->slave_list = malloc(sizeof(mb_slave_runtime_t) * mb_handle->slave_max_num);
     if (mb_handle->slave_list == NULL)
     {
         free(mb_handle);
+        mb_handle = NULL;
         return MB_INIT_STATUS_ERR;
     }
     memset(mb_handle->slave_list, 0, sizeof(mb_slave_runtime_t) * mb_handle->slave_max_num);
@@ -78,6 +81,7 @@ fail:
     free(mb_handle->slave_list);
     free(mb_handle);
     mb_handle = NULL;
+    mb_handle = NULL;
     return MB_INIT_STATUS_ERR;
 }
 
@@ -103,34 +107,6 @@ void mb_set_config_change_cb(mb_cfg_change_cb_t cb, void *ctx)
     mb_handle->cfg_change_ctx = ctx;
 }
 
-mb_status_e mb_realloc_slave_list_nolock(void)
-{
-    if (mb_handle->slave_max_num >= MB_SLAVE_HARD_MAX)
-        return MB_REALLOC_STATUS_ERR;
-
-    uint8_t new_cap = mb_handle->slave_max_num + MB_SLAVE_INIT_CAP;
-    mb_slave_runtime_t *new_list = realloc(mb_handle->slave_list,
-                                           sizeof(mb_slave_runtime_t) * new_cap);
-    if (new_list == NULL) return MB_REALLOC_STATUS_ERR;   // 旧的还在
-
-    // 新扩容的槽位清 0（realloc 不会清新增区域）
-    memset(new_list + mb_handle->slave_max_num, 0,
-           sizeof(mb_slave_runtime_t) * MB_SLAVE_INIT_CAP);
-
-    mb_handle->slave_list  = new_list;
-    mb_handle->slave_max_num = new_cap;
-    return MB_STATUS_OK;
-}
-
-mb_status_e mb_realloc_slave_list(void)
-{
-    if (mb_handle == NULL) return MB_HANDLE_STATUS_ERR;
-    osMutexAcquire(mb_handle->xSlaveCfgMutex, osWaitForever);
-    mb_status_e ret = mb_realloc_slave_list_nolock();
-    osMutexRelease(mb_handle->xSlaveCfgMutex);
-    return ret;
-}
-
 /**
  * @brief 添加从站核心逻辑（不加锁，调用方必须已持 xSlaveCfgMutex）
  */
@@ -150,11 +126,10 @@ mb_status_e mb_add_slave_nolock(modbus_t *cfg, uint8_t *existed)
         return MB_STATUS_OK;
     }
 
-    // 容量不够 → 扩容
+    // 已有从站可更新；新增从站超过固定容量则拒绝。
     if (mb_handle->slave_actual_num >= mb_handle->slave_max_num)
     {
-        mb_status_e r = mb_realloc_slave_list_nolock();
-        if (r != MB_STATUS_OK) return r;
+        return MB_REALLOC_STATUS_ERR;
     }
 
     // 找空位 INSERT
@@ -167,6 +142,9 @@ mb_status_e mb_add_slave_nolock(modbus_t *cfg, uint8_t *existed)
         }
     }
 
+    if (slave == NULL) return MB_REALLOC_STATUS_ERR;
+    // 空槽可能属于已删除的从站，新站不能继承旧点位和采集结果。
+    memset(slave, 0, sizeof(*slave));
     memcpy(&slave->telegram, cfg, sizeof(modbus_t));
     slave->telegram.u16reg = slave->reg_data_buf;
     slave->telegram.u32CurrentTask = NULL;
@@ -183,7 +161,7 @@ mb_status_e mb_add_slave_nolock(modbus_t *cfg, uint8_t *existed)
 /**
  * @brief 添加从站（公开加锁版）
  */
-mb_status_e mb_add_slave(modbus_t *cfg)
+static mb_status_e mb_add_slave_impl(modbus_t *cfg)
 {
     if (mb_handle == NULL) return MB_HANDLE_STATUS_ERR;
     if (cfg == NULL) return MB_BUILD_REQUEST_ERR;
@@ -242,7 +220,7 @@ mb_status_e mb_delete_slave_nolock(uint8_t slave_id)
 /**
  * @brief 删除从站（公开加锁版）
  */
-mb_status_e mb_delete_slave(uint8_t slave_id)
+static mb_status_e mb_delete_slave_impl(uint8_t slave_id)
 {
     if (mb_handle == NULL) return MB_HANDLE_STATUS_ERR;
 
@@ -259,20 +237,45 @@ mb_status_e mb_delete_slave(uint8_t slave_id)
 void mb_notify_reload_complete(void)
 {
     if (mb_handle == NULL) return;
+    if (!mb_runtime_config_begin()) return;
     MB_LOGI("slave reload complete: %u slaves", mb_handle->slave_actual_num);
     mb_fire_cfg_change(MB_CFG_CHANGE_GLOBAL, 0);   /* 上电加载属于全局变更 */
+    mb_runtime_config_end();
 }
 
 void mb_config_batch_begin(void)
 {
     if (mb_handle == NULL) return;
+    if (s_batch_owner != NULL || !mb_runtime_config_begin()) return;
+    s_batch_owner = osThreadGetId();
     mb_handle->cb_suppress = 1;
 }
 
 void mb_config_batch_end(void)
 {
     if (mb_handle == NULL) return;
+    if (s_batch_owner != osThreadGetId()) return;
     mb_handle->cb_suppress = 0;
     MB_LOGI("config batch end: %u slaves", mb_handle->slave_actual_num);
     mb_fire_cfg_change(MB_CFG_CHANGE_GLOBAL, 0);   /* 批量结束属于全局变更 */
+    s_batch_owner = NULL;
+    mb_runtime_config_end();
+}
+
+/** @brief 新增或更新从站前检查升级及在途门控。 */
+mb_status_e mb_add_slave(modbus_t *cfg)
+{
+    if (!mb_runtime_config_begin()) return MB_UPGRADE_BUSY_ERR;
+    mb_status_e result = mb_add_slave_impl(cfg);
+    mb_runtime_config_end();
+    return result;
+}
+
+/** @brief 删除只在当前总线事务结束后执行。 */
+mb_status_e mb_delete_slave(uint8_t slave_id)
+{
+    if (!mb_runtime_config_begin()) return MB_UPGRADE_BUSY_ERR;
+    mb_status_e result = mb_delete_slave_impl(slave_id);
+    mb_runtime_config_end();
+    return result;
 }

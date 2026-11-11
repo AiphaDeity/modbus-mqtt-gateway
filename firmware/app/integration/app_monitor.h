@@ -33,4 +33,11 @@ bool Monitor_BeginWait(AppModuleId module, uint32_t timeout_ms);
 // 任务上下文锁存不可恢复故障；普通断网、无卡等业务状态不通过此接口上报。
 void Monitor_ReportFatal(AppModuleId module);
 
+/*
+ * 升级任务在实际I/O/运算进展后报告，阻塞前声明等待；其他调用任务直接返回true。
+ * 等待使用现有操作剩余期限，另留1000 ms返回处理裕量，不延长操作本身期限。
+ */
+bool Monitor_UpgradeProgress(void);
+bool Monitor_UpgradeWait(uint32_t timeout_ms);
+
 #endif

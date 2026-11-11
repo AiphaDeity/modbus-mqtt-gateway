@@ -14,33 +14,52 @@
 #include "stm32f4xx_hal_sd.h"
 #include "ff_gen_drv.h"   /* Disk_drvTypeDef / disk.is_initialized */
 #include "cmsis_os2.h"
+#include "sdio.h"
+#include "bsp_driver_sd.h"
 
 extern SD_HandleTypeDef hsd;
 extern Disk_drvTypeDef  disk;
 
 static bool s_sd_ready = false;
 
+/* 重建SDIO和本卡DMA流；覆盖生成的弱实现，供首次挂载和热插拔恢复复用。 */
+uint8_t BSP_SD_Init(void)
+{
+    if (BSP_SD_IsDetected() != SD_PRESENT) return MSD_ERROR;
+
+    __HAL_RCC_SDIO_CLK_ENABLE();
+    __HAL_RCC_DMA2_CLK_ENABLE();
+    if (hsd.hdmarx != NULL) {
+        if (HAL_DMA_GetState(hsd.hdmarx) == HAL_DMA_STATE_BUSY &&
+            HAL_DMA_Abort(hsd.hdmarx) != HAL_OK) return MSD_ERROR;
+        if (HAL_DMA_DeInit(hsd.hdmarx) != HAL_OK) return MSD_ERROR;
+    }
+    /* 只复位SDIO；DMA2上的其他串口流保持运行。 */
+    __HAL_RCC_SDIO_FORCE_RESET();
+    __DSB();
+    __HAL_RCC_SDIO_RELEASE_RESET();
+    HAL_Delay(30U);
+
+    hsd.State = HAL_SD_STATE_RESET;
+    hsd.ErrorCode = HAL_SD_ERROR_NONE;
+    MX_SDIO_SD_Init();
+    if (HAL_SD_Init(&hsd) != HAL_OK) return MSD_ERROR;
+
+    /* 读扇区0验证真实通路；读失败不得报告初始化成功。 */
+    static uint8_t probe_buf[SDCARD_BLOCK_SIZE] __attribute__((aligned(4)));
+    return HAL_SD_ReadBlocks(&hsd, probe_buf, 0U, 1U, 1000U) == HAL_OK
+           ? MSD_OK : MSD_ERROR;
+}
+
+/* 初始化介质后检查卡容量；无卡或枚举失败由上层按不可用处理。 */
 HAL_StatusTypeDef sdcard_tf_init(void)
 {
     HAL_SD_CardInfoTypeDef info;
     HAL_StatusTypeDef st;
 
-    /*
-     * CubeMX 的 MX_SDIO_SD_Init() 已调 HAL_SD_Init(&hsd)：
-     *   1) HAL_SD_MspInit — GPIO/DMA/IRQ 初始化
-     *   2) HAL_SD_InitCard — 卡枚举 (1-bit 模式)
-     *
-     * BusWide 跟随 sdio.c 里的 Init.BusWide（当前 1-bit），
-     * 这里不再硬切 4-bit，避免硬件 DAT1-DAT3 缺失时失败。
-     */
-
-    /* 确认卡状态：已在 TRANSFER 说明 HAL_SD_InitCard 成功 */
-    if (HAL_SD_GetCardState(&hsd) != HAL_SD_CARD_TRANSFER) {
-        st = HAL_SD_InitCard(&hsd);
-        if (st != HAL_OK) {
-            s_sd_ready = false;
-            return HAL_ERROR;
-        }
+    if (BSP_SD_Init() != MSD_OK) {
+        s_sd_ready = false;
+        return HAL_ERROR;
     }
 
     /* 验证卡信息 */
@@ -75,7 +94,7 @@ HAL_StatusTypeDef sdcard_tf_deinit(void)
      *   4) 清所有 SDIO 中断标志 + disable 中断
      *   5) SDIO GPIO 回到 input floating（避免悬空引脚干扰）
      *
-     * 插卡后 BSP_SD_Init 里会完整 RCC reset + MX_SDIO_SD_Init 重建一切。
+     * 插卡后 BSP_SD_Init 重建SDIO和本卡DMA流。
      */
 
     /* 1) 停 DMA */

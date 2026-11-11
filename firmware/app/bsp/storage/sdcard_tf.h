@@ -5,10 +5,14 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+/* 单条SD命令响应期限为500 ms；HAL相关单元预包含本头，覆盖库默认值。 */
+#undef SDIO_CMDTIMEOUT
+#define SDIO_CMDTIMEOUT 500U
+
 /*
  * TF 卡（SD 卡）SDIO 驱动。
- * 硬件：SDIO 接口 + 4位数据线模式。
- * 依赖：CubeMX 已生成 MX_SDIO_Init()，全局句柄 hsd 可用。
+ * 硬件提供4位数据线，当前沿用生成配置的1位模式。
+ * 依赖：CubeMX 已生成 MX_SDIO_SD_Init()，全局句柄 hsd 可用。
  *
  * 本驱动只提供裸扇区读写（512B/块）。
  * 上层若要使用 FAT 文件系统，需自行集成 FatFs 中间件。
