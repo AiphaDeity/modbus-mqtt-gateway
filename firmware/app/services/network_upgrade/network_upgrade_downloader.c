@@ -19,6 +19,7 @@
 
 /* HTTPS 支持 */
 #include "https_tls.h"
+#include "https_ca_cert.h"   /* 百度云 BOS 根 CA (GlobalSign Root CA - R1) */
 
 /* ===== 内部缓冲（CCMRAM，不挤占普通 SRAM） ===== */
 #define NW_DL_RX_BUF_SIZE  1024   /* 略大于 1016，收响应头和 body 复用 */
@@ -181,10 +182,12 @@ static nw_dl_status_t fetch_https(const nw_dl_params_t *params,
     }
     printf("[NWDL] TCP connected (HTTPS)\r\n");
 
-    /* TLS 握手 */
-    /* CA 证书暂为 NULL（测试模式）；集成真实证书时从 params 或编译期常量传入 */
+    /* TLS 握手，CA 证书 = 预置 GlobalSign Root CA (百度云 BOS) */
     https_tls_result_t tls_ret = HttpsTls_Connect(&g_tls_session, conn,
-                                                    host, NULL, 0, timeout_ms);
+                                                    host,
+                                                    g_https_ca_cert_der,
+                                                    g_https_ca_cert_der_len,
+                                                    timeout_ms);
     if (tls_ret != HTTPS_TLS_OK)
     {
         printf("[NWDL] TLS handshake fail: %d\r\n", (int)tls_ret);

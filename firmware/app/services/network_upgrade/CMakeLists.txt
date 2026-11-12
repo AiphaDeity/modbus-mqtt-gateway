@@ -9,6 +9,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/network_upgrade_downloader.c
     ${CMAKE_CURRENT_LIST_DIR}/https_tls.c
     ${CMAKE_CURRENT_LIST_DIR}/https_tls_stubs.c
+    ${CMAKE_CURRENT_LIST_DIR}/https_ca_cert.c
 )
 
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
