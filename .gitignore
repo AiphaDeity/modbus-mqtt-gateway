@@ -27,6 +27,7 @@ CMakeUserPresets.json
 *.hex
 firmware/app/build/
 firmware/app/build_release/
+firmware/app/build_prod/
 firmware/bootloader/build/
 烧录.bat
 
