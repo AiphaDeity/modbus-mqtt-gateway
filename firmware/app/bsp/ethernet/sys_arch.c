@@ -440,7 +440,7 @@ sys_mbox_free(sys_mbox_t *mbox)
 sys_thread_t
 sys_thread_new(const char *name, lwip_thread_fn thread, void *arg, int stacksize, int prio)
 {
-  TaskHandle_t rtos_task;
+  TaskHandle_t rtos_task = NULL;
   BaseType_t ret;
   sys_thread_t lwip_thread;
   size_t rtos_stacksize;

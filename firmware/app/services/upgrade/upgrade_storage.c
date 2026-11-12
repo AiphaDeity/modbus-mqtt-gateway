@@ -614,7 +614,20 @@ static UpgradeStageResult Commit(void *context, uint32_t session_id,
   return result;
 }
 
-static const UpgradeStageBackend backend = {Prepare, Write, Read, Keys, Close, Commit};
+// 调用方持有Stage串行占用，只通过存储任务读取日志，不建立收包会话。
+static UpgradeStageResult ReadBootState(void *context, UpgradeStateProtection *state,
+                                         uint32_t timeout_ms)
+{
+  (void)context;
+  if (storage.begin_sent || storage.commit_sent)
+  {
+    return UPGRADE_STAGE_BUSY;
+  }
+  StartOperation(timeout_ms);
+  return LoadProtection(state);
+}
+
+static const UpgradeStageBackend backend = {Prepare, Write, Read, Keys, Close, Commit, ReadBootState};
 
 // 检查基线、协议尺寸、真实队列及密钥，接入升级后端。
 UpgradeStageResult UpgradeStorage_Bind(const UpgradeStorageBinding *binding)

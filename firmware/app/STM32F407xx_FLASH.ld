@@ -151,12 +151,7 @@ SECTIONS
 
   _siccmram = LOADADDR(.ccmram);
 
-  /* CCM-RAM section
-  *
-  * IMPORTANT NOTE!
-  * If initialized variables will be placed in this section,
-  * the startup code needs to be modified to copy the init-values.
-  */
+  /* 带初值的 CCM 数据由 AppMemory_InitCcm 从 Flash 复制。 */
   .ccmram :
   {
     . = ALIGN(4);
@@ -167,6 +162,16 @@ SECTIONS
     . = ALIGN(4);
     _eccmram = .;       /* create a global symbol at ccmram end */
   } >CCMRAM AT> FLASH
+
+  /* 零初值 CCM 数据不占 Flash；在构造函数和 main 前统一清零。 */
+  .ccmram_bss (NOLOAD) :
+  {
+    . = ALIGN(4);
+    _sccmram_bss = .;
+    *(.bss.ccmram .bss.ccmram.*)
+    . = ALIGN(4);
+    _eccmram_bss = .;
+  } >CCMRAM
 
   /* used by the startup to initialize data */
   _sidata = LOADADDR(.data);

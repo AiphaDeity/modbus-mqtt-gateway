@@ -18,6 +18,23 @@
 #define NW_DL_RX_BUF_SIZE  1024   /* 略大于 1016，收响应头和 body 复用 */
 #define NW_DL_HTTP_PORT    80
 
+static struct netconn *g_download_conn;
+
+/* 仅由升级任务调用；删除失败保留连接，下次下载先重试释放，不覆盖原始错误。 */
+static nw_dl_status_t download_close(nw_dl_status_t result)
+{
+    err_t err = netconn_delete(g_download_conn);
+    if (err == ERR_OK)
+        g_download_conn = NULL;
+    else
+    {
+        printf("[NWDL] connection delete fail err=%d\r\n", (int)err);
+        if (result == NW_DL_OK)
+            result = NW_DL_ERR_INTERNAL;
+    }
+    return result;
+}
+
 /* 解析 URL：http://host[:port]/path → host, port, path
  * 返回 0=成功，-1=格式错误
  * url 例：http://abc.baidubce.com:8080/fw/firmware.gwp
@@ -97,6 +114,7 @@ nw_dl_status_t NetworkDownloader_Fetch(const nw_dl_params_t *params)
     err_t err;
 
     if (!params || !params->url || !params->cb) return NW_DL_ERR_URL;
+    if (download_close(NW_DL_OK) != NW_DL_OK) return NW_DL_ERR_INTERNAL;
 
     uint32_t chunk_size = params->chunk_size;
     if (chunk_size == 0 || chunk_size > 1016) chunk_size = 1016;
@@ -127,14 +145,14 @@ nw_dl_status_t NetworkDownloader_Fetch(const nw_dl_params_t *params)
         printf("[NWDL] netconn_new fail\r\n");
         return NW_DL_ERR_CONNECT;
     }
+    g_download_conn = conn;
     netconn_set_recvtimeout(conn, 10000);  /* 10s recv 超时 */
 
     err = netconn_connect(conn, &ip, port);
     if (err != ERR_OK)
     {
         printf("[NWDL] connect fail err=%d\r\n", (int)err);
-        netconn_delete(conn);
-        return NW_DL_ERR_CONNECT;
+        return download_close(NW_DL_ERR_CONNECT);
     }
     printf("[NWDL] TCP connected\r\n");
 
@@ -153,22 +171,23 @@ nw_dl_status_t NetworkDownloader_Fetch(const nw_dl_params_t *params)
             "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n",
             path, host);
     }
+    if (req_len <= 0 || (size_t)req_len >= sizeof(req))
+        return download_close(NW_DL_ERR_REQUEST);
     err = netconn_write(conn, req, req_len, NETCONN_COPY);
     if (err != ERR_OK)
     {
         printf("[NWDL] write request fail err=%d\r\n", (int)err);
-        netconn_delete(conn);
-        return NW_DL_ERR_REQUEST;
+        return download_close(NW_DL_ERR_REQUEST);
     }
 
     /* 5. 收响应头（循环收直到找到 \r\n\r\n） */
-    static char hdr_buf[512] __attribute__((section(".ccmram")));   /* 响应头缓冲 */
+    static char hdr_buf[512] __attribute__((section(".bss.ccmram")));   /* 响应头缓冲 */
     int hdr_len = 0;
     int header_end_pos = -1;    /* \r\n\r\n 结束位置（body 起始在 hdr_buf 中的偏移） */
     struct netbuf *nbuf = NULL;
 
     /* body 残余：如果 header 和 body 在同一个 netbuf，保留 header 后面的 body 数据 */
-    static uint8_t body_residual[NW_DL_RX_BUF_SIZE] __attribute__((section(".ccmram")));
+    static uint8_t body_residual[NW_DL_RX_BUF_SIZE] __attribute__((section(".bss.ccmram")));
     uint32_t body_residual_len = 0;
 
     while (header_end_pos < 0 && hdr_len < (int)sizeof(hdr_buf) - 1)
@@ -177,8 +196,7 @@ nw_dl_status_t NetworkDownloader_Fetch(const nw_dl_params_t *params)
         if (err != ERR_OK)
         {
             printf("[NWDL] recv header fail err=%d\r\n", (int)err);
-            netconn_delete(conn);
-            return NW_DL_ERR_RESPONSE;
+            return download_close(NW_DL_ERR_RESPONSE);
         }
         void *data;
         uint16_t dlen;
@@ -223,7 +241,7 @@ nw_dl_status_t NetworkDownloader_Fetch(const nw_dl_params_t *params)
             }
         }
 
-        netbuf_free(nbuf);
+        netbuf_delete(nbuf);
         nbuf = NULL;
     }
     hdr_buf[hdr_len] = '\0';
@@ -231,8 +249,7 @@ nw_dl_status_t NetworkDownloader_Fetch(const nw_dl_params_t *params)
     if (header_end_pos < 0)
     {
         printf("[NWDL] header incomplete\r\n");
-        netconn_delete(conn);
-        return NW_DL_ERR_RESPONSE;
+        return download_close(NW_DL_ERR_RESPONSE);
     }
 
     /* 6. 解析状态码和 Content-Length */
@@ -240,27 +257,24 @@ nw_dl_status_t NetworkDownloader_Fetch(const nw_dl_params_t *params)
     if (status != 200 && status != 206)
     {
         printf("[NWDL] HTTP status %d\r\n", status);
-        netconn_delete(conn);
-        return NW_DL_ERR_HTTP_STATUS;
+        return download_close(NW_DL_ERR_HTTP_STATUS);
     }
     int32_t content_len = parse_content_length(hdr_buf, hdr_len);
     if (content_len < 0)
     {
         printf("[NWDL] no Content-Length\r\n");
-        netconn_delete(conn);
-        return NW_DL_ERR_NO_CONTENT_LEN;
+        return download_close(NW_DL_ERR_NO_CONTENT_LEN);
     }
     if ((uint32_t)content_len != params->total_size)
     {
         printf("[NWDL] size mismatch: got %ld expected %u\r\n",
                (long)content_len, (unsigned)params->total_size);
-        netconn_delete(conn);
-        return NW_DL_ERR_SIZE_MISMATCH;
+        return download_close(NW_DL_ERR_SIZE_MISMATCH);
     }
     printf("[NWDL] HTTP %d, Content-Length=%ld\r\n", status, (long)content_len);
 
     /* 7. 循环收 body，每 chunk_size 调回调 */
-    static uint8_t chunk_buf[NW_DL_RX_BUF_SIZE] __attribute__((section(".ccmram")));  /* body 分块缓冲 */
+    static uint8_t chunk_buf[NW_DL_RX_BUF_SIZE] __attribute__((section(".bss.ccmram")));  /* body 分块缓冲 */
     uint32_t offset = 0;
     uint32_t chunk_accum = 0;   /* 当前 chunk 累积字节数 */
 
@@ -277,8 +291,7 @@ nw_dl_status_t NetworkDownloader_Fetch(const nw_dl_params_t *params)
             if (cb_ret != NW_DL_OK)
             {
                 printf("[NWDL] callback error at residual offset=%u\r\n", (unsigned)offset);
-                netconn_delete(conn);
-                return NW_DL_ERR_CALLBACK;
+                return download_close(NW_DL_ERR_CALLBACK);
             }
             offset += chunk_accum;
             chunk_accum = 0;
@@ -292,8 +305,7 @@ nw_dl_status_t NetworkDownloader_Fetch(const nw_dl_params_t *params)
         {
             if (err == ERR_CLSD || err == ERR_CONN) break;  /* 服务端关连接 */
             printf("[NWDL] recv body fail err=%d at offset=%u\r\n", (int)err, (unsigned)offset);
-            netconn_delete(conn);
-            return NW_DL_ERR_RECEIVE;
+            return download_close(NW_DL_ERR_RECEIVE);
         }
 
         /* 遍历 netbuf 的所有段（pbuf 链可能有多段） */
@@ -321,9 +333,8 @@ nw_dl_status_t NetworkDownloader_Fetch(const nw_dl_params_t *params)
                     if (cb_ret != NW_DL_OK)
                     {
                         printf("[NWDL] callback error at offset=%u\r\n", (unsigned)offset);
-                        netbuf_free(nbuf);
-                        netconn_delete(conn);
-                        return NW_DL_ERR_CALLBACK;
+                        netbuf_delete(nbuf);
+                        return download_close(NW_DL_ERR_CALLBACK);
                     }
                     offset += chunk_accum;
                     chunk_accum = 0;
@@ -331,7 +342,7 @@ nw_dl_status_t NetworkDownloader_Fetch(const nw_dl_params_t *params)
             }
         } while (netbuf_next(nbuf) == ERR_OK);  /* 移到下一段，回 do 开头重新调 netbuf_data */
 
-        netbuf_free(nbuf);
+        netbuf_delete(nbuf);
         nbuf = NULL;
     }
 
@@ -341,20 +352,19 @@ nw_dl_status_t NetworkDownloader_Fetch(const nw_dl_params_t *params)
         nw_dl_status_t cb_ret = params->cb(params->ctx, offset, chunk_buf, chunk_accum);
         if (cb_ret != NW_DL_OK)
         {
-            netconn_delete(conn);
-            return NW_DL_ERR_CALLBACK;
+            return download_close(NW_DL_ERR_CALLBACK);
         }
         offset += chunk_accum;
     }
 
-    netconn_delete(conn);
-
     if (offset != (uint32_t)content_len)
     {
         printf("[NWDL] incomplete: got %u expected %ld\r\n", (unsigned)offset, (long)content_len);
-        return NW_DL_ERR_RECEIVE;
+        return download_close(NW_DL_ERR_RECEIVE);
     }
 
+    nw_dl_status_t result = download_close(NW_DL_OK);
+    if (result != NW_DL_OK) return result;
     printf("[NWDL] download complete: %u bytes\r\n", (unsigned)offset);
     return NW_DL_OK;
 }

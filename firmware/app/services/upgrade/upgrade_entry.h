@@ -37,7 +37,8 @@ const char *UpgradeEntry_PhaseName(UpgradeStagePhase phase);
 UpgradeStageResult UpgradeEntry_Begin(const UpgradeEntryPeer *peer, const char *path,
                                       uint32_t total_size, const uint8_t *sha256, uint32_t *session_id);
 /*
- * 按字节偏移写入 1～1016 B 数据，返回后可复用 data；由升级执行任务同步调用。
+ * 按字节偏移写入 1～1016 B 数据，data 在返回前须可读且不变，返回后可复用。
+ * 由升级执行任务同步调用，不保留 data 指针。
  * peer/session_id 必须匹配当前会话；连续 30 s 无新增读回数据则超时。
  */
 UpgradeStageResult UpgradeEntry_Write(const UpgradeEntryPeer *peer, uint32_t session_id,

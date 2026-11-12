@@ -5,8 +5,8 @@
  *   ① 接收并校验升级任务：MQTT 通知 JSON 解析 + authorize 回调
  *   ② 主动分块下载：调 NetworkDownloader_Fetch，每块交 UpgradeEntry_Write
  *   ③ 调用 M4 接口：Begin → Write(循环) → Finish → Reboot（执行任务串行调）
- *   ④ 状态与结果上报：PUBLISH ota_status，重启后查 GetStatus 上报最终结果
- *   ⑤ 网络暂停、门控和健康报告：UpgradeQuiesce_Bind(NETWORK) + Monitor_RegisterHealth
+ *   ④ 状态与结果上报：消费M4核验的Boot结果，PUBLISH ota_status并等待PUBACK
+ *   ⑤ 网络暂停和门控：UpgradeQuiesce_Bind(NETWORK)
  *
  * 不在 MQTT 回调里执行下载/Flash/密码运算（README 明确要求）。
  */
@@ -20,14 +20,15 @@
 #include "cmsis_os2.h"
 #include "FreeRTOS.h"
 #include "task.h"
+#include "stm32f4xx_hal.h"
 
 #include "upgrade_stage.h"
 #include "upgrade_entry.h"
 #include "upgrade_quiesce.h"
-#include "app_monitor.h"
 #include "app_upgrade.h"
 #include "app_modules.h"
 #include "mqtt_client.h"
+#include "telemetry_task.h"
 
 /* ===== 升级通知请求结构（JSON 解析结果） ===== */
 typedef struct
@@ -52,6 +53,7 @@ typedef struct
 
 /* ===== 前向声明（内部函数） ===== */
 static void NetworkUpgrade_Task(void *argument);
+static void report_boot_result(void);
 
 /* ===== 模块状态 ===== */
 static volatile bool s_initialized = false;
@@ -59,21 +61,22 @@ static volatile bool s_task_started = false;
 
 /* 升级执行任务同步：Notify 设 request + 释放信号量，Task 获取后执行 */
 static osSemaphoreId_t s_notify_sem = NULL;
-static nw_upgrade_request_t s_pending_req __attribute__((section(".ccmram")));   /* Notify 写，Task 读（单生产单消费） */
+static nw_upgrade_request_t s_pending_req __attribute__((section(".bss.ccmram")));   /* Notify 写，Task 读（单生产单消费） */
 static volatile bool s_upgrade_in_progress = false;
 
 /* 当前升级阶段（供状态上报） */
-static volatile int s_phase = 0;   /* 0=idle 1=downloading 2=verifying 3=ready 4=rebooting 5=installed 6=failed */
+static volatile int s_phase = 0;   /* 0～6为下载阶段，7=trial，8=rolled_back；名称见phase_to_string。 */
+static bool s_boot_result_done;
 
 /* epoch 分配计数器（每次下载尝试唯一，本次启动不复用） */
 static volatile uint32_t s_epoch_counter = 0;
 
 /* ota_status topic（Init 时拼好，百度云模式 $iot/{dk}/user/ota_status） */
-static char s_ota_status_topic[96] __attribute__((section(".ccmram"))) = {0};
+static char s_ota_status_topic[96] __attribute__((section(".bss.ccmram"))) = {0};
 
 /* ===== 升级执行任务静态资源（6KiB，放 CCMRAM 不挤占 SRAM） ===== */
-_Alignas(8) static StackType_t s_upgrade_stack[NETWORK_UPGRADE_TASK_STACK_BYTES / sizeof(StackType_t)] __attribute__((section(".ccmram")));
-static StaticTask_t s_upgrade_control_block __attribute__((section(".ccmram")));
+_Alignas(8) static StackType_t s_upgrade_stack[NETWORK_UPGRADE_TASK_STACK_BYTES / sizeof(StackType_t)] __attribute__((section(".bss.ccmram")));
+static StaticTask_t s_upgrade_control_block __attribute__((section(".bss.ccmram")));
 static const osThreadAttr_t s_upgrade_attributes =
 {
     .name = "nw_upgrade",
@@ -168,6 +171,8 @@ static const char *phase_to_string(int phase)
         case 4: return "rebooting";
         case 5: return "installed";
         case 6: return "failed";
+        case 7: return "trial";
+        case 8: return "rolled_back";
         default: return "unknown";
     }
 }
@@ -215,20 +220,19 @@ static nw_dl_status_t download_chunk_callback(void *ctx_, uint32_t offset,
     if ((offset & ~0x3FFF) != ((offset + len) & ~0x3FFF))
     {
         report_progress(ctx->task_id, offset + len, ctx->total_size);
-        Monitor_ReportProgress(APP_MODULE_MQTT, true);
     }
 
     return NW_DL_OK;
 }
 
 /* ===== 网络门控回调（UpgradeQuiesceParticipant） =====
- * pause: 暂停遥测发送 + Telemetry 采集
- * settle: 结算在途 PUBLISH（等待或超时）
- * sync: flush 缓冲
+ * pause: 请求两个任务停止新业务
+ * settle: 等待任务自身确认及发送锁退出
+ * sync: 再次核对暂停，持久数据由Storage_Task同步
  * resume: 恢复业务
  */
 
-/* 门控标志：pause 设 true，resume 设 false。Telemetry 主循环检查它。 */
+/* 仅表示已请求暂停；停稳结果须查询两个任务的实际确认。 */
 static volatile bool s_quiesced = false;
 
 bool NetworkUpgrade_IsQuiesced(void)
@@ -236,40 +240,55 @@ bool NetworkUpgrade_IsQuiesced(void)
     return s_quiesced;
 }
 
+/* 原子关闭两个任务的业务入口，每次请求撤销旧确认。 */
 static UpgradeStageResult quiesce_pause(void *ctx, uint32_t timeout_ms)
 {
-    (void)ctx; (void)timeout_ms;
-    /* 设暂停标志：Telemetry 下一轮看到就跳过采集+上报 */
+    (void)ctx;
+    if (timeout_ms == 0U) return UPGRADE_STAGE_TIMEOUT;
+    taskENTER_CRITICAL();
     s_quiesced = true;
-    printf("[NWUPG] quiesce_pause: telemetry paused\r\n");
+    MqttClient_SetPaused(true);
+    Telemetry_SetPaused(true);
+    taskEXIT_CRITICAL();
+    printf("[NWUPG] pause requested\r\n");
     return UPGRADE_STAGE_OK;
 }
 
+/* 等待真实任务安全点，等待本身不代报健康、不延长传入期限。 */
 static UpgradeStageResult quiesce_settle(void *ctx, uint32_t timeout_ms)
 {
     (void)ctx;
-    /* 结算在途 PUBLISH：等当前轮 Telemetry 完成（最多 timeout_ms）。
-     * Telemetry 周期 2s，一轮采集+上报约 200ms。等 500ms 足够让在途消息发完。 */
-    uint32_t wait = (timeout_ms > 0 && timeout_ms < 500) ? timeout_ms : 500;
-    osDelay(wait);
-    printf("[NWUPG] quiesce_settle: in-flight settled (%ums)\r\n", (unsigned)wait);
-    return UPGRADE_STAGE_OK;
+    uint32_t started_ms = HAL_GetTick();
+    while ((uint32_t)(HAL_GetTick() - started_ms) < timeout_ms)
+    {
+        if (!s_quiesced) return UPGRADE_STAGE_MODE;
+        bool mqtt_paused = MqttClient_IsPaused();
+        bool telemetry_paused = Telemetry_IsPaused();
+        if (mqtt_paused && telemetry_paused) return UPGRADE_STAGE_OK;
+        if (osDelay(1U) != osOK) return UPGRADE_STAGE_INTERNAL;
+    }
+    printf("[NWUPG] settle timeout mqtt=%u telemetry=%u\r\n",
+           (unsigned)MqttClient_IsPaused(), (unsigned)Telemetry_IsPaused());
+    return UPGRADE_STAGE_TIMEOUT;
 }
 
+/* 网络没有另建持久缓冲；保持暂停，记录落盘由存储同步阶段确认。 */
 static UpgradeStageResult quiesce_sync(void *ctx, uint32_t timeout_ms)
 {
-    (void)ctx; (void)timeout_ms;
-    /* flush：当前无额外缓冲要刷，MQTT netconn_write 是同步的，直接返回 OK */
-    printf("[NWUPG] quiesce_sync: no buffer to flush\r\n");
-    return UPGRADE_STAGE_OK;
+    return quiesce_settle(ctx, timeout_ms);
 }
 
+/* 撤销本地请求；协调器在所有恢复成功后最后开放全局准入。 */
 static UpgradeStageResult quiesce_resume(void *ctx, uint32_t timeout_ms)
 {
-    (void)ctx; (void)timeout_ms;
-    /* 恢复业务：清暂停标志，Telemetry 下一轮恢复采集+上报 */
+    (void)ctx;
+    if (timeout_ms == 0U) return UPGRADE_STAGE_TIMEOUT;
+    taskENTER_CRITICAL();
+    MqttClient_SetPaused(false);
+    Telemetry_SetPaused(false);
     s_quiesced = false;
-    printf("[NWUPG] quiesce_resume: telemetry resumed\r\n");
+    taskEXIT_CRITICAL();
+    printf("[NWUPG] pause request cleared\r\n");
     return UPGRADE_STAGE_OK;
 }
 
@@ -317,14 +336,8 @@ void NetworkUpgrade_Init(void)
         printf("[NWUPG] QuiesceBind(NETWORK) fail: %s\r\n", UpgradeEntry_ErrorName(ret));
     }
 
-    /* 登记 MQTT 模块健康（2s 进展，30s 等待上限） */
-    Monitor_RegisterHealth(APP_MODULE_MQTT, 2000, 30000);
-
-    /* 登记 Telemetry 模块健康 */
-    Monitor_RegisterHealth(APP_MODULE_TELEMETRY, 2000, 30000);
-
     s_initialized = true;
-    printf("[NWUPG] Init OK: policy+quiesce+monitor bound\r\n");
+    printf("[NWUPG] Init OK: policy+quiesce bound\r\n");
 }
 
 /* ===== 创建执行任务 ===== */
@@ -387,8 +400,13 @@ static void NetworkUpgrade_Task(void *argument)
 
     for (;;)
     {
-        /* 等通知 */
-        osSemaphoreAcquire(s_notify_sem, osWaitForever);
+        /* 空闲时每秒尝试交接启动结果；收到下载通知后立即消费，不在此处等待上报。 */
+        osStatus_t wait = osSemaphoreAcquire(s_notify_sem, osKernelGetTickFreq());
+        if (wait != osOK)
+        {
+            report_boot_result();
+            continue;
+        }
         if (!s_pending_req.valid) continue;
 
         s_upgrade_in_progress = true;
@@ -502,90 +520,60 @@ static void NetworkUpgrade_Task(void *argument)
     }
 }
 
-/* ===== 重启后结果上报 =====
- * 重启后 ReportFinalResult 被调用时：
- * - is_trial == false → 正常启动，不上报最终结果
- * - is_trial == true  → 升级后首次启动，代码能跑到这 = 新 App 健康 = 升级成功
- *   Boot 写了 TRIAL 但 CONFIRM 由 Monitor 任务在健康 1s 后写入。
- *   GetStatus 查 phase + commit_state 判断当前确认进度。
- *   task_id 重启后丢失（RAM 数据没了），用 boot identity 的 sequence 代替。
- */
-void NetworkUpgrade_ReportFinalResult(void)
+/* 只消费M4已核验的本次启动快照；同一结果在broker确认前保留并重试。 */
+static void report_boot_result(void)
 {
-    if (!s_initialized) return;
+    if (s_boot_result_done) return;
 
-    /* 判断是否升级后启动 */
-    bool is_trial = App_UpgradeIsTrial();
-    if (!is_trial)
+    UpgradeMessage identity;
+    if (!App_UpgradeGetStartupIdentity(&identity))
     {
-        printf("[NWUPG] not trial boot, skip final report\r\n");
+        s_boot_result_done = true;
         return;
     }
+    AppUpgradeResult result = App_UpgradeGetResult();
+    if ((result == APP_UPGRADE_RESULT_UNKNOWN) || !MqttClient_IsConnected()) return;
 
-    /* 查 Boot 身份（获取 sequence 作为 task_id 标识） */
-    UpgradeMessage msg;
-    char task_id_buf[32] = {0};
-    if (App_UpgradeGetBootIdentity(&msg))
+    const char *phase;
+    switch (result)
     {
-        printf("[NWUPG] trial boot: seq=%u attempts=%u\r\n",
-               (unsigned)msg.sequence, (unsigned)msg.trial_attempts);
-        snprintf(task_id_buf, sizeof(task_id_buf), "seq%u", (unsigned)msg.sequence);
-    }
-
-    /* 查 GetStatus（不访问存储，只读 RAM 快照） */
-    UpgradeEntryPeer peer =
-    {
-        .source = UPGRADE_STAGE_SOURCE_NETWORK,
-        .epoch = 0,   /* 重启后查询，epoch 不重要 */
-    };
-    UpgradeStageStatus status;
-    UpgradeStageResult ret = UpgradeEntry_GetStatus(&peer, &status);
-    if (ret != UPGRADE_STAGE_OK)
-    {
-        printf("[NWUPG] GetStatus fail: %s\r\n", UpgradeEntry_ErrorName(ret));
-        /* GetStatus 失败也上报（is_trial=true 说明新 App 在运行） */
-        s_phase = 5;
-        report_status(task_id_buf, "installed", "trial");
-        return;
-    }
-
-    printf("[NWUPG] GetStatus: phase=%s commit=%d err=%s\r\n",
-           UpgradeEntry_PhaseName(status.phase),
-           (int)status.commit_state,
-           UpgradeEntry_ErrorName(status.error));
-
-    /* 根据 phase + commit_state 判断安装结果 */
-    switch (status.phase)
-    {
-        case UPGRADE_STAGE_VERIFIED:
-        case UPGRADE_STAGE_REBOOT_PENDING:
-            /* READY 已提交，试运行中。commit_state 判断 Boot 是否已写确认 */
+        case APP_UPGRADE_RESULT_TRIAL:
+            phase = "trial";
+            s_phase = 7;
+            break;
+        case APP_UPGRADE_RESULT_CONFIRMED:
+            phase = "confirmed";
             s_phase = 5;
-            if (status.commit_state == UPGRADE_COMMIT_WRITTEN)
-                report_status(task_id_buf, "installed", "confirmed");
-            else
-                report_status(task_id_buf, "installed", "trial");
             break;
-
-        case UPGRADE_STAGE_IDLE:
-            /* 已确认完成或回退完成。is_trial=true 说明是试运行启动，不是回退 */
-            s_phase = 5;
-            if (status.commit_state == UPGRADE_COMMIT_WRITTEN)
-                report_status(task_id_buf, "installed", "success");
-            else
-                report_status(task_id_buf, "installed", "trial");
+        case APP_UPGRADE_RESULT_ROLLED_BACK:
+            phase = "rolled_back";
+            s_phase = 8;
             break;
-
-        case UPGRADE_STAGE_ERROR:
-            /* 健康检查失败 */
-            s_phase = 6;
-            report_status(task_id_buf, "failed", UpgradeEntry_ErrorName(status.error));
-            break;
-
         default:
-            /* QUIESCING/STAGING 等中间状态 */
-            s_phase = 5;
-            report_status(task_id_buf, "installed", "in_progress");
-            break;
+            return;
+    }
+
+    char digest[65];
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < sizeof(identity.digest); i++)
+    {
+        digest[i * 2] = hex[identity.digest[i] >> 4];
+        digest[i * 2 + 1] = hex[identity.digest[i] & 0x0fU];
+    }
+    digest[64] = '\0';
+
+    char payload[256];
+    int len = snprintf(payload, sizeof(payload),
+        "{\"type\":\"boot_result\",\"tx_id\":\"%08lx%08lx\",\"sequence\":%lu,"
+        "\"phase\":\"%s\",\"image_sha256\":\"%s\"}",
+        (unsigned long)(identity.tx_id >> 32), (unsigned long)(uint32_t)identity.tx_id,
+        (unsigned long)identity.sequence, phase, digest);
+    if ((len <= 0) || ((size_t)len >= sizeof(payload))) return;
+
+    if (MqttClient_PublishUpgradeResult((const uint8_t *)payload, (size_t)len) == 1)
+    {
+        s_boot_result_done = true;
+        printf("[NWUPG] boot result PUBACK: tx=%08lx%08lx phase=%s\r\n",
+               (unsigned long)(identity.tx_id >> 32), (unsigned long)(uint32_t)identity.tx_id, phase);
     }
 }

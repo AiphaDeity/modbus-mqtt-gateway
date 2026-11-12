@@ -32,7 +32,6 @@ static UpgradeStageStatus session;
 static UpgradeStageStatus published_status;
 
 // 普通SRAM固定工作区，不将整包放RAM；同一时间只有一个修改操作使用。
-static uint8_t chunk[UPGRADE_STAGE_MAX_CHUNK_SIZE] __attribute__((aligned(8)));
 static uint8_t readback[256] __attribute__((aligned(8)));
 
 // 检查当前是否处于调度器运行后的任务上下文。
@@ -177,7 +176,7 @@ static UpgradeStageResult CheckSession(uint32_t session_id)
 }
 
 // 比较整块的持久读回；追加和重复块共用，不靠CRC或最后一块缓存判断相同。
-static UpgradeStageResult ReadMatches(uint32_t offset, uint32_t size)
+static UpgradeStageResult ReadMatches(uint32_t offset, const uint8_t *expected, uint32_t size)
 {
   uint32_t compared = 0U;
   while (compared < size)
@@ -202,7 +201,7 @@ static UpgradeStageResult ReadMatches(uint32_t offset, uint32_t size)
     {
       return result;
     }
-    if (memcmp(readback, &chunk[compared], count) != 0)
+    if (memcmp(readback, expected + compared, count) != 0)
     {
       return UPGRADE_STAGE_INTEGRITY;
     }
@@ -234,7 +233,7 @@ UpgradeStageResult UpgradeStage_Bind(const UpgradeStageBackend *adapter, void *c
 {
   if ((adapter == NULL) || (adapter->prepare == NULL) || (adapter->write == NULL)
       || (adapter->read == NULL) || (adapter->keys == NULL) || (adapter->close == NULL)
-      || (adapter->commit == NULL))
+      || (adapter->commit == NULL) || (adapter->read_boot_state == NULL))
   {
     return UPGRADE_STAGE_INVALID;
   }
@@ -251,6 +250,49 @@ UpgradeStageResult UpgradeStage_Bind(const UpgradeStageBackend *adapter, void *c
   backend_context = context;
   backend_ready = true;
   return ReleaseOperation(UPGRADE_STAGE_OK);
+}
+
+// 与收包共用修改占用，避免只读查询抢用存储请求和应答工作区。
+UpgradeStageResult UpgradeStage_ReadBootState(UpgradeStateProtection *state, uint32_t timeout_ms)
+{
+  if (state == NULL)
+  {
+    return UPGRADE_STAGE_INVALID;
+  }
+  memset(state, 0, sizeof(*state));
+  if ((timeout_ms == 0U) || (timeout_ms > 3000U))
+  {
+    return UPGRADE_STAGE_INVALID;
+  }
+  if (!UpgradeStage_ExecutorAllowed())
+  {
+    return UPGRADE_STAGE_MODE;
+  }
+  UpgradeStageResult result = TakeOperation();
+  if (result != UPGRADE_STAGE_OK)
+  {
+    return result;
+  }
+  if (!backend_ready)
+  {
+    return ReleaseOperation(UPGRADE_STAGE_NOT_READY);
+  }
+  if (storage_open || (session.resume_error != UPGRADE_STAGE_OK)
+      || ((session.phase != UPGRADE_STAGE_IDLE) && (session.phase != UPGRADE_STAGE_ERROR)))
+  {
+    return ReleaseOperation(UPGRADE_STAGE_BUSY);
+  }
+  uint32_t started_ms = HAL_GetTick();
+  result = backend.read_boot_state(backend_context, state, timeout_ms);
+  if (RemainingMs(started_ms, timeout_ms) == 0U)
+  {
+    result = UPGRADE_STAGE_TIMEOUT;
+  }
+  if (result != UPGRADE_STAGE_OK)
+  {
+    memset(state, 0, sizeof(*state));
+  }
+  return ReleaseOperation(result);
 }
 
 // 检查准入和旧占用，分配会话并准备候选槽。
@@ -352,7 +394,7 @@ UpgradeStageResult UpgradeStage_Begin(UpgradeStageSource source, uint32_t total_
 UpgradeStageResult UpgradeStage_Write(uint32_t session_id, uint32_t offset,
                                      const uint8_t *data, uint32_t size)
 {
-  if ((data == NULL) || (size == 0U) || (size > sizeof(chunk)))
+  if ((data == NULL) || (size == 0U) || (size > UPGRADE_STAGE_MAX_CHUNK_SIZE))
   {
     return UPGRADE_STAGE_INVALID;
   }
@@ -379,7 +421,6 @@ UpgradeStageResult UpgradeStage_Write(uint32_t session_id, uint32_t offset,
   {
     return ReleaseOperation(UPGRADE_STAGE_OFFSET);
   }
-  memcpy(chunk, data, size);
   bool append = (offset == session.next_offset);
   if (append)
   {
@@ -388,7 +429,7 @@ UpgradeStageResult UpgradeStage_Write(uint32_t session_id, uint32_t offset,
     {
       return ReleaseOperation(FailSession(UPGRADE_STAGE_TIMEOUT));
     }
-    result = backend.write(backend_context, session_id, offset, chunk, size, remaining);
+    result = backend.write(backend_context, session_id, offset, data, size, remaining);
     if (RemainingMs(last_progress_ms, UPGRADE_STAGE_IDLE_TIMEOUT_MS) == 0U)
     {
       result = UPGRADE_STAGE_TIMEOUT;
@@ -396,7 +437,7 @@ UpgradeStageResult UpgradeStage_Write(uint32_t session_id, uint32_t offset,
   }
   if (result == UPGRADE_STAGE_OK)
   {
-    result = ReadMatches(offset, size);
+    result = ReadMatches(offset, data, size);
   }
   uint32_t completed_ms = HAL_GetTick();
   if (UpgradeStage_CancellationRequested(session_id))

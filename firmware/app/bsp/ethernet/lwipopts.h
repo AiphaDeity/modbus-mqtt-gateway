@@ -157,6 +157,7 @@
 #define TCPIP_MBOX_SIZE                 4     /* 原 8，裁剪一半 */
 #define TCPIP_THREAD_PRIO               (configMAX_PRIORITIES - 2)
 #define LWIP_SO_RCVTIMEO                1   /* netconn 收超时要用 */
+#define LWIP_SO_SNDTIMEO                1   /* MQTT发送须在监督等待期限内返回 */
 
 /* ---------- 调试 ---------- */
 #define LWIP_DEBUG                      LWIP_DBG_OFF   /* ★关闭 lwip 内部调试打印（否则串口刷屏） */

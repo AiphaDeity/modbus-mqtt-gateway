@@ -21,6 +21,7 @@
 #include "queue.h"
 
 #include <string.h>
+#include <stdio.h>
 
 /* ---------- 队列句柄 ---------- */
 
@@ -28,22 +29,11 @@ static osMessageQueueId_t s_write_q   = NULL;   /* 元素：storage_write_req_t�
 static osMessageQueueId_t s_fetch_q   = NULL;   /* 元素：storage_fetch_req_t（值） */
 static osMessageQueueId_t s_resp_q    = NULL;   /* 元素：storage_fetch_resp_t（~4.3KB 值，深度 1） */
 static osMessageQueueId_t s_ack_q     = NULL;   /* 元素：storage_ack_t（值） */
+/* 写入失败可能已推进介质状态，锁存后保留原队首，不自动重试冒充重复成功。 */
+static HAL_StatusTypeDef s_write_error;
 
-/*
- * ============================================================================
- * ★ RAM 优化：以下 5 块存储合计约 13.3KB，整体搬到 CCMRAM。
- *
- *   F407 有 64KB CCM（0x10000000），只能被 CPU 访问、不能 DMA。本工程
- *   此前 CCM 占用为 0，完全空着。这 5 块是纯软件队列存储——只被
- *   osMessageQueuePut/Get 的内核 memcpy 读写，不涉及任何 DMA，
- *   所以放进 CCM 对功能零影响，却能把 13.3KB 从 128KB SRAM 里让出来。
- *
- *   ⚠️ 本工程 startup_stm32f407xx.s 没有实现 .ccmram 段的拷贝/清零循环，
- *      CCM 里的变量上电是随机值，因此必须在 storage_m2_init() 里手动 memset。
- *      任意一块漏清零 → 队列控制块带垃圾值 → osMessageQueueNew 行为异常。
- * ============================================================================
- */
-#define M3_CCM  __attribute__((section(".ccmram"), used))
+/* CCM 队列和响应缓冲仅由 CPU 访问，启动时统一清零，不可用于 DMA。 */
+#define M3_CCM  __attribute__((section(".bss.ccmram"), used))
 
 /* 应答组装缓冲：填好后值拷贝入队列，随后即可重填 */
 M3_CCM static storage_fetch_resp_t s_resp_buf;
@@ -66,10 +56,7 @@ _Alignas(8) M3_CCM static uint8_t s_ack_q_cb  [ QCB_SIZE(STORAGE_M2_ACK_Q_DEPTH,
 
 void storage_m2_init(void)
 {
-    /*
-     * CCM 段不被 startup 清零（见上方说明），这里必须逐块手动清零，
-     * 否则队列控制块和存储区带随机值。
-     */
+    /* 建队列前清理静态存储和响应缓冲。 */
     memset(&s_resp_buf,   0, sizeof(s_resp_buf));
     memset(s_write_q_cb,  0, sizeof(s_write_q_cb));
     memset(s_fetch_q_cb,  0, sizeof(s_fetch_q_cb));
@@ -115,54 +102,77 @@ void storage_m2_get_cache_stats(storage_cache_stats_t *out)
 
 /* ---------- 内部处理 ---------- */
 
-static void process_write_queue(void)
+/* 先查看队首，只有记录写入明确成功后才移除请求。 */
+static HAL_StatusTypeDef process_write_queue(void)
 {
     storage_write_req_t req;
-    /* 每轮至多一条，持续上报不能饿死升级读回和取消请求。 */
-    if (osMessageQueueGet(s_write_q, &req, NULL, 0) == osOK) {
-        (void)storage_record_append(req.kind, req.seq, req.captured_at_ms,
-                                    req.payload, req.payload_len);
+    if (s_write_error != HAL_OK) return s_write_error;
+    if (xQueuePeek((QueueHandle_t)s_write_q, &req, 0U) != pdPASS) return HAL_OK;
+    HAL_StatusTypeDef result = storage_record_append(req.kind, req.seq, req.captured_at_ms,
+                                                    req.payload, req.payload_len);
+    if (result == HAL_OK) {
+        if (osMessageQueueGet(s_write_q, &req, NULL, 0U) != osOK) result = HAL_ERROR;
     }
+    if (result == HAL_ERROR || result == HAL_TIMEOUT) {
+        s_write_error = result;
+        printf("[M3] queued write unresolved seq=%08lX%08lX status=%u\r\n",
+               (unsigned long)(req.seq >> 32), (unsigned long)req.seq, (unsigned)result);
+    }
+    return result;
 }
 
-static void process_fetch_queue(void)
+/* 请求、读回及应答成对处理；应答满或读取失败时不移除请求。 */
+static HAL_StatusTypeDef process_fetch_queue(void)
 {
     storage_fetch_req_t req;
-    if (osMessageQueueGet(s_fetch_q, &req, NULL, 0) != osOK) return;
+    if (xQueuePeek((QueueHandle_t)s_fetch_q, &req, 0U) != pdPASS) return HAL_OK;
+    if (osMessageQueueGetSpace(s_resp_q) == 0U) return HAL_BUSY;
 
     uint16_t max_count = req.max_count;
     if (max_count > STORAGE_M2_FETCH_BATCH_MAX) max_count = STORAGE_M2_FETCH_BATCH_MAX;
 
     uint16_t count = 0;
-    storage_record_fetch(max_count, s_resp_buf.records, &count);
+    HAL_StatusTypeDef result = storage_record_fetch(max_count, s_resp_buf.records, &count);
+    if (result != HAL_OK) return result;
 
     s_resp_buf.req_id = req.req_id;
     s_resp_buf.count  = count;
 
-    /* 应答队列深度 1：上一份应答没被取走就丢弃（M2 单在途 + 超时重试） */
-    (void)osMessageQueuePut(s_resp_q, &s_resp_buf, 0, 0);
+    if (osMessageQueuePut(s_resp_q, &s_resp_buf, 0, 0) != osOK) return HAL_ERROR;
+    return osMessageQueueGet(s_fetch_q, &req, NULL, 0U) == osOK ? HAL_OK : HAL_ERROR;
 }
 
-static void process_ack_queue(void)
+/* 保留不能应用的回执；水位更新后的持久化由统一同步阶段确认。 */
+static HAL_StatusTypeDef process_ack_queue(void)
 {
     storage_ack_t ack;
-    if (osMessageQueueGet(s_ack_q, &ack, NULL, 0) == osOK) {
-        storage_record_ack_upto(ack.ack_upto_seq);
-    }
+    if (xQueuePeek((QueueHandle_t)s_ack_q, &ack, 0U) != pdPASS) return HAL_OK;
+    if (!storage_mutation_allowed() || !storage_record_is_ready()) return HAL_BUSY;
+    storage_record_ack_upto(ack.ack_upto_seq);
+    return osMessageQueueGet(s_ack_q, &ack, NULL, 0U) == osOK ? HAL_OK : HAL_ERROR;
 }
 
-void storage_m2_process(void)
+/* 持完整操作锁收尾一轮；临时忙与明确I/O失败分别返回。 */
+HAL_StatusTypeDef storage_m2_process(void)
 {
-    if (s_write_q == NULL || !storage_mutation_allowed()) return;
-    process_write_queue();
-    process_fetch_queue();
-    process_ack_queue();
+    if (s_write_q == NULL || s_fetch_q == NULL || s_resp_q == NULL || s_ack_q == NULL)
+        return HAL_ERROR;
+    if (!storage_mutation_begin()) return HAL_BUSY;
+    HAL_StatusTypeDef write_result = process_write_queue();
+    HAL_StatusTypeDef fetch_result = process_fetch_queue();
+    HAL_StatusTypeDef ack_result = process_ack_queue();
+    storage_mutation_end();
+    if (write_result == HAL_ERROR || fetch_result == HAL_ERROR || ack_result == HAL_ERROR)
+        return HAL_ERROR;
+    if (write_result == HAL_TIMEOUT || fetch_result == HAL_TIMEOUT) return HAL_TIMEOUT;
+    return write_result == HAL_BUSY || fetch_result == HAL_BUSY || ack_result == HAL_BUSY ? HAL_BUSY : HAL_OK;
 }
 
 /* 调用方已暂停生产和业务处理，只观察未完成请求，不清空或伪造应答。 */
 bool storage_m2_settled(void)
 {
-    return s_write_q != NULL && s_ack_q != NULL && s_fetch_q != NULL && s_resp_q != NULL &&
+    return s_write_error == HAL_OK &&
+           s_write_q != NULL && s_ack_q != NULL && s_fetch_q != NULL && s_resp_q != NULL &&
            osMessageQueueGetCount(s_write_q) == 0U &&
            osMessageQueueGetCount(s_ack_q) == 0U &&
            osMessageQueueGetCount(s_fetch_q) == 0U;

@@ -509,6 +509,7 @@ void UpgradeTf_Task(void *argument)
       Error_Handler();
       return;
     }
+    App_UpgradePollResult(HAL_GetTick());
     bool pressed = HAL_GPIO_ReadPin(TF_UPGRADE_KEY_GPIO_Port, TF_UPGRADE_KEY_Pin) == GPIO_PIN_SET;
     if (ButtonReleased(&button, pressed, HAL_GetTick()))
     {

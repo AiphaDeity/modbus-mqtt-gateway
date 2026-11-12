@@ -113,7 +113,7 @@ IDLE → STAGING → VERIFIED → QUIESCING → REBOOT_PENDING
 | 操作 | 已实现行为 |
 | --- | --- |
 | Begin | 整包216～458960 B、来源和32 B传输SHA；成功才输出非零RAM会话号。prepare匹配本次Boot身份并完整认证confirmed，预留非零事务号，重新检查角色后才让M3准备另一槽 |
-| Write | 1～1016 B输入复制到普通SRAM；适配拆成≤256 B。完整写后逐字节读回，成功才推进；相同重复块只读比较、不重写、不推进或续期 |
+| Write | 同步读取1～1016 B输入，返回前须保持可读且不变；适配拆成≤256 B值拷贝入存储请求。完整写后逐字节读回，成功才推进；相同重复块只读比较、不重写、不推进或续期 |
 | Finish | 重新读整包算传输SHA，再做实际公共认证/向量检查，成功只到VERIFIED并保留候选租约 |
 | Commit | 必须VERIFIED；关变更门控，按模块暂停→结算→同步，全部成功才请求持久READY，复读确认后到REBOOT_PENDING |
 | Abort | 未提交时幂等释放占用，不擦包或日志；UNKNOWN/已提交READY拒绝撤销。恢复或关闭失败分别记录并保留门控/租约 |
@@ -228,6 +228,23 @@ Initialize只由显式首次配置调用，必须全部[0,0x7000)升级元数据
 次数为已提交的放行机会；写记录后、跳转前掉电也计入。禁止次数减少或同事务重新归零；每次放行有不同sequence。64 B邮箱基线2在word12/13放tx_id低/高32位，word14放次数；Boot仅软件复位且域/事务/序号/摘要/次数匹配才接受意图，仍重认证及比对App。
 
 App从入口起最长30 s，可信平台/产品自检连续健康1 s才请求确认，不要求外部网络在线或TF存在。Monitor聚合各关键模块登记/真实进展/自检，合法等待不能续期，过期或致命平台故障锁存停止喂狗；确认前再次原子检查，避免Poll后故障仍写确认。缺实际报告不自动确认，M1/M2/M3试运行业务门控仍需接入，不能称整机试运行已验收。
+
+### 启动结果与联网交接
+
+现有升级任务通过App_UpgradePollResult最多每秒尝试一次只读核对，每次总限3 s，成功取得本次启动快照后停止读取；读失败保留重试。UpgradeStage_ReadBootState与收包共用串行占用，仅空闲或已清理ERROR允许；实际读取仍由Storage_Task处理既有READ_METADATA消息，不直接访问Flash。收包中、提交不明、旧占用未释放、读失败或身份不匹配均不产生成功结果。
+
+| 本次Boot及持久状态 | 结果 |
+| --- | --- |
+| 普通/恢复TRIAL且事务号、序号、次数、镜像摘要匹配 | TRIAL，保持试运行门控 |
+| NORMAL与CONFIRMED/INSTALL或RECOVERY全部匹配 | CONFIRMED |
+| NORMAL与CONFIRMED/RESTORE全部匹配 | ROLLED_BACK |
+| 缺依赖、读取失败、身份不符或首次ENROLL/CANCEL | UNKNOWN，不报终态 |
+
+已知结果为本次启动的只读快照，健康确认仍须复位交Boot认证和持久提交。原App_UpgradeGetBootIdentity仍只允许正常启动；新增StartupIdentity只用于结果关联，不开放业务或收包权限。
+
+网络升级任务空闲时读取RAM快照，MQTT连通后发布ota_status；不在MQTT或监督任务中等待存储。事件type为boot_result，含16个小写hex字符的字符串tx_id、u32 sequence、phase（trial/confirmed/rolled_back）及64个小写hex字符的明文image_sha256（32 B）。UNKNOWN保持待判定。sequence不是云端任务号，image_sha256也不是下载通知的整包传输SHA；云端task_id关联和按事务/序号/阶段去重由M2及云端处理。
+
+启动结果复用原QoS1槽和发送锁；重复调用不叠加在途副本，匹配PUBACK才结束本次待报。断线时撤销连接内packet_id，未确认结果以原始身份重发，已确认结果在本次启动内不重发。分配编号跳过仍在途的ID。PUBACK只证明broker接收，不冒充云端任务处理回执；重新上电可能再次发送相同快照。不新增任务、队列、持久格式或擦写步骤。
 
 硬件IWDG当前仍/256、4095，按LSI范围约22.31～61.68 s，不能视为满足拟定≤8 s目标；最终参数、Flash停顿和最长合法不可喂狗段须实板核算。软件固定期限不等同实板墙钟保证。
 

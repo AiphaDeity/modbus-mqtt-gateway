@@ -67,7 +67,7 @@ osMessageQueueId_t storage_m2_ack_queue(void);
 /* M2 侧读取缓存统计（任意任务、随时可调） */
 void storage_m2_get_cache_stats(storage_cache_stats_t *out);
 
-/* Storage_Task 循环调用：处理写队列 → 补传请求 → 回执 */
-void storage_m2_process(void);
+/* 仅Storage_Task调用，沿用当前I/O期限；失败保留请求，返回HAL状态供结算判断。 */
+HAL_StatusTypeDef storage_m2_process(void);
 
 #endif /* STORAGE_M2_H */

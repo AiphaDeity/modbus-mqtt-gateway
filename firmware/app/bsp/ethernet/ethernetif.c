@@ -126,6 +126,8 @@ LWIP_MEMPOOL_DECLARE(RX_POOL, ETH_RX_BUFFER_CNT, sizeof(RxBuff_t), "Zero-copy RX
    （数据已经在 pbuf 里了），信号量最轻量。
    ★为什么二值不是计数？DMA 一次中断对应"至少有一帧"，线程醒来会把积压帧全读完 */
 static osSemaphoreId_t RxPktSemaphore;
+static osThreadId_t RxThread;
+static uint8_t RxPoolInitialized;
 
 /* ★帧级排障打印开关（临时）：1=打印收发帧摘要（上限各 120 帧）+ [CNT] 心跳，0=关闭。
    排查"收了不发/发了不到"这类链路问题时打开，问题定位后改回 0。
@@ -163,7 +165,7 @@ static const osThreadAttr_t ethernetif_thread_attr = {
 /* ============================================================================
  * 五、函数声明
  * ==========================================================================*/
-static void low_level_init(struct netif *netif);            /* 网卡底层初始化（ethernetif_init 内部调） */
+static err_t low_level_init(struct netif *netif);           /* 网卡底层初始化（ethernetif_init 内部调） */
 static err_t  low_level_output(struct netif *netif, struct pbuf *p);  /* 发一帧 */
 static struct pbuf *low_level_input(struct netif *netif);   /* 取一帧（从 DMA 队列） */
 static void ethernetif_thread(void *argument);              /* 收包线程：等信号量 → 读帧 → 喂内核 */
@@ -340,14 +342,31 @@ static void get_stm32_mac(uint8_t *mac)
  * 八、LwIP 底层接口（HAL 新架构零拷贝）
  * ==========================================================================*/
 
-/**
- * @brief  硬件侧准备（netif_add → ethernetif_init → 本函数）
- * @note   HAL_ETH_Init 已在 main.c 的 MX_ETH_Init() 完成，这里只做：
- *         netif 参数 + MAC 同步 + Rx 池 + PHY + Start_IT + 信号量 + 收包线程
- */
-static void low_level_init(struct netif *netif)
+/* 仅在 DMA 尚未启动时回收接收资源；删除失败保留句柄供下次重试。 */
+static err_t ethernetif_release_rx(void)
+{
+  if (RxThread != NULL)
+  {
+    if (osThreadTerminate(RxThread) != osOK)
+      return ERR_IF;
+    RxThread = NULL;
+  }
+  if (RxPktSemaphore != NULL)
+  {
+    if (osSemaphoreDelete(RxPktSemaphore) != osOK)
+      return ERR_IF;
+    RxPktSemaphore = NULL;
+  }
+  return ERR_OK;
+}
+
+/* 初始化接收路径；返回 ERR_OK 才允许将网卡加入协议栈。 */
+static err_t low_level_init(struct netif *netif)
 {
   uint8_t macaddress[6] = {0};
+
+  if (heth.gState != HAL_ETH_STATE_READY || ethernetif_release_rx() != ERR_OK)
+    return ERR_IF;
 
   /* 1. netif 基本参数 */
   netif->mtu = ETH_MAX_PAYLOAD;                  /* MTU=1500（以太网最大负载） */
@@ -380,7 +399,11 @@ static void low_level_init(struct netif *netif)
 
   /* 3. 零拷贝接收池：把 RX_POOL 初始化（分配内存）。必须在 Start_IT 之前，
      因为 DMA 启动后立刻要 RxAllocate 回调从池里取缓冲 */
-  LWIP_MEMPOOL_INIT(RX_POOL);
+  if (!RxPoolInitialized)
+  {
+    LWIP_MEMPOOL_INIT(RX_POOL);
+    RxPoolInitialized = 1;
+  }
 
   /* 4. PHY：探测 + 软复位 + 自动协商。
      失败（MDIO 不通/不是 LAN8720）就标记网卡 down，不启动 ETH */
@@ -388,7 +411,7 @@ static void low_level_init(struct netif *netif)
   {
     netif_set_link_down(netif);
     netif_set_down(netif);
-    return;
+    return ERR_IF;
   }
 
   /* 5. 收包信号量（二值，初始 0）——★必须先建信号量再启动 ETH！
@@ -397,6 +420,17 @@ static void low_level_init(struct netif *netif)
      HAL_ETH_RxCpltCallback 里 osSemaphoreRelease(RxPktSemaphore=NULL) 直接崩 */
   RxPktSemaphore = osSemaphoreNew(1, 0, NULL);
   printf("[ETH] sem=%p\r\n", (void *)RxPktSemaphore);   /* ★断点：信号量建没建成 */
+  if (RxPktSemaphore == NULL)
+    return ERR_MEM;
+
+  /* 先创建接收任务；它在 MAC 启动前只等待，不访问 DMA 描述符。 */
+  RxThread = osThreadNew(ethernetif_thread, netif, &ethernetif_thread_attr);
+  if (RxThread == NULL)
+  {
+    printf("[ETH] rx thread create failed\r\n");
+    (void)ethernetif_release_rx();
+    return ERR_MEM;
+  }
 
   /* ★★诊断打印（排障）：Start_IT 前读出中断屏蔽状态 + HAL 时基值。
      - PRIMASK=1  → 全局中断被关死（HAL_Delay 等不到 uwTick 涨 → 死循环）
@@ -410,7 +444,12 @@ static void low_level_init(struct netif *netif)
   /* 6. 启动 ETH（★关键动作）
      HAL_ETH_Start_IT 做的事：使能 MAC + DMA，注册接收中断，
      之后 DMA 就开始往 RX_POOL 写数据，每写完一帧调 HAL_ETH_RxCpltCallback */
-  HAL_ETH_Start_IT(&heth);
+  if (HAL_ETH_Start_IT(&heth) != HAL_OK)
+  {
+    printf("[ETH] Start_IT failed: state=%u\r\n", (unsigned)heth.gState);
+    (void)ethernetif_release_rx();
+    return ERR_IF;
+  }
   printf("[ETH] Start_IT done\r\n");                    /* ★断点：ETH DMA 起没起来 */
 
   /* 7. 初始链接状态上报：上电先把 PHY 链接状态同步给 lwip */
@@ -427,10 +466,8 @@ static void low_level_init(struct netif *netif)
     netif_set_down(netif);      /* 没插线：先 down，链接线程发现插线后会拉起 */
   }
 
-  /* 8. 创建收包线程：等信号量 → 读帧 → 喂给 tcpip_thread
-     ★为什么在这里创建？因为信号量刚建好，且只有 PHY 探测成功后收包线程才有意义 */
-  osThreadNew(ethernetif_thread, netif, &ethernetif_thread_attr);
   printf("[ETH] rx thread created\r\n");                /* ★断点：low_level_init 走完 */
+  return ERR_OK;
 }
 
 /**
@@ -577,6 +614,8 @@ static void ethernetif_thread(void *argument)
          判断"没包是没中断还是中断来了但读不出数据"；二是万一中断丢了也能兜底轮询一次。
          正式运行保持 1 秒超时没有副作用（每次醒来读一遍没包就立刻睡回去） */
     osSemaphoreAcquire(RxPktSemaphore, 1000U);
+    if (heth.gState != HAL_ETH_STATE_STARTED)
+      continue;
 
     /* ★评审要求：收发包用同一个任务上下文串行化 TX 提交/回收。
        本线程每 ~1s 醒一次（无论有没有收到帧），顺手回收已发完的 Tx 描述符和 pbuf——
@@ -673,9 +712,7 @@ err_t ethernetif_init(struct netif *netif)
   netif->output     = etharp_output;               /* ★发包：先查 ARP 再走 linkoutput（标准以太网流程） */
   netif->linkoutput = low_level_output;            /* ★真正发帧：就是上面的零拷贝发送 */
 
-  low_level_init(netif);                           /* 硬件准备（PHY + Start_IT + 线程） */
-
-  return ERR_OK;                                   /* 初始化成功 */
+  return low_level_init(netif);
 }
 
 /* ============================================================================

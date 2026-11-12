@@ -13,6 +13,12 @@ static UpgradeQuiesceParticipant participants[UPGRADE_QUIESCE_COUNT];
 static uint32_t bound_mask;
 static uint32_t paused_mask;
 static bool quiescing;
+// 先停生产者，最后结算及同步存储；恢复按相反顺序。
+static const UpgradeQuiesceModule pause_order[] =
+{
+  UPGRADE_QUIESCE_NETWORK, UPGRADE_QUIESCE_CONFIG,
+  UPGRADE_QUIESCE_MODBUS, UPGRADE_QUIESCE_STORAGE
+};
 
 // 根据构建配置生成必须参与升级暂停的模块集合。
 static uint32_t RequiredMask(void)
@@ -100,8 +106,9 @@ UpgradeStageResult UpgradeQuiesce_Run(uint32_t started_ms, uint32_t timeout_ms)
   taskEXIT_CRITICAL();
   for (uint32_t phase = 0U; phase < 3U; phase++)
   {
-    for (uint32_t i = 0U; i < UPGRADE_QUIESCE_COUNT; i++)
+    for (uint32_t step = 0U; step < UPGRADE_QUIESCE_COUNT; step++)
     {
+      uint32_t i = pause_order[step];
       if ((RequiredMask() & (1U << i)) == 0U)
       {
         continue;
@@ -147,7 +154,7 @@ UpgradeStageResult UpgradeQuiesce_Resume(uint32_t timeout_ms)
   // 逆序恢复；任一失败保留门控，不能把部分恢复解释为正常运行。
   for (uint32_t i = UPGRADE_QUIESCE_COUNT; i > 0U; i--)
   {
-    uint32_t module = i - 1U;
+    uint32_t module = pause_order[i - 1U];
     if ((paused_mask & (1U << module)) == 0U)
     {
       continue;

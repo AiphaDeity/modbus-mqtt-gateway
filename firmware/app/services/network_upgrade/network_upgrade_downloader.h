@@ -75,6 +75,7 @@ typedef struct
  * @return NW_DL_OK=成功，其他=失败（错误码见枚举）
  * @note   阻塞调用，须在升级执行任务里调（不在 MQTT 回调里调）。
  *         内部用 netconn，每次收 ≤chunk_size 字节调回调。
+ *         仅允许同一升级任务串行调用；释放连接失败时保留引用，下一次先重试释放。
  */
 nw_dl_status_t NetworkDownloader_Fetch(const nw_dl_params_t *params);
 

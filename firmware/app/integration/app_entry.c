@@ -35,27 +35,23 @@ void App_Entry(void *argument)
   App_MonitorStart();
 
 #if GATEWAY_ENABLE_M2
-  /* ★网卡初始化必须在【任务上下文】里做，不能放回 main.c 的 osKernelStart 之前：
-     m2_ethernet_init 内部的 taskENTER_CRITICAL()/taskEXIT_CRITICAL() 在调度器启动前
-     会因 uxCriticalNesting 哨兵值(0xAAAAAAAA)配不平，把 BASEPRI 永久锁在 0x50，
-     导致 TIM6 时基中断和 ETH 接收中断全被屏蔽（PING 不通的根因）。
-     此时调度器已在跑，uxCriticalNesting=0，临界区能正确恢复 BASEPRI。
-     ★评审要求：网络局部故障不能升级成整机停机——PHY/网线/DHCP 异常时，
-     Modbus 和本地存储必须照常工作。这里最多重试 5 次，仍失败就打日志后继续装配，
-     网络保持未就绪，后续由 MQTT 任务按策略重试，不再 Error_Handler。 */
+  // 在任务中初始化网络；局部失败最多尝试五次，再继续装配本地业务。
   {
     int retry;
+    int32_t network_status = ETH_ERR_CONFIG;
     for (retry = 0; retry < 5; retry++)
     {
-      if (m2_ethernet_init() == ETH_OK)
+      network_status = m2_ethernet_init();
+      if (network_status == ETH_OK)
         break;
-      printf("[App] m2_ethernet_init 失败(%d/5)，2s 后重试\r\n", retry + 1);
-      osDelay(2000);
+      printf("[App] m2_ethernet_init 失败(%d/5)\r\n", retry + 1);
+      if (retry < 4)
+      {
+        osDelay(2000);
+      }
     }
-    if (m2_ethernet_init() != ETH_OK)
+    if (network_status != ETH_OK)
     {
-      /* 幂等：g_m2_eth_inited 仍为 0，eth_link/eth_dhcp 线程未创建。
-         记录一行最小错误信息后继续——串口日志是当前唯一诊断手段。 */
       printf("[App] m2_ethernet_init 最终失败：网络保持未就绪，继续装配其他模块\r\n");
     }
   }
@@ -77,8 +73,6 @@ void App_Entry(void *argument)
    * 在 ModulesStart 后调用，确保 M4 升级框架和 MQTT 模块已就绪。 */
   NetworkUpgrade_Init();
   NetworkUpgrade_StartTask();
-  /* 重启后查升级结果并上报（试运行启动时才实际工作） */
-  NetworkUpgrade_ReportFinalResult();
 #endif
   printf("[App] ModulesStart done\r\n");
   Monitor_StartupComplete();
