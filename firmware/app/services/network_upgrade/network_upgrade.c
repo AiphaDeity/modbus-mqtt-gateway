@@ -12,6 +12,7 @@
  */
 #include "network_upgrade.h"
 #include "network_upgrade_downloader.h"
+#include "https_tls.h"           /* HttpsTls_Init：TLS 模块一次性初始化 */
 
 #include <stdio.h>
 #include <string.h>
@@ -334,6 +335,14 @@ void NetworkUpgrade_Init(void)
     if (ret != UPGRADE_STAGE_OK)
     {
         printf("[NWUPG] QuiesceBind(NETWORK) fail: %s\r\n", UpgradeEntry_ErrorName(ret));
+    }
+
+    /* 初始化 TLS 模块（熵源 + CTR_DRBG + 时间函数注册） */
+    https_tls_result_t tls_ret = HttpsTls_Init();
+    if (tls_ret != HTTPS_TLS_OK)
+    {
+        printf("[NWUPG] TLS init fail: %d (HTTPS download unavailable)\r\n", (int)tls_ret);
+        /* 不阻断启动：HTTP 下载仍可用，仅 HTTPS 不可用 */
     }
 
     s_initialized = true;
