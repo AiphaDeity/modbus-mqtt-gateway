@@ -8,8 +8,8 @@
  *   4. 状态/LWT retain=true，其余 retain=false（设计 5.1）
  *   5. 重连退避 1/2/4/8/16/32/60s + 20% 抖动，最长 72s（设计 5.1）
  *   6. 拒绝 RETAIN=1 的保留控制回放（设计 5.1）
- *   7. 补传每次取最多 10 条（设计 5.2，STORAGE_M2_FETCH_BATCH_MAX=10）
- *   8. payload 最大 4096B（M2-03，设计 5.2）
+ *   7. 补传每次取最多 4 条（内存收缩：原 10→4，STORAGE_M2_FETCH_BATCH_MAX=4）
+ *   8. payload 最大 1024B（内存收缩：原 4096→1024，超长报文明确拒绝不截断）
  *   9. 回执 30s 未到则保持原 ID 重发；PUBACK 不回收缓存（设计 5.2）
  *
  * 数据流：
@@ -80,7 +80,10 @@
 #define MQTT_CONNACK_TIMEOUT_MS 5000  /* 等 CONNACK 超时（原 3000 改 5000，给云端更多处理时间） */
 #define MQTT_REPLAY_INTERVAL_MS 3000  /* 补传 pump 调度间隔（有新数据时） */
 #define MQTT_REPLAY_RESEND_MS  30000  /* 回执未到重发间隔（设计 5.2: 30s） */
-#define MQTT_MAX_PAYLOAD       4096   /* 设计 5.2: payload 上限 */
+#define MQTT_MAX_PAYLOAD       1024   /* 内存收缩：原 4096→1024；超长报文拒绝不截断 */
+/* 收发缓冲 = 载荷 + MQTT 头开销（固定头5 + topic_len2 + topic≤96 + packet_id2 ≈ 105），给 200 余量 */
+#define MQTT_TX_BUF_SIZE       (MQTT_MAX_PAYLOAD + 200)
+#define MQTT_RX_BUF_SIZE       (MQTT_MAX_PAYLOAD + 200)
 #define MQTT_IO_TIMEOUT_MS    10000U
 #define MQTT_TX_WAIT_MS       12000U
 #define MQTT_HEALTH_MARGIN_MS  1000U
@@ -141,12 +144,11 @@ static char g_topic_cmd_ack[96];
 static char g_topic_ota_status[96];
 
 /* ===== 收发缓冲（放 CCMRAM，不挤占 SRAM 里的 FreeRTOS 堆）
- * tx_buf: 固定头(5) + topic(64) + payload(4096) ≈ 4165，给 4200
- * rx_ring: 帧重组，最大帧 ≈ 4170，给 4400
+ * 内存收缩：tx_buf 4200→1224、rx_ring 4400→1224（载荷上限 1024 + 头开销 200）
  * 注意：netconn_write 用 NETCONN_COPY（拷贝到 LWIP 内部 pbuf），tx_buf 本身不需 DMA 可达，
  *       放 CCMRAM 安全；rx_ring/cmd_payload/ack_payload 全是 CPU 处理，同样安全 */
-static uint8_t tx_buf[4200]  __attribute__((section(".bss.ccmram")));
-static uint8_t rx_ring[4400] __attribute__((section(".bss.ccmram")));
+static uint8_t tx_buf[MQTT_TX_BUF_SIZE]  __attribute__((section(".bss.ccmram")));
+static uint8_t rx_ring[MQTT_RX_BUF_SIZE] __attribute__((section(".bss.ccmram")));
 static uint16_t rx_ring_len = 0;   /* rx_ring 当前已有效字节数 */
 
 /* 下行命令解析缓冲（PUBLISH 载荷拷贝出来，\0 结尾好给字符串解析） */
@@ -712,17 +714,22 @@ static size_t mqtt_build_pingreq(void)
 
 static void rx_ring_append(const uint8_t *data, size_t len)
 {
+    /* 超长报文明确拒绝，不截断执行（原实现滑窗保留尾部会导致半帧误解析）。
+     * 正常 MQTT 帧 ≤ 载荷1024 + 头~105 ≈ 1129 < ring(1224)，不会触发这里。 */
+    if (len >= sizeof(rx_ring))
+    {
+        printf("[MQTT] drop oversize seg %u > ring %u (rejected, not truncated)\r\n",
+               (unsigned)len, (unsigned)sizeof(rx_ring));
+        rx_ring_len = 0;
+        return;
+    }
     if (rx_ring_len + len > sizeof(rx_ring))
     {
-        if (len >= sizeof(rx_ring))
-        {
-            memcpy(rx_ring, data + (len - sizeof(rx_ring)), sizeof(rx_ring));
-            rx_ring_len = sizeof(rx_ring);
-            return;
-        }
-        memmove(rx_ring, rx_ring + (rx_ring_len + len - sizeof(rx_ring)),
-                sizeof(rx_ring) - (rx_ring_len + len - sizeof(rx_ring)));
-        rx_ring_len = sizeof(rx_ring) - len;
+        /* 累积溢出：前帧不完整且 ring 将满，说明帧超长或乱序，清空丢弃 */
+        printf("[MQTT] drop overflow %u+%u > ring %u (rejected, not truncated)\r\n",
+               (unsigned)rx_ring_len, (unsigned)len, (unsigned)sizeof(rx_ring));
+        rx_ring_len = 0;
+        /* ring 已清空，追加本段（可能是新帧开头）重新同步 */
     }
     memcpy(rx_ring + rx_ring_len, data, len);
     rx_ring_len += len;
@@ -739,6 +746,14 @@ static size_t rx_ring_take_frame(uint8_t *out_type, uint8_t *out_flags,
         return 0;
 
     size_t frame_total = 1 + rl_bytes + remaining;
+    /* 超长帧拒绝：单帧总长超过 ring 容量，永远装不下，清空丢弃不截断等待 */
+    if (frame_total > sizeof(rx_ring))
+    {
+        printf("[MQTT] drop oversize frame total=%u > ring %u (rejected)\r\n",
+               (unsigned)frame_total, (unsigned)sizeof(rx_ring));
+        rx_ring_len = 0;
+        return 0;
+    }
     if (rx_ring_len < frame_total) return 0;
 
     *out_type  = (rx_ring[0] >> 4) & 0x0F;
@@ -1002,13 +1017,13 @@ static void mqtt_handle_puback(uint16_t packet_id)
  *   - 在线立即请求存储任务读取已提交记录，按现有 Topic 和 JSON 契约发布
  *   - PUBACK 后仅释放 MQTT packet_id，不回收缓存（业务回执才回收）
  *   - 回执 30s 未到则保持原 ID 重发，重试间隔不超过 60s
- *   - 恢复后每次取最多 10 条
+ *   - 恢复后每次取最多 4 条（内存收缩：原 10→4）
  */
 static bool g_fetch_in_flight = false;
 static uint32_t g_fetch_req_id = 1;
 static uint32_t g_fetch_expected_id;
 
-/* ★放 static + CCMRAM：storage_fetch_resp_t 含 records[10]×~530B ≈ 5.3KB，
+/* ★放 static + CCMRAM：storage_fetch_resp_t 含 records[4]×544B ≈ 2.2KB（收缩前 records[10]≈5.4KB），
  * 放栈上会爆任务栈。本函数单线程（仅 mqtt 任务调），static 安全。 */
 static storage_fetch_resp_t g_fetch_resp __attribute__((section(".bss.ccmram")));
 
@@ -1232,11 +1247,15 @@ int MqttClient_Publish(const char *topic, const uint8_t *payload, size_t plen)
         return -1;
     }
 
-    /* payload 上限检查（设计 5.2: 4096B） */
+    /* 载荷上限检查（内存收缩：MQTT_MAX_PAYLOAD=1024；超长明确拒绝不截断） */
+    if (plen > MQTT_MAX_PAYLOAD)
+    {
+        return -3;   /* 超过载荷上限 */
+    }
     size_t tlen = strlen(topic);
     if (tlen + plen + 8 > sizeof(tx_buf))
     {
-        return -3;   /* 过大 */
+        return -3;   /* 报文装不进 tx_buf */
     }
 
     if (!mqtt_lock_tx())
@@ -1268,14 +1287,19 @@ static int mqtt_publish_qos1(const char *topic, const uint8_t *payload, size_t p
         return -1;
     }
 
+    /* 载荷上限检查（超长明确拒绝不截断；QoS1 pending 槽 512B 更严） */
+    if (plen > MQTT_MAX_PAYLOAD)
+    {
+        return -3;   /* 超过载荷上限 */
+    }
     size_t tlen = strlen(topic);
     if (tlen + plen + 10 > sizeof(tx_buf))
     {
-        return -3;   /* 过大 */
+        return -3;   /* 报文装不进 tx_buf */
     }
     if (plen > MQTT_QOS1_PAYLOAD_MAX)
     {
-        return -3;   /* 超过 QoS1 pending payload 上限 */
+        return -3;   /* 超过 QoS1 pending payload 上限(512B) */
     }
 
     if (!mqtt_lock_tx())

@@ -25,9 +25,9 @@
 
 /* ---------- 队列句柄 ---------- */
 
-static osMessageQueueId_t s_write_q   = NULL;   /* 元素：storage_write_req_t（536B 值） */
+static osMessageQueueId_t s_write_q   = NULL;   /* 元素：storage_write_req_t（544B 值） */
 static osMessageQueueId_t s_fetch_q   = NULL;   /* 元素：storage_fetch_req_t（值） */
-static osMessageQueueId_t s_resp_q    = NULL;   /* 元素：storage_fetch_resp_t（~4.3KB 值，深度 1） */
+static osMessageQueueId_t s_resp_q    = NULL;   /* 元素：storage_fetch_resp_t（~2.2KB 值，深度 1；收缩前 ~5.4KB） */
 static osMessageQueueId_t s_ack_q     = NULL;   /* 元素：storage_ack_t（值） */
 /* 写入失败可能已推进介质状态，锁存后保留原队首，不自动重试冒充重复成功。 */
 static HAL_StatusTypeDef s_write_error;
