@@ -68,10 +68,7 @@
 #define configTICK_RATE_HZ                       ((TickType_t)1000)
 #define configMAX_PRIORITIES                     ( 56 )
 #define configMINIMAL_STACK_SIZE                 ((uint16_t)128)
-/* 32KB：LWIP netconn/pbuf + M2↔M3 值传递队列（fetch_resp depth=1 ≈ 5.3KB + write 8×536B ≈ 4.3KB）
- * + IPC 对象。24KB 实测 MALLOC FAILED（freeHeap=4920），depth=4→1 省 15.9KB 后仍需 32KB 留足余量。
- * 任务栈全在 CCMRAM，不占此堆。MEM_SIZE 12KB(lwipopts) + heap 32KB，SRAM 128KB 装得下。 */
-#define configTOTAL_HEAP_SIZE                    ((size_t)32768)
+#define configTOTAL_HEAP_SIZE                    ((size_t)24576)
 #define configMAX_TASK_NAME_LEN                  ( 16 )
 #define configUSE_TRACE_FACILITY                 1
 #define configUSE_16_BIT_TICKS                   0
@@ -169,13 +166,6 @@ standard names. */
 
 /* IMPORTANT: After 10.3.1 update, Systick_Handler comes from NVIC (if SYS timebase = systick), otherwise from cmsis_os2.c */
 
-/* 本工程时基分工（★不要乱改）：
-   - HAL 时基 = TIM6（stm32f4xx_hal_timebase_tim.c），TIM6 中断里喂 HAL_IncTick()
-   - FreeRTOS 心跳 = SysTick，由 cmsis_os2.c 的默认 SysTick_Handler 喂 xPortSysTickHandler()
-   两者互不干扰，所以这里必须保持 0。
-   若改成 1 再由 stm32f4xx_it.c 自己写 SysTick_Handler 并调 HAL_IncTick()，
-   uwTick 会被 TIM6 + SysTick 双份递增，所有 HAL 超时失真。
-   （历史教训见 LWIP_PING排障记录_修正版.md） */
 #define USE_CUSTOM_SYSTICK_HANDLER_IMPLEMENTATION 0
 
 /* USER CODE BEGIN Defines */

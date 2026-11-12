@@ -14,6 +14,7 @@
  */
 
 #include "storage_runtime.h"
+#include "upgrade_quiesce.h"
 #include "sdcard_tf.h"
 #include "main.h"
 #include "storage_record.h"
@@ -509,6 +510,9 @@ static HAL_StatusTypeDef storage_record_append_impl(uint8_t kind, uint64_t seq,
 
     /* seq 严格单调；重复/回退的写入视为重复请求，静默忽略 */
     if (seq <= s_last_seq) return HAL_OK;
+    /* 结算只追加当前段，不在暂停期间回收段文件；请求留在队列等恢复。 */
+    if (s_next_slot >= RECORD_SEGMENT_SLOTS && !UpgradeQuiesce_AllowsMutation())
+        return HAL_BUSY;
     /* 记录“已尝试”的高水位（失败也算），保证 pending 统计不漏 */
     s_last_seq = seq;
 

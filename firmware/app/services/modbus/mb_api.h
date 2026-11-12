@@ -9,8 +9,7 @@ typedef struct mb_slave_runtime mb_slave_runtime_t;
 
 
 #define MB_REG_MAX_PER_SLAVE     32U   // 每一个从站，最多存32个寄存器
-#define MB_SLAVE_INIT_CAP        4U    // 初始容量，和扩容粒度一致，一次+4
-#define MB_SLAVE_HARD_MAX        16U   // 最多可以挂16个Modbus从站
+#define MB_SLAVE_HARD_MAX        4U    // 固定4个从站槽位，不在运行期扩容
 #define MB_WRITE_QUEUE_DEPTH     4U    // 外部写请求队列深度（MQTT下发配置/运行写操作）
 
 /* ============= 日志等级控制（量产时设为 MB_LOG_LEVEL_OFF 关掉所有日志）============= */
@@ -68,7 +67,7 @@ typedef enum
  * @brief 配置变更回调函数类型
  *
  *  存储模块通过 mb_set_config_change_cb() 注册，Modbus 在从站增删改成功后调用。
- *  典型用法：回调里遍历 mb_handle_get()->slave_list 写 Flash。
+ *  回调只投递存储请求或记录脏状态，不能在调用任务直接访问Flash。
  *
  * @param reason  变更原因
  * @param slave_id 变更涉及的从站 ID（批量重载时为 0）
@@ -93,7 +92,7 @@ typedef enum
 {
     MB_STATUS_OK = 0,    // 成功
     MB_INIT_STATUS_ERR,   // 初始化失败
-    MB_REALLOC_STATUS_ERR,   // 扩容失败
+    MB_REALLOC_STATUS_ERR,   // 从站槽位已满
     MB_HANDLE_STATUS_ERR,   // 句柄不存在
     MB_SLAVE_NOT_FOUND_ERR,   // 从站不存在
     MB_PARSE_STATUS_ERR,   // 解析失败
@@ -102,6 +101,7 @@ typedef enum
     MB_QUEUE_FULL_ERR,     // 外部写请求队列满
     MB_NOT_SUPPORT_FC_ERR, // 不支持的功能码
     MB_WAIT_TIMEOUT_ERR,  // 同步等待写结果超时
+    MB_UPGRADE_BUSY_ERR,  // 试运行、升级暂停或已有事务时拒绝新变更
 } mb_status_e;
 
 /**
@@ -120,8 +120,7 @@ typedef enum
  *  由 poll 任务在 IDLE 状态优先取出，用 ModbusQueryInject 头插发送。
  *
  *  写入值直接拷贝到 write_values[]，避免外部指针生命周期问题。
- *  result_sem 可选：调用者传 osSemaphoreId_t 用于同步等待结果；
- *                NULL 表示异步，不通知调用者。
+ *  同步请求只携带模块内部票据；不保存调用者信号量和结果指针。
  */
 typedef struct
 {
@@ -131,8 +130,7 @@ typedef struct
     uint16_t       reg_count;     // 写入数量 (FC6 固定为1)
     uint16_t       write_values[MB_REG_MAX_PER_SLAVE];  // 写入值（直接拷贝，无指针风险）
 
-    osSemaphoreId_t result_sem;   // 可选：结果通知信号量；NULL 表示异步
-    mb_errot_t     *result_err_out; // 可选：结果输出指针；poll 任务处理完后填入
+    uint32_t completion_id;       // 同步结果票据；0表示异步，不保存调用者地址
 } mb_write_request_t;
 
 /**
@@ -212,10 +210,10 @@ typedef struct
 
 
 void Modbus_Init(void);
+bool mb_runtime_ready(void);
 void vModbusPollTask(void* argument);
 
 mb_status_e mb_handle_init(void);
-mb_status_e mb_realloc_slave_list(void);
 mb_status_e mb_poll_slave(void);
 mb_status_e mb_add_slave(modbus_t *cfg);
 mb_slave_runtime_t* mb_get_slave_runtime(uint8_t slave_id);
@@ -235,8 +233,8 @@ mb_status_e mb_delete_slave(uint8_t slave_id);
  * @param op       MB_CFG_OP_UPSERT / MB_CFG_OP_DELETE
  * @param slave_id 目标从站地址（UPSERT 时强制覆盖 cfg->u8id，防呆）
  * @param cfg      从站协议配置；DELETE 或仅改点位表时传 NULL
- * @param points   点位表（整表 32 项，空位 valid=0）；不改点位时传 NULL
- * @return MB_STATUS_OK 成功；MB_SLAVE_NOT_FOUND_ERR 从站不存在；MB_BUILD_REQUEST_ERR 参数非法
+ * @param points   点位表（整表 MB_POINTS_PER_SLAVE 项，空位 valid=0）；不改点位时传 NULL
+ * @return MB_STATUS_OK 成功；MB_REALLOC_STATUS_ERR 从站已满；MB_SLAVE_NOT_FOUND_ERR 从站不存在；MB_BUILD_REQUEST_ERR 参数非法
  */
 mb_status_e mb_apply_slave_config(mb_cfg_op_t op,
                                   uint8_t slave_id,
@@ -253,7 +251,7 @@ mb_handle_t* mb_handle_get(void);
  *
  *  存储模块（Flash持久化）在系统初始化时调用一次。
  *  之后 mb_add_slave / mb_delete_slave 成功时自动触发回调，
- *  回调里遍历 mb_handle_get()->slave_list 写 Flash 即可。
+ *  回调不得执行Flash擦写；实际持久化交由Storage_Task。
  *
  * @param cb    回调函数指针（传 NULL 可取消注册）
  * @param ctx   用户上下文指针，回调时原样传回（可选，传 NULL 即可）
@@ -273,15 +271,13 @@ void mb_set_config_change_cb(mb_cfg_change_cb_t cb, void *ctx);
  * @param reg_addr       起始寄存器/线圈地址（协议地址，直达从站）
  * @param reg_count      FC5/FC6 强制为 1；FC15/FC16 传写入数量 (≤ MB_REG_MAX_PER_SLAVE)
  * @param write_values   要写入的值数组（直接拷贝，无指针生命周期问题）
- * @param result_sem     可选：调用者传入信号量，写完成后 poll 任务 release，
- *                       调用者用 osSemaphoreAcquire 同步等待结果；
- *                       传 NULL 表示异步，不通知
- * @param result_err_out 可选：调用者传入 mb_errot_t*，写完成后填入结果，
- *                       配合 result_sem 使用；传 NULL 忽略
+ * @param result_sem     保留原调用形态：非NULL选择本函数内同步等待；后台不访问该对象
+ * @param result_err_out 仅同步返回时写结果；异步须为NULL，超时返回ERR_UNKNOWN
  * @param result_timeout_ms  同步等待超时（ms），仅当 result_sem != NULL 时生效；
- *                           传 0 = 永久等待（兼容旧行为）；建议传 2000~5000
+ *                           0使用TIMEOUT_MODBUS+1000 ms，不再无限等待
  * @return MB_STATUS_OK 成功投递；MB_QUEUE_FULL_ERR 队列满；
- *         MB_NOT_SUPPORT_FC_ERR 功能码不支持；MB_WAIT_TIMEOUT_ERR 同步等待超时
+ *         MB_NOT_SUPPORT_FC_ERR 功能码不支持；MB_WAIT_TIMEOUT_ERR 同步等待超时；
+ *         MB_UPGRADE_BUSY_ERR 门控拒绝。同步成功还须检查result_err_out，不能自动重试UNKNOWN。
  */
 mb_status_e mb_inject_write(uint8_t slave_id,
                             uint8_t func_code,

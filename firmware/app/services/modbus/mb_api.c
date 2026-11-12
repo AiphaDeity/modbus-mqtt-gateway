@@ -8,8 +8,71 @@
 
 #include "mb_internal.h"
 #include "mb_pointmap.h"
+#include "upgrade_quiesce.h"
 #include <string.h>
 #include <stdio.h>
+
+enum { MB_RESULT_WAITING = 1, MB_RESULT_DONE, MB_RESULT_ABANDONED };
+typedef struct
+{
+    uint32_t id;
+    uint8_t state;
+    mb_errot_t error;
+} mb_write_result_t;
+
+static mb_write_result_t s_write_results[MB_WRITE_QUEUE_DEPTH + 1U];
+static uint32_t s_next_result;
+
+/** @brief 已完成结果也须等同步调用方取走，不能只看请求队列为空。 */
+bool mb_write_results_settled(void)
+{
+    taskENTER_CRITICAL();
+    bool settled = true;
+    for (uint32_t i = 0U; i < MB_WRITE_QUEUE_DEPTH + 1U; i++)
+        settled = settled && s_write_results[i].id == 0U;
+    taskEXIT_CRITICAL();
+    return settled;
+}
+
+/** @brief 在途结果由模块持有，队列不保存调用者信号量或栈地址。 */
+static mb_write_result_t *mb_result_find(uint32_t id)
+{
+    for (uint32_t i = 0U; i < MB_WRITE_QUEUE_DEPTH + 1U; i++)
+    {
+        if (s_write_results[i].id == id) return &s_write_results[i];
+    }
+    return NULL;
+}
+
+/** @brief 同步等待者已离开时，尚未发送的请求直接取消。 */
+bool mb_write_pending(const mb_write_request_t *request)
+{
+    if (request->completion_id == 0U) return true;
+    taskENTER_CRITICAL();
+    mb_write_result_t *result = mb_result_find(request->completion_id);
+    bool pending = result != NULL && result->state == MB_RESULT_WAITING;
+    taskEXIT_CRITICAL();
+    return pending;
+}
+
+/** @brief 完成或拒绝一条写请求；超时者的票据只回收，不访问其原始缓冲。 */
+void mb_finish_write(const mb_write_request_t *request, mb_errot_t error)
+{
+    if (request->completion_id == 0U) return;
+    taskENTER_CRITICAL();
+    mb_write_result_t *result = mb_result_find(request->completion_id);
+    if (result != NULL)
+    {
+        if (result->state == MB_RESULT_ABANDONED)
+            memset(result, 0, sizeof(*result));
+        else
+        {
+            result->error = error;
+            result->state = MB_RESULT_DONE;
+        }
+    }
+    taskEXIT_CRITICAL();
+}
 
 /* ========= 统一配置入口 ========= */
 
@@ -19,7 +82,7 @@
  *  内部自己持 cfg 锁 + 调 _nolock 版本 CRUD，避免与公开加锁版嵌套死锁。
  *  多次内部变更合并为一次 cfg_change_cb 回调（存储方只写一次 Flash）。
  */
-mb_status_e mb_apply_slave_config(mb_cfg_op_t op,
+static mb_status_e mb_apply_slave_config_impl(mb_cfg_op_t op,
                                   uint8_t slave_id,
                                   const modbus_t *cfg,
                                   const mb_point_t *points)
@@ -110,6 +173,9 @@ mb_status_e mb_inject_write(uint8_t slave_id,
                             uint32_t result_timeout_ms)
 {
     if (mb_handle == NULL)              return MB_HANDLE_STATUS_ERR;
+    if (__get_IPSR() != 0U || osKernelGetState() != osKernelRunning) return MB_UPGRADE_BUSY_ERR;
+    if (result_timeout_ms > INT32_MAX)  return MB_BUILD_REQUEST_ERR;
+    if (result_sem != NULL && !mb_runtime_can_wait()) return MB_UPGRADE_BUSY_ERR;
     if (write_values == NULL)           return MB_BUILD_REQUEST_ERR;
     if (func_code != MB_FC_WRITE_REGISTER &&
         func_code != MB_FC_WRITE_MULTIPLE_REGISTERS &&
@@ -128,8 +194,6 @@ mb_status_e mb_inject_write(uint8_t slave_id,
     wr.slave_id       = slave_id;
     wr.func_code      = func_code;
     wr.reg_addr       = reg_addr;
-    wr.result_sem     = result_sem;
-    wr.result_err_out = result_err_out;
 
     if (func_code == MB_FC_WRITE_MULTIPLE_COILS)
     {
@@ -152,25 +216,58 @@ mb_status_e mb_inject_write(uint8_t slave_id,
             wr.write_values[i] = write_values[i];
     }
 
-    if (osMessageQueuePut(mb_handle->xWriteReqQueue, &wr, 0, 0) != osOK)
+    if (result_sem == NULL && result_err_out != NULL) return MB_BUILD_REQUEST_ERR;
+    mb_write_result_t *result = NULL;
+    taskENTER_CRITICAL();
+    bool allowed = !mb_runtime_paused() && UpgradeQuiesce_AllowsMutation();
+    if (allowed && result_sem != NULL && s_next_result != UINT32_MAX)
+    {
+        for (uint32_t i = 0U; i < MB_WRITE_QUEUE_DEPTH + 1U; i++)
+        {
+            if (s_write_results[i].id != 0U) continue;
+            result = &s_write_results[i];
+            result->id = ++s_next_result;
+            result->state = MB_RESULT_WAITING;
+            wr.completion_id = result->id;
+            break;
+        }
+    }
+    bool queued = allowed && (result_sem == NULL || result != NULL) &&
+                  osMessageQueuePut(mb_handle->xWriteReqQueue, &wr, 0U, 0U) == osOK;
+    if (!queued && result != NULL) memset(result, 0, sizeof(*result));
+    taskEXIT_CRITICAL();
+    if (!allowed) return MB_UPGRADE_BUSY_ERR;
+    if (!queued)
     {
         MB_LOGW("write req queue full, slave=%d", slave_id);
         return MB_QUEUE_FULL_ERR;
     }
 
-    // 同步等待：poll 任务处理完后 release + 填 *result_err_out
+    // 保留原同步调用方式，后台只更新模块票据；返回后不再持有调用者对象。
     if (result_sem != NULL)
     {
-        // 兼容旧行为：timeout=0 表示永久等待
-        uint32_t timeout_ticks = (result_timeout_ms == 0)
-                                  ? osWaitForever
-                                  : pdMS_TO_TICKS(result_timeout_ms);
-
-        if (osSemaphoreAcquire(result_sem, timeout_ticks) != osOK)
+        uint32_t timeout_ms = result_timeout_ms == 0U ? TIMEOUT_MODBUS + 1000U : result_timeout_ms;
+        uint32_t started = HAL_GetTick();
+        for (;;)
         {
-            MB_LOGW("write wait timeout: slave=%d, FC=%d, to=%lums",
-                    slave_id, func_code, result_timeout_ms);
-            return MB_WAIT_TIMEOUT_ERR;
+            taskENTER_CRITICAL();
+            bool expired = (uint32_t)(HAL_GetTick() - started) >= timeout_ms;
+            bool done = result->state == MB_RESULT_DONE;
+            mb_errot_t error = result->error;
+            if (done) memset(result, 0, sizeof(*result));
+            else if (expired) result->state = MB_RESULT_ABANDONED;
+            taskEXIT_CRITICAL();
+            if (done && !expired)
+            {
+                if (result_err_out != NULL) *result_err_out = error;
+                return MB_STATUS_OK;
+            }
+            if (expired)
+            {
+                if (result_err_out != NULL) *result_err_out = ERR_UNKNOWN;
+                return MB_WAIT_TIMEOUT_ERR;
+            }
+            osDelay(1U);
         }
     }
 
@@ -231,4 +328,14 @@ mb_status_e mb_take_slave_snapshot(uint8_t slave_id, mb_slave_snapshot_t *snap_o
 
     osMutexRelease(mb_handle->xSlaveDataMutex);
     return MB_STATUS_OK;
+}
+
+/** @brief 完整配置调用及通知都受升级门控保护，暂停时拒绝新变更。 */
+mb_status_e mb_apply_slave_config(mb_cfg_op_t op, uint8_t slave_id,
+                                  const modbus_t *cfg, const mb_point_t *points)
+{
+    if (!mb_runtime_config_begin()) return MB_UPGRADE_BUSY_ERR;
+    mb_status_e result = mb_apply_slave_config_impl(op, slave_id, cfg, points);
+    mb_runtime_config_end();
+    return result;
 }

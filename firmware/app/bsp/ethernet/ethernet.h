@@ -26,10 +26,10 @@ typedef enum {
   ETH_ERR_CONFIG = 3, /* 协议栈配置失败（内存不足等） */
 } eth_result_t;
 
-/* 初始化 LwIP：netif_add + DHCP 线程 + 链接线程（幂等，重复调用直接返回） */
+/* 启动任务串行调用；成功后幂等，失败重试复用已建资源；ETH_OK 不要求已插网线。 */
 int32_t m2_ethernet_init(void);
 
-/* 等待链路建立（网线插好、PHY 链接），超时返回 ETH_ERR_LINK */
+/* timeout_ms 单位毫秒，0 表示无限等待；未初始化返回 ETH_ERR_CONFIG，超时返回 ETH_ERR_LINK。 */
 int32_t m2_ethernet_link_wait(uint32_t timeout_ms);
 
 /* 带 OS 版：收包由 ethernetif_thread 完成，此函数为空实现（保留接口） */

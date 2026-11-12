@@ -25,6 +25,7 @@
 #include <string.h>
 
 #include "FreeRTOS.h"
+#include "task.h"
 #include "cmsis_os2.h"
 
 #include "mb_api.h"
@@ -33,9 +34,8 @@
 #include "storage_seq.h"
 #include "mqtt_client.h"
 #include "app_modules.h"
-#if GATEWAY_ENABLE_M2
-#include "network_upgrade.h" /* NetworkUpgrade_IsQuiesced() 升级门控 */
-#endif
+#include "app_monitor.h"
+#include "upgrade_quiesce.h"
 
 /* 上报周期：Modbus 采集本身可能 1~2 秒一轮，这里 2 秒足够 */
 #define TELEMETRY_PERIOD_MS   2000U
@@ -45,6 +45,27 @@
 
 /* 最多收集的从站 ID 数（MB_SLAVE_HARD_MAX=16） */
 #define TEL_MAX_SLAVES        16U
+
+static volatile bool s_pause_requested;
+static bool s_pause_acknowledged;
+
+/* 请求方只能撤销旧确认，停稳确认由Telemetry任务自身更新。 */
+void Telemetry_SetPaused(bool paused)
+{
+    taskENTER_CRITICAL();
+    s_pause_requested = paused;
+    s_pause_acknowledged = false;
+    taskEXIT_CRITICAL();
+}
+
+/* 查询本次暂停请求对应的实际任务确认。 */
+bool Telemetry_IsPaused(void)
+{
+    taskENTER_CRITICAL();
+    bool paused = s_pause_requested && s_pause_acknowledged;
+    taskEXIT_CRITICAL();
+    return paused;
+}
 
 /* ========= 阶段1：收集有效从站 ID（回调里只读 ID，不调任何加锁函数）========= */
 
@@ -67,33 +88,39 @@ static int collect_slave_ids(mb_slave_runtime_t *slave, void *ctx)
 
 /* ========= 阶段2：处理单个从站（锁已释放，可调任意 pull 接口）========= */
 
-static void publish_one_slave(uint8_t slave_id)
+/* 完成一次从站采集快照、缓存和发送；false表示监督期限已失效。 */
+static bool publish_one_slave(uint8_t slave_id)
 {
     /* 1) 取快照：内部加 xSlaveDataMutex，安全读 reg_data_buf / data_valid */
     mb_slave_snapshot_t snap;
-    if (mb_take_slave_snapshot(slave_id, &snap) != MB_STATUS_OK)
-        return;
+    if (!Monitor_BeginWait(APP_MODULE_TELEMETRY, 3000U)) return false;
+    mb_status_e snapshot_status = mb_take_slave_snapshot(slave_id, &snap);
+    if (!Monitor_ReportProgress(APP_MODULE_TELEMETRY, true)) return false;
+    if (snapshot_status != MB_STATUS_OK)
+        return true;
 
     if (!snap.data_valid || snap.valid_point == 0)
     {
         printf("[TEL] skip slave=%u dv=%u vp=%u\r\n",
                (unsigned)slave_id, (unsigned)snap.data_valid,
                (unsigned)snap.valid_point);
-        return;
+        return true;
     }
 
     /* 2) 解析点位表：内部加 xSlaveCfgMutex 定位 + xSlaveDataMutex 读 raw reg，
      *    此时本任务不持有任何 Modbus 锁，安全 */
-    static mb_parsed_point_t pts[MB_POINTS_PER_SLAVE] __attribute__((section(".ccmram")));
+    static mb_parsed_point_t pts[MB_POINTS_PER_SLAVE] __attribute__((section(".bss.ccmram")));
+    if (!Monitor_BeginWait(APP_MODULE_TELEMETRY, 3000U)) return false;
     int npts = mb_pointmap_parse_slave(slave_id, pts);
+    if (!Monitor_ReportProgress(APP_MODULE_TELEMETRY, true)) return false;
     if (npts <= 0)
     {
         printf("[TEL] no points slave=%u\r\n", (unsigned)slave_id);
-        return;
+        return true;
     }
 
     /* 3) 拼 JSON：{"g":"mb2mqtt_001","slave":2,"online":1,"pts":[{"n":"temp","v":25.3,"u":"C"},...]} */
-    static char buf[PAYLOAD_MAX] __attribute__((section(".ccmram")));
+    static char buf[PAYLOAD_MAX] __attribute__((section(".bss.ccmram")));
     int n = snprintf(buf, sizeof(buf),
         "{\"g\":\"mb2mqtt_001\",\"slave\":%u,\"online\":%u,\"pts\":[",
         (unsigned)slave_id, (unsigned)snap.is_online);
@@ -112,10 +139,13 @@ static void publish_one_slave(uint8_t slave_id)
 
     /* 4) 从 M3 取全局 seq 号 */
     uint64_t seq = 0;
-    if (storage_seq_alloc(&seq) != HAL_OK)
+    if (!Monitor_BeginWait(APP_MODULE_TELEMETRY, 3000U)) return false;
+    HAL_StatusTypeDef sequence_status = storage_seq_alloc(&seq);
+    if (!Monitor_ReportProgress(APP_MODULE_TELEMETRY, true)) return false;
+    if (sequence_status != HAL_OK)
     {
         printf("[TEL] seq_alloc failed, skip slave=%u\r\n", (unsigned)slave_id);
-        return;
+        return true;
     }
 
     /* 5) 填写请求，丢给 M3 离线缓存 */
@@ -127,19 +157,29 @@ static void publish_one_slave(uint8_t slave_id)
     };
     memcpy(req.payload, buf, n);
 
-    osStatus_t st = osMessageQueuePut(storage_m2_write_queue(), &req, 0, 0);
+    taskENTER_CRITICAL();
+    bool allowed = !s_pause_requested && UpgradeQuiesce_AllowsMutation();
+    osStatus_t st = allowed ? osMessageQueuePut(storage_m2_write_queue(), &req, 0, 0) : osErrorResource;
+    taskEXIT_CRITICAL();
+    if (!allowed) return true;
     if (st != osOK)
     {
-        printf("[TEL] write queue full, skip cache slave=%u\r\n", (unsigned)slave_id);
+        printf("[TEL] cache not accepted, skip publish slave=%u status=%d\r\n",
+               (unsigned)slave_id, (int)st);
+        return true;
     }
 
     /* 6) 在线时直接 PUBLISH（不管队列是否满，队列只是离线备份） */
     printf("[TEL-DATA] %.*s\r\n", (int)n, buf);
+    /* 现有发送锁最多12秒，写入最多10秒，另留返回处理余量。 */
+    if (!Monitor_BeginWait(APP_MODULE_TELEMETRY, 24000U)) return false;
     int pr = MqttClient_Publish(MqttClient_TopicTelemetry(),
                                (const uint8_t *)buf, (size_t)n);
+    if (!Monitor_ReportProgress(APP_MODULE_TELEMETRY, true)) return false;
     printf("[TEL] seq=%lu slave=%u online=%u pts=%d mqtt_pub=%d\r\n",
            (unsigned long)seq, (unsigned)slave_id,
            (unsigned)snap.is_online, npts, pr);
+    return true;
 }
 
 /* 空 init：telemetry 没有自己的资源要初始化，全靠 M1/M3 已就绪 */
@@ -148,33 +188,57 @@ AppModuleInitResult Telemetry_Init(void)
     return APP_MODULE_INIT_OK;
 }
 
+/* 采集、合法空闲及暂停检查由本任务报告；超时不继续恢复健康状态。 */
 void Telemetry_Task(void *argument)
 {
     (void)argument;
+    if (!Monitor_RegisterHealth(APP_MODULE_TELEMETRY, 2000U, 30000U))
+        goto health_fail;
     /* 等系统初始化完（DHCP/MQTT/Modbus 都起来）再开始 */
-    osDelay(5000);
+    if (!Monitor_BeginWait(APP_MODULE_TELEMETRY, 6000U) ||
+        osDelay(pdMS_TO_TICKS(5000U)) != osOK)
+        goto health_fail;
     printf("[TEL] task started\r\n");
 
     for (;;)
     {
-#if GATEWAY_ENABLE_M2
-        /* 升级门控：被暂停时跳过采集+上报，只等恢复（保留任务存活） */
-        if (NetworkUpgrade_IsQuiesced())
+        taskENTER_CRITICAL();
+        bool healthy = Monitor_ReportProgress(APP_MODULE_TELEMETRY, true);
+        bool paused = s_pause_requested || !UpgradeQuiesce_AllowsMutation();
+        s_pause_acknowledged = s_pause_requested && healthy;
+        taskEXIT_CRITICAL();
+        if (!healthy) goto health_fail;
+        if (paused)
         {
-            osDelay(pdMS_TO_TICKS(500));
+            if (!Monitor_BeginWait(APP_MODULE_TELEMETRY, 1500U) ||
+                osDelay(pdMS_TO_TICKS(500U)) != osOK)
+                goto health_fail;
             continue;
         }
-#endif
 
         /* 阶段1：收集有效从站 ID（只持 cfg 锁很短时间） */
         tel_slave_list_t list = {0};
+        if (!Monitor_BeginWait(APP_MODULE_TELEMETRY, 3000U)) goto health_fail;
         uint8_t cnt = mb_for_each_valid_slave(collect_slave_ids, &list);
+        if (!Monitor_ReportProgress(APP_MODULE_TELEMETRY, true)) goto health_fail;
 
         /* 阶段2：逐个从站处理（不持有任何 Modbus 锁） */
         for (uint8_t i = 0; i < list.n; i++)
-            publish_one_slave(list.ids[i]);
+        {
+            if (s_pause_requested || !UpgradeQuiesce_AllowsMutation()) break;
+            if (!publish_one_slave(list.ids[i])) goto health_fail;
+        }
 
         printf("[TEL] cycle done: %u slaves\r\n", (unsigned)cnt);
-        osDelay(pdMS_TO_TICKS(TELEMETRY_PERIOD_MS));
+        if (!Monitor_BeginWait(APP_MODULE_TELEMETRY, TELEMETRY_PERIOD_MS + 1000U) ||
+            osDelay(pdMS_TO_TICKS(TELEMETRY_PERIOD_MS)) != osOK)
+            goto health_fail;
     }
+
+health_fail:
+    taskENTER_CRITICAL();
+    s_pause_acknowledged = false;
+    taskEXIT_CRITICAL();
+    Monitor_ReportFatal(APP_MODULE_TELEMETRY);
+    osThreadExit();
 }

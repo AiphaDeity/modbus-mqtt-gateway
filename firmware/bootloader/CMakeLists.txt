@@ -68,6 +68,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/boot_recovery.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/boot_recovery_state.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../shared/upgrade_mailbox.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared/maint_frame.c
 )
 
 # Add include paths

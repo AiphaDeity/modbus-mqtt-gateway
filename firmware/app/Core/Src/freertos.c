@@ -91,7 +91,7 @@ void vApplicationStackOverflowHook(xTaskHandle xTask, signed char *pcTaskName)
 /* USER CODE BEGIN 5 */
 void vApplicationMallocFailedHook(void)
 {
-  /* ★排障：打印剩余堆大小（15KB 的 heap 一旦耗尽就会走到这里） */
+  /* 分配失败时保留剩余堆大小。 */
   printf("\r\n[HOOK] MALLOC FAILED freeHeap=%u\r\n", (unsigned)xPortGetFreeHeapSize());
   Error_Handler();
    /* vApplicationMallocFailedHook() will only be called if
@@ -106,17 +106,6 @@ void vApplicationMallocFailedHook(void)
    provide information on how the remaining heap might be fragmented). */
 }
 /* USER CODE END 5 */
-
-/* ★排障用：configASSERT 失败时被调用（FreeRTOSConfig.h 里改成调这个），
-   把断言所在的源文件和行号打印出来，避免"一黑到底"看不出问题 */
-void vAssertCalled(const char *pcFile, unsigned long ulLine)
-{
-  __disable_irq();
-  printf("\r\n[ASSERT] %s:%lu\r\n", pcFile, ulLine);
-  for (;;)
-  {
-  }
-}
 
 /**
   * @brief  FreeRTOS initialization
@@ -186,6 +175,16 @@ void StartDefaultTask(void *argument)
 
 /* Private application code --------------------------------------------------*/
 /* USER CODE BEGIN Application */
+
+// 打印触发断言的文件和行号，停止执行并等待看门狗复位。
+void vAssertCalled(const char *pcFile, unsigned long ulLine)
+{
+  __disable_irq();
+  printf("\r\n[ASSERT] %s:%lu\r\n", pcFile, ulLine);
+  for (;;)
+  {
+  }
+}
 
 /* USER CODE END Application */
 

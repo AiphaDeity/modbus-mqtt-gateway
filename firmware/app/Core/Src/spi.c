@@ -44,7 +44,7 @@ void MX_SPI2_Init(void)
   hspi2.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi2.Init.CLKPhase = SPI_PHASE_1EDGE;
   hspi2.Init.NSS = SPI_NSS_SOFT;
-  hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_256;
+  hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_8;
   hspi2.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi2.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi2.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
@@ -78,30 +78,16 @@ void HAL_SPI_MspInit(SPI_HandleTypeDef* spiHandle)
     PC3     ------> SPI2_MOSI
     PB10     ------> SPI2_SCK
     */
-    /* MISO 单独配置：内部上拉。
-     * 底板用模拟开关在 W25Q128 与 ES8388 之间分流 SPI2，开关断开或接触不良时
-     * MISO 会悬空，读到的就是电容残留的随机值（表现为同一地址两次读出不同内容）。
-     * 加上拉后悬空会被拉到稳定的 0xFF，能把"通路断开"和"信号质量差"区分开。 */
-    GPIO_InitStruct.Pin = SPI2_MISO_Pin;
-    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-    GPIO_InitStruct.Pull = GPIO_PULLUP;
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
-    GPIO_InitStruct.Alternate = GPIO_AF5_SPI2;
-    HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
-
-    GPIO_InitStruct.Pin = SPI2_MOSI_Pin;
+    GPIO_InitStruct.Pin = SPI2_MISO_Pin|SPI2_MOSI_Pin;
     GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
     GPIO_InitStruct.Alternate = GPIO_AF5_SPI2;
     HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-    /* SCK 加内部下拉：SPI 在每次 HAL 传输返回前会 __HAL_SPI_DISABLE()，
-     * 关闭后引脚失去驱动；CPOL=0 要求空闲为低，下拉可避免关闭瞬间被浮空拉高
-     * 而产生一个多余时钟，把命令的最后一个字节挤掉（0x18 变 0x30 就是这么来的）。 */
     GPIO_InitStruct.Pin = SPI2_SCK_Pin;
     GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-    GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
     GPIO_InitStruct.Alternate = GPIO_AF5_SPI2;
     HAL_GPIO_Init(SPI2_SCK_GPIO_Port, &GPIO_InitStruct);

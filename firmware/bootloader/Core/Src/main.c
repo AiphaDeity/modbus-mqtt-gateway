@@ -332,12 +332,15 @@ int main(void)
 
   /* USER CODE BEGIN Init */
 
-  // 复位标志每次Boot消费一次，冷启动/外部复位不接受残留确认消息。
+  // 获取上次复位标志位
   uint32_t reset_flags = RCC->CSR;
+  // 判断是否为纯软件复位，并且没有发生过掉电、欠压、被看门狗咬死
   bool software_reset = ((reset_flags & RCC_CSR_SFTRSTF) != 0U)
                      && ((reset_flags & (RCC_CSR_PORRSTF | RCC_CSR_BORRSTF
                                         | RCC_CSR_IWDGRSTF | RCC_CSR_WWDGRSTF)) == 0U);
+  // 根据状态和邮箱地址，判断继续运行还是回滚
   Boot_TrialBegin((volatile uint32_t *)UPGRADE_MAILBOX_ADDRESS, software_reset);
+  // 清理标志位
   __HAL_RCC_CLEAR_RESET_FLAGS();
 
   /* USER CODE END Init */
@@ -353,16 +356,19 @@ int main(void)
   MX_GPIO_Init();
   MX_USART1_UART_Init();
   MX_SPI2_Init();
+  MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
 
+  // 如果没有启用编译选项，则启动 WDG。
 #if !defined(BOOT_FLASH_READ_DIAGNOSTIC)
   // 基础外设就绪后启狗，覆盖后续诊断、升级和串口维护。
   if (!Boot_WatchdogStart())
   {
     Error_Handler();
   }
+  // 记录下本次 Bootloader 启动的绝对起点
   uint32_t boot_started_ms = HAL_GetTick();
-  printf("WDG active before startup diagnostics\r\n");
+  printf("Boot watchdog active\r\n");
 #endif
 
   // 发送唤醒命令退出 Flash 深度掉电模式，不修改存储内容。
@@ -521,7 +527,7 @@ int main(void)
   // 新安装的试运行只放行一次，不能在同一次启动中再次Run而误判为未确认重启。
   while ((install_result != BOOT_INSTALL_TRIAL_STARTED) || !allow_app)
   {
-    BootReceiveResult received = Boot_ReceivePackage(public_key, aes_key);
+    BootReceiveResult received = Boot_RecoveryReceive(public_key, aes_key);
     Boot_ResetIfWatchdogFailed("receive");
     if (received == BOOT_RECEIVE_COMMAND)
     {
@@ -539,7 +545,7 @@ int main(void)
     }
     install_result = keys_ready ? Boot_InstallRun(public_key, aes_key) : BOOT_INSTALL_STATE_ERROR;
     Boot_ResetIfWatchdogFailed("install");
-    printf("RCV RESULT %u\r\n", (unsigned int)install_result);
+    Boot_RecoveryReplyResult(install_result);
     allow_app = ((install_result == BOOT_INSTALL_BOOT_EXISTING)
                  || (install_result == BOOT_INSTALL_TRIAL_STARTED)
                  || (install_result == BOOT_INSTALL_RESTORED)) && Boot_CheckAppVector();

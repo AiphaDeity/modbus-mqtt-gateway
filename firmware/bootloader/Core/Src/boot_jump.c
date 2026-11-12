@@ -15,6 +15,12 @@
  */
 static bool Boot_DeinitHardware(void)
 {
+  // 关闭维护口并释放PD5/PD6，交由App重新初始化。
+  if (HAL_UART_DeInit(&huart2) != HAL_OK)
+  {
+    return false;
+  }
+
   // 禁用 USART1，并通过已有 MSP 函数关闭串口时钟、释放 PA9/PA10
   if(HAL_UART_DeInit(&huart1) != HAL_OK)
   {

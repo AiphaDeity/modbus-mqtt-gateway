@@ -4,7 +4,7 @@ M4提供共用包认证、持久日志、事务号、Boot安装/回退、App接�
 
 串口保留首次配置和Boot故障恢复，TF保留离线升级。M2负责MQTT任务通知、下载来源与权限校验、文件下载及结果上报；M4只接收包数据并协调认证/安装，不新增Socket监听、云平台、下载器或任务队列。HTTPS为拟选下载方式，具体认证、资源及云端接口由M2核对，不能把本目录改动称为云端升级已接通。
 
-2026-11-10已把M4可独立实现的代码写入工程；存储端及TF服务现已按同一契约写入，并在Storage_Task内接入绑定调用；Storage任务已启用并提供存储侧暂停/结算/同步和健康报告，真实权限及其他模块回调仍未齐备，默认BEGIN仍为NOT_READY。没有用成功桩开放擦写，没有新增任务或直接访问App的FatFs/SPI，也没有操作板子。源码存在、正式方案已同步与真实升级闭环是不同交付状态。
+TF离线入口由App的upgrade任务读取PA0用户键：消抖确认后长按至少3 s，稳定松开时导入一次/firmware.gwp。启动时已按住、仅插卡、导入期间的按键都不排队触发；导入结束后须先释放再重新长按。任务已绑定实体按键来源授权，文件仍由Storage_Task访问。Config回调和真实信任资料未齐备时明确拒绝，不开放擦写；软件接入不代表实板升级闭环已验证。
 
 ## 文件与职责
 
@@ -15,6 +15,7 @@ M4提供共用包认证、持久日志、事务号、Boot安装/回退、App接�
 | shared/upgrade_transaction.c/.h | 事务号高水位读取、预留与显式首次配置 |
 | shared/upgrade_storage_protocol.h | M4/M3共用的请求/应答ABI，值拷贝，不是网络或Flash编码 |
 | shared/upgrade_trust.c/.h | 只读可信密钥映射，默认未配置；不把包内数据作为密钥 |
+| shared/upgrade_trust_otp.c | 普通F407构建的OTP只读实现；拒绝未锁定或无效记录，不包含密钥值或写入入口 |
 | upgrade_stage.c/.h、upgrade_stage_auth.c/.h | 单会话接收、读回、固定期限、完整认证、提交状态和重启 |
 | upgrade_storage.c/.h | M4侧真实队列请求、匹配/取消、旧源认证、Boot身份复核及READY提交解析 |
 | upgrade_entry.c/.h、upgrade_tf.c/.h | 权限/操作epoch/会话归属/状态映射，以及固定TF路径的两遍导入 |
@@ -48,29 +49,29 @@ Boot保留独立Flash驱动和保存入口；普通构建也具备实际安装�
 ## 真实接入顺序
 
 1. App_Entry先读取Boot邮箱、尝试UpgradeTrust_Initialize、调用UpgradeStage_Init，再提前启动Monitor。信任资料缺失只使升级不可用，不伪造成功映射。
-2. 可信装配绑定UpgradeEntryPolicy。authorize按来源和操作epoch检查实际权限，回调只读、快速且可并发查询，不从请求JSON读取布尔量当授权。M2先验证云端任务及下载来源，再登记本次epoch；撤权时同时调用Disconnect。
+2. UpgradeTf_Init绑定UpgradeEntryPolicy，当前仅接受upgrade任务内本次长按释放分配的TF epoch。回调只读、快速且可并发查询，不从请求JSON读取布尔量当授权。网络来源保持拒绝；M2完成任务及下载来源校验后，须将真实网络授权接到统一策略，不能重复绑定或默认放行。
 3. Storage_Init先创建共同协议的静态队列，Storage_Task恢复存储后调用UpgradeStorage_Bind。它检查运行上下文、协议版本、304/288 B消息尺寸及可信keys，再绑定Stage；旧296/20 B消息不会被当作新版。
 4. M1/M2/M3分别绑定真实UpgradeQuiesceParticipant，并在最终TX/配置提交/持久变更前检查UpgradeQuiesce_AllowsMutation。四个角色为Modbus、Storage、Config、Network；关闭M2构建时不要求Network角色。
 5. 各关键模块登记Monitor_RegisterHealth，再按实际进展、有限等待和自检结果报告；同一源码的业务任务必须落实试运行门控。M4未代改队友调用点，任务创建或接口注册都不证明这些行为已完成。
 6. storage_upgrade_tf提供UpgradeTfSource：open取得不可变文件租约、read完整值拷贝、close幂等且确认后台不再引用缓冲，所有I/O转交Storage_Task。不因插卡/启动自动导入。
 7. M2将授权后的下载交给升级执行任务，依次调用UpgradeEntry_Begin/Write/Finish；MQTT回调只处理通知和调度，不同步执行Flash/密码运算。M1串口配置与Boot恢复使用各自入口，不通过App收包接口。
 
-耗时操作只由升级执行任务调用，不在Storage_Task、Modbus、MQTT、网络核心线程或Monitor执行。M4运行时拒绝已登记的存储/业务/监督任务，并要求历史最小空闲栈至少4096 B；建议执行任务初配至少6 KiB普通SRAM并实测完整调用链。栈检查不代替传输侧选择正确任务，也不证明所有栈峰值。尚未新建这个执行任务或扩大其他人的栈。
+耗时操作只由升级执行任务调用，不在Storage_Task、Modbus、MQTT、网络核心线程或Monitor执行。TF使用已装配的upgrade任务，静态栈6 KiB普通SRAM；初始化不重复创建任务，没有按键请求队列。M4运行时要求历史最小空闲栈至少4096 B，完整调用链峰值仍待实测。任务按实际文件/队列应答和密码检查点报告进展，阻塞前按原操作剩余期限声明等待，给返回处理另留1000 ms裕量；此裕量不延长收包、认证或提交的总期限。
 
-## 成员接口核对（2026-11-10）
+## 成员接口核对（2026-11-11）
 
-2026-11-10只读核对：M3 m3/storage-upgrade为422af956e4c8b533e7cb469c5ec267358ed06d8e，main为c9ceccd。四份升级源码与aa03dfb相同；时间服务等后续提交不等于升级契约已适配。M4已推送的基础提交为c670db3，持久版本统一和本轮存储端实现均为本地改动，未推送；没有合入整个M3分支。
+M4/M3存储软件对接已通过PR #7进入main。本地现合入Gitee bc38d97的M2网络升级、MQTT QoS1、任务启用及AppFlashDebug预设；保留后续M4按键、维护口和门控改动。代码合入不代表网络升级的运行契约或整机内存已经验收。
 
-装配已启用Storage_Init/Storage_Task；Config/MQTT/Telemetry仍保持NULL。下列M1/M2结论来自此前已核实提交，不推断成员未发布的新工作。当前构建资源见末节，任务禁用导致的链接回收不代表业务接通。
+装配已启用Storage、Modbus、Monitor、TF以及M2的MQTT/Telemetry，Config仍NULL。NetworkUpgrade_Init仍尝试重复绑定TF已经占用的唯一权限策略，网络Begin会被现有策略拒绝；MQTT/Telemetry已被登记健康，但其任务循环尚缺对应实际进展报告。M2授权、监督、真实结算及重启结果仍需对齐，不能称网络OTA闭环已完成。
 
 | 对接 | 实际已有接口/实现 | 现在能否直接接入升级 |
 | --- | --- | --- |
-| M1 Modbus | mb_inject_write、mb_take_slave_snapshot、mb_apply_slave_config等业务接口 | 业务可复用；尚无升级暂停、在途结算、恢复及最终TX门控接口，不能用任务挂起代替 |
-| M1 配置/维护帧 | Config_Init/Config_Task仅声明，装配仍NULL；未发现共用maintenance_frame实现 | 不能接串口配置或正式Boot维护帧；需要M1提供真实实现 |
-| M2 网络/上报 | MqttClient_Init/Task/Publish/IsConnected/ReportEvent已实现 | 可复用连接与发布能力；当前Publish为QoS0，不能当作已满足最终QoS1/结果可靠上报。network_upgrade仍只有.gitkeep，无升级通知授权、下载器及执行任务 |
+| M1 Modbus | mb_inject_write、mb_take_slave_snapshot、mb_apply_slave_config等业务接口 | mb_runtime已接暂停、在途结算、恢复、健康及最终TX门控，实板仍待验证 |
+| M1 配置/维护帧 | Config_Init/Config_Task仅声明，装配仍NULL；shared/maint_frame编解码已实现 | App串口配置业务尚未实现；Boot恢复已接入USART2及共用帧，实板互通待验证 |
+| M2 网络/上报 | MQTT/Telemetry任务已启用，PublishQos1及network_upgrade HTTP分块下载/执行代码已合入 | 唯一授权策略重复绑定、实际健康/结算及最终结果尚未对齐；当前下载器不支持HTTPS，源码存在不等于安全升级可用 |
 | 存储升级队列 | 本地storage_upgrade_q和storage_upgrade已采用共同7类操作及版本2日志 | Task内真实绑定调用已接入；真实信任资料缺失时不会开放后端；启用任务不代表实板已运行 |
-| TF文件服务 | 本地storage_upgrade_tf实现open/read/close租约，所有FatFs调用仍在Storage_Task | 已写入Task绑定调用，支持无卡时明确NOT_READY；尚未运行真实文件用例 |
-| 暂停与健康 | M4已提供UpgradeQuiesce_Bind、Monitor_RegisterHealth/ReportProgress等 | 队友实际回调和报告尚未接入；注册成功或任务已创建不能替代运行证据 |
+| TF文件服务 | storage_upgrade_tf提供open/read/close租约，所有FatFs调用仍在Storage_Task；upgrade任务长按释放后调用UpgradeTf_Import | 按键及导入调用已接入；缺信任/角色/介质时拒绝，尚未运行真实文件和安装用例 |
+| 暂停与健康 | Storage和Modbus已有真实接入，Network新增角色回调 | Config业务仍缺失；Network用固定等待代替在途结算，MQTT/Telemetry缺周期健康报告，仍须对齐 |
 | M4查询 | UpgradeEntry_GetStatus、App_UpgradeGetBootIdentity已有实现 | 授权/上下文满足后可用于适配；不是现成的云端任务持久结果表，M2仍须关联任务与确认/回退结果 |
 
 本地已复用现有SPI/SD驱动并补齐存储端，替代远程422af95中的V1预检、68 B日志及旧队列。没有把旧日志导入新版，也没有自动格式化UPGLOG。
@@ -83,13 +84,13 @@ SPI新增*_until接口，统一绝对期限覆盖取锁、命令和忙等待；�
 
 TF租约依赖当前_FS_LOCK=2（编译断言至少2），与记录文件各占一个文件锁；同一文件改写/删除由FatFs拒绝。插拔使租约失败，卸载后旧FIL才失效；close未明确成功时不复用客户端租约。租约期间其他临时文件打开可能因锁名额不足返回错误，不把它当作文件服务成功。所有队列为值拷贝，迟到响应按请求号和租约过滤。
 
-主线任务选择、真实密钥、授权、各模块暂停/结算/同步及健康报告仍决定能否实际启用；本轮没有用注册成功代替这些行为，也未新增升级执行任务。
+真实密钥、Config业务及其余模块健康报告仍决定能否实际完成升级和试运行确认；TF按键授权及执行任务已接入，M2网络代码已合入但运行契约仍待对齐。
 
 ## 存储实际接入
 
 Storage_Init只创建基础资源和初始化介质；Storage_Task恢复配置、序号、身份、时间下界、控制日志及TF只读视图，再分别上报资源和健康。全空、读失败、已提交损坏分别处理。序号初始化只读，高水位须高于已恢复的控制/记录序号；首次分配同样先提交完整预留窗口。
 
-storage_runtime串行化完整业务操作，试运行或升级暂停时拒绝新变更；跨任务序号分配通过值拷贝代理转交Storage_Task。业务Flash和文件I/O使用固定操作期限，文件扇区同步轮询，返回前不遗留DMA引用。未启用MQTT、Telemetry或Config任务，存储端保持M3代码风格。
+storage_runtime串行化完整业务操作，试运行或升级暂停时拒绝新变更；跨任务序号分配通过值拷贝代理转交Storage_Task。业务Flash和文件I/O使用固定操作期限，文件扇区同步轮询，返回前不遗留DMA引用。M2启用MQTT/Telemetry不改变存储独占要求，Config仍未启用，存储端保持M3代码风格。
 
 试运行只读检查TF现有卷、环状态、当前文件长度及最近记录格式/CRC，不建目录、段文件或写回。缺卡/无文件系统按未配置降级；读取失败和格式损坏不作为空白。自动写入自检默认关闭；正常缓存恢复也不因读取失败自动mkfs。
 
@@ -112,7 +113,7 @@ IDLE → STAGING → VERIFIED → QUIESCING → REBOOT_PENDING
 | 操作 | 已实现行为 |
 | --- | --- |
 | Begin | 整包216～458960 B、来源和32 B传输SHA；成功才输出非零RAM会话号。prepare匹配本次Boot身份并完整认证confirmed，预留非零事务号，重新检查角色后才让M3准备另一槽 |
-| Write | 1～1016 B输入复制到普通SRAM；适配拆成≤256 B。完整写后逐字节读回，成功才推进；相同重复块只读比较、不重写、不推进或续期 |
+| Write | 同步读取1～1016 B输入，返回前须保持可读且不变；适配拆成≤256 B值拷贝入存储请求。完整写后逐字节读回，成功才推进；相同重复块只读比较、不重写、不推进或续期 |
 | Finish | 重新读整包算传输SHA，再做实际公共认证/向量检查，成功只到VERIFIED并保留候选租约 |
 | Commit | 必须VERIFIED；关变更门控，按模块暂停→结算→同步，全部成功才请求持久READY，复读确认后到REBOOT_PENDING |
 | Abort | 未提交时幂等释放占用，不擦包或日志；UNKNOWN/已提交READY拒绝撤销。恢复或关闭失败分别记录并保留门控/租约 |
@@ -162,6 +163,8 @@ M2调用顺序固定如下，不需要额外的M4云端API：
 UpgradeEntry_Finish执行Stage_Finish和Stage_Commit；返回OK仅表示READY已持久/准备重启，安装和健康结果须重启后查询。ErrorName/PhaseName给M1/M2统一的E_FORMAT/E_RANGE/E_MODE/E_BUSY/E_STORAGE/E_INTEGRITY/E_AUTH/E_TIMEOUT/E_INTERNAL及阶段名称，不另做JSON实现。
 
 TF只接受/firmware.gwp。UpgradeTf_Import先对不可变租约文件计算整包SHA，再BEGIN、第二遍读文件并逐块调用同一Write，关闭文件后Finish/Commit；文件变化会被最终持久摘要/认证拒绝。每遍文件处理固定180 s，不在Storage_Task内同步排队等待自己。文件关闭错误和包槽取消错误分别返回，关闭未确认先隔离旧租约；RequestCancel只请求取消，不伪造完成。
+
+PA0每20 ms轮询，按下/释放均消抖40 ms；从确认按下起计时，达到3 s后仍须释放才触发，持续按住不触发。启动及导入返回后先等待稳定释放，避免旧按压再次启动升级。每次触发先核对正常Boot身份、后端和模块回调，再使用非零且本次启动不复用的epoch调用导入；忙或缺依赖当次拒绝，不排队。失败关闭和取消分别记错，未释放占用时下次按键先重试清理；提交不明继续保持原保护。USART1仅输出拒绝原因或导入结果，不承担触发。
 
 第三轮只整理TF和Storage的读取重复逻辑：HashFile/CopyFile共用ReadBlock，保留每遍180000 ms固定起点，复制读取额外限制单次等待最多30000 ms。只在读取成功、未到期且未观察到取消时消费该块；读取期间收到取消也在返回后检查。文件完整填充约定及close/abort错误处理不变。
 
@@ -226,6 +229,23 @@ Initialize只由显式首次配置调用，必须全部[0,0x7000)升级元数据
 
 App从入口起最长30 s，可信平台/产品自检连续健康1 s才请求确认，不要求外部网络在线或TF存在。Monitor聚合各关键模块登记/真实进展/自检，合法等待不能续期，过期或致命平台故障锁存停止喂狗；确认前再次原子检查，避免Poll后故障仍写确认。缺实际报告不自动确认，M1/M2/M3试运行业务门控仍需接入，不能称整机试运行已验收。
 
+### 启动结果与联网交接
+
+现有升级任务通过App_UpgradePollResult最多每秒尝试一次只读核对，每次总限3 s，成功取得本次启动快照后停止读取；读失败保留重试。UpgradeStage_ReadBootState与收包共用串行占用，仅空闲或已清理ERROR允许；实际读取仍由Storage_Task处理既有READ_METADATA消息，不直接访问Flash。收包中、提交不明、旧占用未释放、读失败或身份不匹配均不产生成功结果。
+
+| 本次Boot及持久状态 | 结果 |
+| --- | --- |
+| 普通/恢复TRIAL且事务号、序号、次数、镜像摘要匹配 | TRIAL，保持试运行门控 |
+| NORMAL与CONFIRMED/INSTALL或RECOVERY全部匹配 | CONFIRMED |
+| NORMAL与CONFIRMED/RESTORE全部匹配 | ROLLED_BACK |
+| 缺依赖、读取失败、身份不符或首次ENROLL/CANCEL | UNKNOWN，不报终态 |
+
+已知结果为本次启动的只读快照，健康确认仍须复位交Boot认证和持久提交。原App_UpgradeGetBootIdentity仍只允许正常启动；新增StartupIdentity只用于结果关联，不开放业务或收包权限。
+
+网络升级任务空闲时读取RAM快照，MQTT连通后发布ota_status；不在MQTT或监督任务中等待存储。事件type为boot_result，含16个小写hex字符的字符串tx_id、u32 sequence、phase（trial/confirmed/rolled_back）及64个小写hex字符的明文image_sha256（32 B）。UNKNOWN保持待判定。sequence不是云端任务号，image_sha256也不是下载通知的整包传输SHA；云端task_id关联和按事务/序号/阶段去重由M2及云端处理。
+
+启动结果复用原QoS1槽和发送锁；重复调用不叠加在途副本，匹配PUBACK才结束本次待报。断线时撤销连接内packet_id，未确认结果以原始身份重发，已确认结果在本次启动内不重发。分配编号跳过仍在途的ID。PUBACK只证明broker接收，不冒充云端任务处理回执；重新上电可能再次发送相同快照。不新增任务、队列、持久格式或擦写步骤。
+
 硬件IWDG当前仍/256、4095，按LSI范围约22.31～61.68 s，不能视为满足拟定≤8 s目标；最终参数、Flash停顿和最长合法不可喂狗段须实板核算。软件固定期限不等同实板墙钟保证。
 
 ## M4/M3队列契约
@@ -277,24 +297,86 @@ Storage_Task须有界唤醒/连续服务并保留控制/采样公平性，不能
 
 ## 信任资料、工具与启用
 
-UpgradeTrust_ReadPlatform默认返回false；可信平台实现只读保护区，提供运行期间不变的65 B SEC1公钥和32 B AES指针，当前批准密钥编号均为1。GATEWAY_UPGRADE_TRUST_SOURCE可显式加入该实现；不能把生产密钥、私钥或凭据写进通用源码、日志、TF或导出。Boot/App都先初始化同一映射，未知编号拒绝；没有真实资料时保持未配置。
+普通F407 Boot/App由根CMake自动接入shared/upgrade_trust_otp.c，覆盖默认拒绝映射的弱实现；GATEWAY_UPGRADE_TRUST_SOURCE非空时使用指定的其他保护区实现。BOOT_PACKAGE_RECEIVE_TEST只使用显式测试根，不编入OTP实现，也不能同时指定保护区实现。两边取得运行期间不变的65 B SEC1公钥和32 B AES只读指针，当前批准密钥编号均为1；没有有效记录时Initialize返回false，升级保持NOT_READY。
+
+OTP布局依据[ST RM0090的OTP组织](https://www.st.com/resource/en/reference_manual/DM00031020.pdf)：独立于主Flash的16个32 B数据块，各有一个锁字节。本项目软件预留最后四块12～15，即数据[0x1FFF7980,0x1FFF7A00)、锁字节[0x1FFF7A0C,0x1FFF7A10)，不改变Boot的64 KiB、App的448 KiB及外部Flash分区。读取前要求四个锁字节均为0x00；0xFF或其他值均拒绝。数据无有效记录时不回退到包内、TF、配置文件或测试密钥。
+
+信任记录固定128 B，整数为小端，不直接写C结构体；工厂/维护资料按下表准备，不放进通用构建产物。
+
+| 相对偏移（B） | 长度（B） | 内容与校验 |
+| --- | --- | --- |
+| 0 | 8 | ASCII GWTRUST后跟一个0x00字节 |
+| 8 | 4 | 记录总长度128 |
+| 12 / 16 | 各4 | 签名/解密密钥编号，均为1 |
+| 20 | 65 | SEC1未压缩P-256公钥，须前缀0x04且为有效曲线点 |
+| 85 | 32 | AES-256密钥，拒绝全0x00或全0xFF |
+| 117 | 7 | 保留字段全0x00 |
+| 124 | 4 | CRC-32/ISO-HDLC覆盖前124 B，小端存储 |
+
+CRC只检测意外损坏，锁定只防改写，不代表AES对调试器/运行固件保密，也不替代工厂写入来源的可信性。首次部署前须核对该板OTP没有其他用途，核验受控记录及备份，再单独批准写入和锁定；本轮不提供自动写入/锁定路径，不修改RDP或选项字节。OTP不能擦除，锁定后不能修改，本实现不支持原地换密钥。生产密钥和私钥不得进入Git、源码、通用ELF/bin、日志、TF或导出。
+
+2026-11-11软件验证：7个预设构建通过，BootSizeCheck为Flash55256/65536 B，AppDebug为304140/458752 B，Release为184920/524288 B；普通SRAM分别为18216/131008、107152/131008、107096/131072 B。Boot/App两种配置的信任绑定和OTP实现共4个单元严格编译及静态分析通过，实际符号确认普通构建使用OTP强实现、两个测试预设均不编入该实现。拒绝分支按源码审查，尚未执行固件反例或读取实板OTP，不作为运行验收。
 
 tools/package_upgrade.py读取外部受控P-256私钥及设备AES文件，生成V2加密包，持久号默认且只允许2，明确固件版本并确认实际App接管IWDG。当前硬件标识仍为源码批准的F407-TEST；此标识不表示使用测试信任根。输入必须为0x08010000偏移且向量有效的App，不写出明文/密钥副本，输出前真实验签及GCM自检。PEM密码可从指定环境变量读取，不把密码放命令行。
 
 nonce由每AES密钥唯一的SQLite账本预留，先持久递增再加密，失败消耗的值不复用；同账本并发受数据库事务串行。首次登记才用--initialize-ledger，不覆盖已有密钥记录；正常制作不自动新建丢失账本。每key只能有一个持续维护的账本，不能复制后并行用；丢失或回滚须轮换AES密钥，不能重置同key账本继续发行。该保证依赖可信发布环境及账本可靠保管。
 
-tools/boot_recovery.py及既有本地发送工具的--persistence-version默认且只允许2；发送前核对包和设备INFO，要求明确compat=2，缺字段或其他值拒绝。--initialize-transactions仅在INFO显示首次空白时发送GWRTINIT；设备还完整检查全部元数据FF，失败不擦除重试。INFO增加兼容号、普通阶段/序号、事务/次数及高水位状态，保留原字段。
+tools/boot_recovery.py的--persistence-version默认且只允许2；发送前核对包和设备INFO，要求mode=BOOT及compat=2，缺字段或其他值拒绝。--initialize-transactions仅在INFO显示首次空白时明确请求首次初始化；设备还完整检查全部元数据FF，失败不擦除重试。旧GWRC/GWLOAD/GWBASE文本接收入口已移除，旧本地发送脚本不适用于当前Boot；首次部署使用显式事务号初始化和同一恢复流程，不绕过认证或试运行。
 
 源码准备完成后，启用仍需以下外部交付：
 
 1. 存储端、共同队列及TF租约已写入；Storage及存储侧门控/健康已接入，实际信任资料下的绑定/运行仍需实板核对；历史控制日志卡死不能仅凭编译关闭。
 2. M2提供真实任务授权、网络下载、升级执行任务及最终结果上报；M1提供串口配置/共用维护帧。各模块接试运行/最终变更门控、真实暂停/结算/同步和健康报告；TF租约的真实介质行为仍需验证。
-3. 工厂/维护流程提供真实保护区映射、已接管IWDG的初始App及匹配恢复包；不自动重生成测试信任根或擦旧日志。Boot/App/M3/工具均采用版本2，普通升级不更新Boot、不隐式迁移持久格式。
+3. 工厂/维护流程写入并锁定核验过的真实OTP记录，提供已接管IWDG的初始App及匹配恢复包；只读映射代码已接入，不表示板上已配置。部署不自动重生成测试信任根或擦旧日志。Boot/App/M3/工具均采用版本2，普通升级不更新Boot、不隐式迁移持久格式。
 4. 集中实板验证真实存储/吞吐、取消/关闭、断电窗口、两次试运行、错误确认拒绝、看门狗交接/停止及栈堆峰值，最后核对正式构建和测试根隔离。
 
-当前Boot电脑工具仍使用GWRC等工程恢复协议，尚未接正式设计的A5 5A维护帧/0x30～0x32。共用帧编解码由M1提供，Boot侧正式封装、统一工具接入和联调仍需完成；现有串口安全机制及工具检查不能冒充该协议验收。
+### Boot恢复维护帧
+
+Boot及tools/boot_recovery.py复用maint_frame V1：A5 5A、version=1、opcode、flags、request_id(u32LE)、payload_len(u16LE)、载荷及CRC32LE。载荷最多1024 B，CRC覆盖version到payload；请求flags=0，响应flags=1并回显同一请求号。Boot正常启动日志不属于协议应答，工具按帧和请求号识别结果。
+
+| 命令 | 请求载荷 | 结果 |
+| --- | --- | --- |
+| 0x01 INFO / 0x02 STATUS | JSON `{}` | BOOT模式、compat、普通/恢复状态、保护槽、高水位状态及当前会话进度 |
+| 0x30 RECOVERY_BEGIN | JSON `{"slot":2,"total_len":985,"allow_unknown_state":false}` | 保护检查、提交恢复屏障及擦槽后返回session_id、slot、total_len、next_offset=0；slot为1/A、2/B，allow_unknown_state可省略且默认false |
+| 0x31 RECOVERY_CHUNK | session_id(u32LE)、offset(u32LE)、data(1～1016 B) | 顺序分块写入并读回，返回next_offset；工具默认每块256 B |
+| 0x32 RECOVERY_FINISH | JSON `{"session_id":7}` | 收齐并完整认证、持久提交READY后返回ACCEPTED/READY；安装器运行一次，再以同请求号返回OK/TRIAL及install_result=1，失败返回ERROR |
+| 0x16 REBOOT | JSON `{}` | 无活动收包时回应OK后复位；工具--run使用此命令，重启由Boot重新判断持久事务，不宣称App已成功运行 |
+
+原有“首次配置事务号”操作复用0x30的独立载荷`{"initialize_transactions":true}`，不能与收包字段混用、不建立收包会话。此操作由工具--initialize-transactions明确发起，不自动擦除或初始化已有元数据，不新增命令号。请求仅支持表中字段与类型，重复字段、溢出、尾随内容和未知字段拒绝。
+
+响应统一JSON：request_id/status/error/field/restart_required及表中结果字段。失败采用E_FORMAT/E_REQUIRED/E_RANGE/E_MODE/E_AUTH/E_BUSY/E_STORAGE/E_INTEGRITY/E_VERSION/E_TIMEOUT/E_EXPIRED/E_CAPACITY，不返回密钥。ACCEPTED仅表示READY已持久；OK/TRIAL表示安装器已登记试运行，仍须实际跳转与App健康确认。
+
+单会话；session_id复用持久事务号的u32可表示值，不在重启后复用旧编号，超过范围返回E_CAPACITY且不擦包槽。同请求号且参数相同的活动BEGIN返回原会话，不再次擦除；参数冲突拒绝，活动时其他BEGIN返回E_BUSY。CHUNK重复范围须完全落在已确认偏移内，逐段读回内容相同才返回原偏移，冲突拒绝，不允许部分重叠续写。重复BEGIN、重复块及查询均不延长接收进展期限。
+
+半帧2 s超时丢弃，CRC/长度错误重新同步；30 s无新增写入则结束RAM会话，保留恢复屏障和半包，禁止FINISH。收包总期限180 s从擦槽完成后计算；擦槽仍有300 s总期限，认证与安装沿用原有监督。会话到期或写入失败后须用新BEGIN显式重试，不能用旧会话继续；工具不自动重试擦写。断电后不凭RAM偏移续传。
+
+Boot恢复使用**USART2 PD5/TX、PD6/RX，115200 8N1，无流控，轮询收发**。用户已通过CubeMX生成初始化和引脚别名；恢复收发已切换huart2，跳转App前先关闭USART2并释放PD5/PD6，再关闭日志串口及恢复时钟。USART1 PA9/PA10继续输出日志。
+
+USB转串口使用3.3V电平：RX接PD5、TX接PD6、GND共地；选择这一路适配器的COM口。关闭维护口串口监视器，工具独占该口，打开工具后复位设备；如需同时看日志，可另开USART1的监视器。命令在工程根目录执行：
+
+```powershell
+python tools/boot_recovery.py --port COM11 --info
+python tools/boot_recovery.py --port COM11 --initialize-transactions
+python tools/boot_recovery.py --port COM11 --package <加密包路径> --erase-slot B
+python tools/boot_recovery.py --port COM11 --run
+```
+
+COM11按实际端口替换；初始化只用于全空元数据，恢复必须明确选择可擦槽，工具及Boot均保护可信已确认源。工具超时代表结果未知，不得当作失败后自动擦除重试。首次恢复安装成功也不表示App健康确认通过。
+
+
+2026-11-11按授权补齐M1现有模块的升级接入：Modbus最终UART发送准入、暂停与在途结算、Poll/Master实际进展监督、配置RAM变更门控及共用maint_frame V1编解码。同步写结果改为模块内票据，超时不遗留调用者指针；UNKNOWN不自动重发。Config_Task仍无业务实现，未绑定Config角色或伪造健康；实际配置保存/维护命令继续不可用，升级整体仍受该依赖及Network/权限限制。App维护命令分派仍待实现；Boot恢复帧及超时已按上节接入，不能据此认为App串口配置也已完成。
+
+恢复协议本轮软件验证：BootDebug/BootSizeCheck/BootReceiveTest/BootRecoveryTest构建通过，4个相关单元严格编译及GCC静态分析通过，电脑工具48项纯Python协议检查通过。BootSizeCheck Flash54420/65536 B、普通SRAM19312/131008 B；相比替换前Flash减少836 B，SRAM增加1096 B，主要为有界维护帧接收缓存。未运行设备C协议用例或实板；半帧/重复块/掉电/真实UART时序仍须硬件验证。未新增库、任务、工具文件或测试固件，旧文本收包代码已删除，原只读SPI诊断保留。
+
+用户生成PD5/PD6的USART2配置后已完成维护口收发和跳转前清理接入。4个Boot预设重建通过；BootSizeCheck现为Flash54620/65536 B、普通SRAM19384/131008 B。恢复接收、跳转、USART初始化静态检查通过；跳转单元对既有裸汇编通过r0/r1读取参数的unused-parameter告警作临时检查豁免，正式编译选项未改。沿用协议工具48项检查，未重复无行为变化的工具用例；USART2实际收发及跳转仍待实板验证。
+
+本轮AppDebug、Release、BootSizeCheck构建通过，8个相关单元严格ARM编译和静态分析通过；AppDebug为Flash305212/458752 B、普通SRAM107216/131008 B，Release为186904/524288 B、107160/131072 B，CCM均27096/65536 B。临时强制保留M1/维护帧接口链接为Flash309524 B、普通SRAM107576 B，无缺失符号；这不是完整网络升级或栈堆峰值。未执行C模型、串口、实板或断电用例。
 
 ## 已有验证及限制
+
+2026-11-11合入Gitee bc38d97后，AppDebug、Release、M3Test及AppFlashDebug构建通过；本轮修改的任务装配和Modbus轮询通过严格ARM诊断及静态分析。仅应用启用AES ROM查表，释放8744 B普通SRAM。AppDebug链接为Flash405496 B、普通SRAM129232 B、CCM60828 B；C堆理论仅2288 B，小于4站运行表/句柄净需2512 B，当前整机运行内存不满足。网络权限策略重复绑定、真实健康/结算和最终结果仍待对齐，不能将此合并视作实板可运行或OTA验收通过。
+
+2026-11-11按键入口接入后，AppDebug/Release构建通过，6个相关单元严格ARM编译及GCC静态分析通过。实际按键函数经8组编译期向量检查，覆盖启动已按住、短按、3 s阈值、持续按住、抖动、计时回绕及重复操作；未执行C运行用例或实板。AppDebug占用Flash315212 B、普通SRAM115928 B、CCM27096 B，含6 KiB升级任务栈；完整调用链峰值、真实文件/安装与故障用例仍待实板验证。
 
 上轮存储端源码适配：AppDebug/Release构建通过，7个相关单元严格ARM编译、5个单元-fanalyzer通过。为排除默认任务禁用导致的链接回收，临时强制保留Storage_Init/Storage_Task及网络/TF升级入口，实际链接并核对核心/驱动符号；Flash 311084/458752 B、普通SRAM 109104/131008 B、CCM 27096/65536 B。正式选项未改，临时ELF/map清理；数字不含未来网络下载器、新执行任务栈或动态峰值。日志为.local/tests/logs/m3-upgrade-*。
 

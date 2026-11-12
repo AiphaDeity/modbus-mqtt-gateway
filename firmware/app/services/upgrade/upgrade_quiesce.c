@@ -1,6 +1,7 @@
 #include "upgrade_quiesce.h"
 
 #include "app_upgrade.h"
+#include "app_monitor.h"
 #include "stm32f4xx_hal.h"
 #include "cmsis_os2.h"
 #include "FreeRTOS.h"
@@ -12,6 +13,12 @@ static UpgradeQuiesceParticipant participants[UPGRADE_QUIESCE_COUNT];
 static uint32_t bound_mask;
 static uint32_t paused_mask;
 static bool quiescing;
+// 先停生产者，最后结算及同步存储；恢复按相反顺序。
+static const UpgradeQuiesceModule pause_order[] =
+{
+  UPGRADE_QUIESCE_NETWORK, UPGRADE_QUIESCE_CONFIG,
+  UPGRADE_QUIESCE_MODBUS, UPGRADE_QUIESCE_STORAGE
+};
 
 // 根据构建配置生成必须参与升级暂停的模块集合。
 static uint32_t RequiredMask(void)
@@ -75,6 +82,18 @@ bool UpgradeQuiesce_AllowsMutation(void)
   return !paused && App_UpgradeCanCommit();
 }
 
+// 在模块回调的剩余期限内登记等待，完成回调后报告升级任务进展。
+static UpgradeStageResult CallParticipant(UpgradeStageResult (*action)(void *, uint32_t),
+                                           void *context, uint32_t timeout_ms)
+{
+  if (!Monitor_UpgradeWait(timeout_ms))
+  {
+    return UPGRADE_STAGE_INTERNAL;
+  }
+  UpgradeStageResult result = action(context, timeout_ms);
+  return Monitor_UpgradeProgress() ? result : UPGRADE_STAGE_INTERNAL;
+}
+
 // 关闭变更门控，并在同一总期限内暂停、结算和同步各模块。
 UpgradeStageResult UpgradeQuiesce_Run(uint32_t started_ms, uint32_t timeout_ms)
 {
@@ -87,8 +106,9 @@ UpgradeStageResult UpgradeQuiesce_Run(uint32_t started_ms, uint32_t timeout_ms)
   taskEXIT_CRITICAL();
   for (uint32_t phase = 0U; phase < 3U; phase++)
   {
-    for (uint32_t i = 0U; i < UPGRADE_QUIESCE_COUNT; i++)
+    for (uint32_t step = 0U; step < UPGRADE_QUIESCE_COUNT; step++)
     {
+      uint32_t i = pause_order[step];
       if ((RequiredMask() & (1U << i)) == 0U)
       {
         continue;
@@ -113,7 +133,7 @@ UpgradeStageResult UpgradeQuiesce_Run(uint32_t started_ms, uint32_t timeout_ms)
         // 失败也可能已暂停，恢复时仍须调用这一模块，不能只记成功的模块。
         paused_mask |= 1U << i;
       }
-      UpgradeStageResult result = action(participant->context, remaining);
+      UpgradeStageResult result = CallParticipant(action, participant->context, remaining);
       if (Remaining(started_ms, timeout_ms) == 0U)
       {
         return UPGRADE_STAGE_TIMEOUT;
@@ -134,7 +154,7 @@ UpgradeStageResult UpgradeQuiesce_Resume(uint32_t timeout_ms)
   // 逆序恢复；任一失败保留门控，不能把部分恢复解释为正常运行。
   for (uint32_t i = UPGRADE_QUIESCE_COUNT; i > 0U; i--)
   {
-    uint32_t module = i - 1U;
+    uint32_t module = pause_order[i - 1U];
     if ((paused_mask & (1U << module)) == 0U)
     {
       continue;
@@ -145,7 +165,7 @@ UpgradeStageResult UpgradeQuiesce_Resume(uint32_t timeout_ms)
       return UPGRADE_STAGE_TIMEOUT;
     }
     UpgradeQuiesceParticipant *participant = &participants[module];
-    UpgradeStageResult result = participant->resume(participant->context, remaining);
+    UpgradeStageResult result = CallParticipant(participant->resume, participant->context, remaining);
     if (Remaining(started_ms, timeout_ms) == 0U)
     {
       return UPGRADE_STAGE_TIMEOUT;

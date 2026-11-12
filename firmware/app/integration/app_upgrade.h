@@ -10,6 +10,14 @@ typedef enum
   APP_UPGRADE_ROLLBACK_RESET
 } AppUpgradeAction;
 
+typedef enum
+{
+  APP_UPGRADE_RESULT_UNKNOWN,
+  APP_UPGRADE_RESULT_TRIAL,
+  APP_UPGRADE_RESULT_CONFIRMED,
+  APP_UPGRADE_RESULT_ROLLED_BACK
+} AppUpgradeResult;
+
 // 自检完成后连续健康1s；从App入口起总预算30s，不把稳定窗口叠加到总期限外。
 #define APP_UPGRADE_STABLE_MS 1000U
 #define APP_UPGRADE_DEADLINE_MS 30000U
@@ -28,6 +36,12 @@ bool App_UpgradeCanCommit(void);
 
 // 仅受Boot管理的正常启动返回可信交接身份；普通Debug直启不能用于升级旧源比对。
 bool App_UpgradeGetBootIdentity(UpgradeMessage *message);
+// 只读本次Boot正常/试运行身份，失败清零；仅用于结果关联，不作为业务提交授权。
+bool App_UpgradeGetStartupIdentity(UpgradeMessage *message);
+// 现有升级任务每轮调用；成功取得本次启动快照后停止读日志，读失败最多每秒重试一次。
+void App_UpgradePollResult(uint32_t now_ms);
+// 任务上下文读取本次Boot结果；UNKNOWN不代表失败，TRIAL不代表确认成功。
+AppUpgradeResult App_UpgradeGetResult(void);
 
 /*
  * 仅监督任务调用，now_ms 为同一单调毫秒时基；platform_healthy 为平台检查，

@@ -11,6 +11,7 @@
 #include "task.h"
 #include "queue.h"
 #include "Modbus.h"
+#include "mb_internal.h"
 #include "timers.h"
 #include "semphr.h"
 #include <stdio.h>
@@ -87,7 +88,7 @@ uint8_t numberHandlers = 0;
 modbusHandler_t *mHandlers[MAX_M_HANDLERS];
 
 
-static void sendTxBuffer(modbusHandler_t *modH);
+static bool sendTxBuffer(modbusHandler_t *modH);
 static int16_t getRxBuffer(modbusHandler_t *modH);
 static uint8_t validateAnswer(modbusHandler_t *modH);
 static void buildException( uint8_t u8exception, modbusHandler_t *modH );
@@ -781,7 +782,8 @@ void ModbusQuery(modbusHandler_t * modH, modbus_t telegram )
 	if (modH->uModbusType == MB_MASTER)
 	{
 	telegram.u32CurrentTask = (uint32_t *) osThreadGetId();
-	xQueueSendToBack(modH->QueueTelegramHandle, &telegram, 0);
+	if (!mb_runtime_enqueue(modH, &telegram, false))
+        xTaskNotify((TaskHandle_t)telegram.u32CurrentTask, ERR_UPGRADE_BUSY, eSetValueWithOverwrite);
 	}
 	else{
 		while(1);// error a slave cannot send queries as a master
@@ -793,9 +795,9 @@ void ModbusQuery(modbusHandler_t * modH, modbus_t telegram )
 void ModbusQueryInject(modbusHandler_t * modH, modbus_t telegram )
 {
 	//Add the telegram to the TX head Queue of Modbus
-	xQueueReset(modH->QueueTelegramHandle);
 	telegram.u32CurrentTask = (uint32_t *) osThreadGetId();
-	xQueueSendToFront(modH->QueueTelegramHandle, &telegram, 0);
+	if (!mb_runtime_enqueue(modH, &telegram, true))
+        xTaskNotify((TaskHandle_t)telegram.u32CurrentTask, ERR_UPGRADE_BUSY, eSetValueWithOverwrite);
 }
 
 
@@ -922,9 +924,13 @@ int8_t SendQuery(modbusHandler_t *modH ,  modbus_t telegram )
 	}
 
 
-	sendTxBuffer(modH);
-
+	bool sent = sendTxBuffer(modH);
 	xSemaphoreGive(modH->ModBusSphrHandle);
+	if (!sent)
+    {
+        modH->i8state = COM_IDLE;
+        return modH->i8lastError;
+    }
 
 	modH->i8state = COM_WAITING;
 	modH->i8lastError = 0;
@@ -1048,8 +1054,13 @@ void StartTaskModbusMaster(void *argument)
 
   for(;;)
   {
-	  /*Wait indefinitely for a telegram to send */
-	  xQueueReceive(modH->QueueTelegramHandle, &telegram, portMAX_DELAY);
+	  mb_runtime_query_complete();
+      if (!mb_runtime_take_query(modH, &telegram))
+      {
+          osDelay(10U);
+          continue;
+      }
+      (void)xTaskNotifyWait(0U, UINT32_MAX, &ulNotificationValue, 0U);
 
 
 #if ENABLE_TCP ==1
@@ -1094,9 +1105,23 @@ void StartTaskModbusMaster(void *argument)
      }
 #else
      // This is the case for implementations with only USART support
-     SendQuery(modH, telegram);
-     /* Block indefinitely until a Modbus Frame arrives or query timeouts*/
-     ulNotificationValue = ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+     int8_t send_error = SendQuery(modH, telegram);
+     if (send_error != 0)
+     {
+         modH->i8state = COM_IDLE;
+         xTaskNotify((TaskHandle_t)telegram.u32CurrentTask, send_error, eSetValueWithOverwrite);
+         continue;
+     }
+     if (xTaskNotifyWait(0U, UINT32_MAX, &ulNotificationValue,
+                         pdMS_TO_TICKS(TIMEOUT_MODBUS + 200U)) != pdTRUE)
+     {
+         modH->i8state = COM_IDLE;
+         modH->i8lastError = ERR_UNKNOWN;
+         xTaskNotify((TaskHandle_t)telegram.u32CurrentTask, ERR_UNKNOWN, eSetValueWithOverwrite);
+         // 缺少帧结束/超时通知属于执行链故障，不能当普通从站离线继续写。
+         mb_runtime_fail();
+         continue;
+     }
 
 #endif
 
@@ -1531,7 +1556,7 @@ extern uint8_t CDC_Transmit_FS(uint8_t* Buf, uint16_t Len);
  * @return nothing
  * @ingroup modH Modbus handler
  */
-static void sendTxBuffer(modbusHandler_t *modH)
+static bool sendTxBuffer(modbusHandler_t *modH)
 {
     // append CRC to message
 
@@ -1556,23 +1581,6 @@ if(modH->xTypeHW != TCP_HW)
     {
 #endif
 
-    	if (modH->EN_Port != NULL)
-        {
-    		/*
-    		 * Full-Duplex UART（USART3）模式下，不能调 HAL_HalfDuplex_* 系列函数！
-    		 * 它会改 gState=BUSY_TX_RX → HAL_UART_Transmit_IT 因 gState 不匹配直接返回 HAL_ERROR！
-    		 * 
-    		 * Full-Duplex 下 RE/TE 全程开着，我们只需要：
-    		 *   GPIO 拉高 DE → 切 RS485 收发器到 TX 方向
-    		 *   发完后 GPIO 拉低 DE → 切回 RX 方向
-    		 */
-    		printf("[DIR] DE=HIGH prev=%d (port=%p pin=%d)\n",
-    			(int)HAL_GPIO_ReadPin(modH->EN_Port, modH->EN_Pin),
-    			modH->EN_Port, modH->EN_Pin);
-    		HAL_GPIO_WritePin(modH->EN_Port, modH->EN_Pin, GPIO_PIN_SET);
-    		printf("[DIR] DE=HIGH now=%d\n", (int)HAL_GPIO_ReadPin(modH->EN_Port, modH->EN_Pin));
-        }
-
         /* 打印 TX 帧 hex dump（最多 32 字节） */
         {
             int _i;
@@ -1588,9 +1596,11 @@ if(modH->xTypeHW != TCP_HW)
 #endif
     		// transfer buffer to serial line IT
     		{
-    			HAL_StatusTypeDef _ret = HAL_UART_Transmit_IT(modH->port, modH->u8Buffer,  modH->u8BufferSize);
+                HAL_StatusTypeDef _ret = mb_runtime_transmit(modH);
     			if (_ret != HAL_OK) {
     				printf("[TX-ERR] HAL_UART_Transmit_IT ret=%d gState=%d RxState=%d\n", _ret, modH->port->gState, modH->port->RxState);
+                    modH->u8BufferSize = 0U;
+                    return false;
     			}
     		}
 
@@ -1599,7 +1609,11 @@ if(modH->xTypeHW != TCP_HW)
         else
         {
         	//transfer buffer to serial line DMA
-        	HAL_UART_Transmit_DMA(modH->port, modH->u8Buffer, modH->u8BufferSize);
+            if (mb_runtime_transmit(modH) != HAL_OK)
+        {
+            modH->u8BufferSize = 0U;
+            return false;
+        }
 
         }
 #endif
@@ -1723,8 +1737,7 @@ if(modH->xTypeHW != TCP_HW)
      modH->u8BufferSize = 0;
      // increase message counter
      modH->u16OutCnt++;
-
-
+     return true;
 }
 
 

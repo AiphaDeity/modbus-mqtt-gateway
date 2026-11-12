@@ -62,8 +62,14 @@ void MX_GPIO_Init(void)
   GPIO_InitStruct.Pin = SPI_FLASH_CS_Pin|SPI_IMU_CS_Pin|ETH_NRST_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;   /* CS 类引脚需要干净边沿 */
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : TF_UPGRADE_KEY_Pin */
+  GPIO_InitStruct.Pin = TF_UPGRADE_KEY_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(TF_UPGRADE_KEY_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : RS485_DIR_Pin */
   GPIO_InitStruct.Pin = RS485_DIR_Pin;
@@ -72,10 +78,7 @@ void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(RS485_DIR_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : SD_CARD_DET_Pin
-   * 硬件卡座：卡插入时机械开关拉低 DET 引脚；
-   * 未插入时需内部上拉保证 PD3 稳定读高。
-   */
+  /*Configure GPIO pin : SD_CARD_DET_Pin */
   GPIO_InitStruct.Pin = SD_CARD_DET_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_PULLUP;

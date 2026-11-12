@@ -48,13 +48,19 @@ AppModuleInitResult MqttClient_Init(void);
  */
 void MqttClient_Task(void *argument);
 
+/* 仅任务上下文设置暂停请求；每次请求均撤销旧确认，MQTT保活继续运行。 */
+void MqttClient_SetPaused(bool paused);
+/* 任务到达安全点、旧补传应答已结算且发送锁空闲时返回true。 */
+bool MqttClient_IsPaused(void);
+
 /**
  * @brief  线程安全的 PUBLISH（QoS0）——telemetry_task 等其他任务可并发调用
  * @param  topic   主题字符串（\0 结尾）
  * @param  payload 数据指针
  * @param  plen    数据长度
- * @return 0=成功，-1=未连接，-2=发送失败，-3=payload 过大
- * @note   内部加互斥锁保护 tx_buf 和 netconn_write
+ * @return 0=成功，-1=未连接或发送锁不可用，-2=发送失败，-3=payload过大，-5=业务暂停
+ * @note   锁等待最多12秒、写入最多10秒（另计调度延迟），写入失败关闭发送准入。
+ *         MQTT任务自行报告健康，其他调用任务须覆盖本次阻塞等待。
  */
 int MqttClient_Publish(const char *topic, const uint8_t *payload, size_t plen);
 
@@ -63,11 +69,18 @@ int MqttClient_Publish(const char *topic, const uint8_t *payload, size_t plen);
  * @param  topic   主题字符串（\0 结尾）
  * @param  payload 数据指针
  * @param  plen    数据长度（≤512B，QoS1 pending 缓冲上限）
- * @return 0=已发送(等PUBACK), -1=未连接, -2=发送失败, -3=过大, -4=pending队列满
+ * @return 0=已发送(等PUBACK), -1=未连接或发送锁不可用, -2=发送失败, -3=过大, -4=pending队列满, -5=业务暂停
  * @note   内部拷贝 payload 到 pending 槽，函数返回后 payload 可释放。
  *         PUBACK 30s 未到则保持原 packet_id 重发（设计 5.2）。
+ *         锁/写入等待和健康报告责任同QoS0接口。
  */
 int MqttClient_PublishQos1(const char *topic, const uint8_t *payload, size_t plen);
+/*
+ * 仅网络升级任务提交本次启动的同一份已核验结果，payload在返回前有效且不变。
+ * 复用ota_status和原QoS1槽；0=已发送/仍等PUBACK，1=匹配PUBACK已到，负值同QoS1。
+ * 断线未确认时须重调；PUBACK仅证明broker接收，不表示云端任务已处理。
+ */
+int MqttClient_PublishUpgradeResult(const uint8_t *payload, size_t plen);
 
 /**
  * @brief  查询 MQTT 是否已连接到 broker

@@ -64,6 +64,15 @@ typedef struct
 static __lwip_dev g_lwipdev;          /* lwip 控制结构体（静态=只本文件用） */
 static struct netif g_lwip_netif;     /* 全局网络接口（lwip 的核心对象，代表"这块网卡"） */
 static uint8_t  g_m2_eth_inited = 0;  /* 幂等保护：已初始化过就不再初始化（防止 main 里重复调用） */
+static uint8_t g_tcpip_started;
+static volatile uint8_t g_tcpip_ready;
+static uint8_t g_netif_added;
+#if LWIP_NETIF_LINK_CALLBACK
+static sys_thread_t g_link_thread;
+#endif
+#if LWIP_DHCP
+static sys_thread_t g_dhcp_thread;
+#endif
 
 /* DHCP 状态枚举（照例程 netconf.h，值别改，线程状态机靠它跳转）：
    OFF=没开始 → START=开始申请 → WAIT_ADDRESS=等分配 → ADDRESS_ASSIGNED=分配成功
@@ -127,123 +136,94 @@ static void lwip_comm_default_ip_set(__lwip_dev *lwipx)
   lwipx->dhcpstatus  = 0;   /* 初始没开 DHCP */
 }
 
-/* ================= 五、初始化入口：m2_ethernet_init() =================
- * 调用时机：integration/app_entry.c 的 App_Entry() 里（★必须是任务上下文，
- *           即调度器已经跑起来之后；2026-11-04 之前曾放在 main.c 的
- *           osKernelStart 之前，导致 BASEPRI 被锁死、PING 不通）
- * 为什么必须在任务上下文？
- *   - tcpip_init 会创建 tcpip_thread（内核线程）
- *   - netif_add 内部 ethernetif_init 会创建收包线程，DHCP/链接线程在这里创建
- *   - 调度器启动前创建这些对象时，FreeRTOS 的 uxCriticalNesting 还是哨兵值
- *     0xAAAAAAAA，一次 enter/exit 配不平 → BASEPRI 停在 0x50 → 中断被屏蔽
- *   （详见 LWIP_PING排障记录_修正版.md 第二/第九章）
- * ==================================================================== */
+/* ================= 五、初始化入口 ================= */
+/* tcpip 线程完成初始化后报告就绪；重试复用同一个协议栈。 */
+static void lwip_init_done(void *argument)
+{
+  (void)argument;
+  g_tcpip_ready = 1;
+}
+
+/* 仅由启动任务串行调用；失败保留已创建的基础资源，重试只补缺项。 */
 int32_t m2_ethernet_init(void)
 {
-  struct netif *netif_init_flag = NULL;   /* netif_add 的返回值：判断网卡挂没挂上 */
-  ip_addr_t ipaddr, netmask, gw;          /* 网卡的 IP/掩码/网关（netif_add 用） */
+  ip_addr_t ipaddr, netmask, gw;
 
   if (g_m2_eth_inited)
-    return ETH_OK;                        /* 已初始化过，直接返回（幂等） */
-
-  /* ★排障临时守卫：如果 HAL_ETH_Init 没跑（heth.gState 不是 READY/STARTED），
-     说明 ETH 硬件时钟/GPIO/IRQ 都没配好，调 HAL_ETH_ReadPHYRegister 会死循环。
-     跳过整个 m2_ethernet_init，等 MX_ETH_Init 问题修好后再恢复。 */
+    return ETH_OK;
   if (heth.gState == HAL_ETH_STATE_RESET || heth.gState == HAL_ETH_STATE_ERROR)
   {
-    printf("[ETH] skip m2_ethernet_init: heth.gState=%u (MX_ETH_Init not ready)\r\n", (unsigned)heth.gState);
-    fflush(stdout);
+    printf("[ETH] HAL not ready: state=%u\r\n", (unsigned)heth.gState);
     return ETH_ERR_CONFIG;
   }
 
-  /* 1. 初始化 tcpip 内核
-     ★ 这一句内部创建了 lwip 的核心线程 tcpip_thread（名字 "lwip_thread"，栈 1280 字 = 5KB）。
-       注意本工程 sys_arch.c 里 LWIP_FREERTOS_THREAD_STACKSIZE_IS_STACKWORDS=1，
-       即 lwipopts.h 的 TCPIP_THREAD_STACKSIZE 单位是"字"（4 字节），不是字节。
-       所有协议栈处理（TCP/UDP/ARP/DHCP 报文）都在这个线程里跑。
-       参数 NULL,NULL = 不用初始化完成回调、不传自定义数据 */
-  tcpip_init(NULL, NULL);
-
-  /* 2. 先写好默认静态 IP（DHCP 超时回落要用），DHCP 成功会覆盖 g_lwipdev 里的值 */
-  lwip_comm_default_ip_set(&g_lwipdev);
-
-#if LWIP_DHCP
-  /* 用 DHCP：网卡先给 0.0.0.0（IP 全 0），等 DHCP 线程去要地址。
-     为什么给全 0？DHCP 流程要求客户端先以 0.0.0.0 发广播请求 */
-  ipaddr.addr = 0;
-  netmask.addr = 0;
-  gw.addr = 0;
-#else
-  /* （不用 DHCP 才走这里：直接用静态 IP 配置网卡） */
-  IP4_ADDR(&ipaddr, g_lwipdev.ip[0], g_lwipdev.ip[1], g_lwipdev.ip[2], g_lwipdev.ip[3]);
-  IP4_ADDR(&netmask, g_lwipdev.netmask[0], g_lwipdev.netmask[1], g_lwipdev.netmask[2], g_lwipdev.netmask[3]);
-  IP4_ADDR(&gw, g_lwipdev.gateway[0], g_lwipdev.gateway[1], g_lwipdev.gateway[2], g_lwipdev.gateway[3]);
-#endif
-
-  /* 3. 把网卡挂进 lwip
-     参数依次是：
-       &g_lwip_netif      —— 网卡对象（lwip 用这个结构代表本网卡）
-       &ipaddr &netmask &gw —— 初始 IP/掩码/网关
-       NULL               —— state：给驱动的自定义数据，不需要
-       &ethernetif_init   —— ★初始化回调：netif_add 内部会调它，实际做硬件准备
-                               （PHY 探测 + HAL_ETH_Start_IT + 建收包线程，见第 2 步 ethernetif.c）
-       &tcpip_input       —— ★收包入口：驱动线程收到一帧就调 netif->input(=tcpip_input)
-                               把包扔给内核线程处理
-     ★这里【绝对不能】套 taskENTER_CRITICAL()！
-       例程原本在 netif_add 外面套了临界区，但 netif_add 内部会回调
-       ethernetif_init → low_level_init，里面有：
-         · PHY 软复位/自动协商的 HAL_Delay（依赖 TIM6 中断递增 uwTick）
-         · HAL_ETH_Start_IT，其内部也有 HAL_Delay(ETH_REG_WRITE_DELAY)
-       FreeRTOS 临界区会把 BASEPRI 抬到 configMAX_SYSCALL_INTERRUPT_PRIORITY(0x50)，
-       屏蔽所有优先级数值 ≥5 的中断——TIM6（优先级15，实测 IPR=0xF0）同样被屏蔽，
-       uwTick 立刻冻结 → HAL_Delay 里的 while 永远退不出去 → 卡死在 Start_IT 前
-       （串口只打到 [ETH] sem=... 就是这个死循环，2026-11-04 实测 BASEPRI=0x50、uwTick 停在 11）
-       正确做法：netif_add 直接调，lwip 内部有自己的 sys_arch 互斥保护。 */
-  netif_init_flag = netif_add(&g_lwip_netif, &ipaddr, &netmask, &gw,
-                              NULL, &ethernetif_init, &tcpip_input);
-
-  /* 网卡添加失败（内存不够等）：返回配置错误 */
-  if (netif_init_flag == NULL)
+  if (!g_tcpip_started)
   {
-    g_m2_eth_inited = 0;                  /* 保持未初始化，允许重试 */
-    return ETH_ERR_CONFIG;
+    g_tcpip_started = 1;
+    tcpip_init(lwip_init_done, NULL);
+  }
+  uint32_t started_ms = HAL_GetTick();
+  while (!g_tcpip_ready)
+  {
+    if ((uint32_t)(HAL_GetTick() - started_ms) >= 2000U)
+    {
+      printf("[ETH] tcpip init timeout\r\n");
+      return ETH_ERR_CONFIG;
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
   }
 
-  /* 4. 设为默认网口：系统只有一个网卡，默认路由/ARP 都走它。
-     netifapi 版本：投递到 tcpip_thread 执行（本函数跑在 App_Entry 任务上下文） */
-  netifapi_netif_set_default(&g_lwip_netif);
-
-  /* 5. 链接回调 + 起链接线程
-     先手动调一次 lwip_link_status_updated 初始化状态，
-     再注册回调（网线插拔时 lwip 自动调它），最后建链接线程（每秒查 PHY） */
-#if LWIP_NETIF_LINK_CALLBACK
-  lwip_link_status_updated(&g_lwip_netif);
-  netif_set_link_callback(&g_lwip_netif, lwip_link_status_updated);
-  printf("[ETH] before link thread, freeHeap=%u\r\n", (unsigned)xPortGetFreeHeapSize());
-  /* 这里不再套临界区：xTaskCreate 内部自己会处理临界区，外面再包一层只会让
-     整个建线程过程长时间关中断，没有任何好处 */
-  sys_thread_new("eth_link", lwip_link_thread, &g_lwip_netif,
-                 LWIP_LINK_STK_SIZE, LWIP_LINK_TASK_PRIO);
-  printf("[ETH] link thread created, freeHeap=%u\r\n", (unsigned)xPortGetFreeHeapSize());
-#endif
-
-  /* 6. DHCP 线程：去路由器要 IP（超时自动回落静态）
-     sys_thread_new = lwip 的建线程封装，带 OS 下由 sys_arch.c 实现（= FreeRTOS xTaskCreate） */
+  if (!g_netif_added)
+  {
+    lwip_comm_default_ip_set(&g_lwipdev);
 #if LWIP_DHCP
-  g_lwipdev.dhcpstatus = 0;               /* 标记：还没 DHCP */
-  printf("[ETH] before dhcp thread, freeHeap=%u\r\n", (unsigned)xPortGetFreeHeapSize());
-  /* ★注意：g_lwip_dhcp_state 不能在这里设 OFF！
-   * 上面的 lwip_link_status_updated(第218行) 已经根据 link 状态设好了
-   *（link up 时设了 LWIP_DHCP_START）。这里再设 OFF 会覆盖掉 START，
-   *  导致 DHCP 线程读到 OFF 永远不发起 DHCP 请求。 */
-  /* 同上：不套临界区 */
-  sys_thread_new("eth_dhcp", lwip_dhcp_process, &g_lwip_netif,
-                 LWIP_DHCP_STK_SIZE, LWIP_DHCP_TASK_PRIO);
-  printf("[ETH] dhcp thread created, freeHeap=%u\r\n", (unsigned)xPortGetFreeHeapSize());
+    ip_addr_set_zero_ip4(&ipaddr);
+    ip_addr_set_zero_ip4(&netmask);
+    ip_addr_set_zero_ip4(&gw);
+#else
+    IP4_ADDR(&ipaddr, g_lwipdev.ip[0], g_lwipdev.ip[1], g_lwipdev.ip[2], g_lwipdev.ip[3]);
+    IP4_ADDR(&netmask, g_lwipdev.netmask[0], g_lwipdev.netmask[1], g_lwipdev.netmask[2], g_lwipdev.netmask[3]);
+    IP4_ADDR(&gw, g_lwipdev.gateway[0], g_lwipdev.gateway[1], g_lwipdev.gateway[2], g_lwipdev.gateway[3]);
+#endif
+    /* netifapi 使用协议栈互斥锁，PHY 等待期间保持硬件中断可用。 */
+    if (netifapi_netif_add(&g_lwip_netif, &ipaddr, &netmask, &gw,
+                          NULL, ethernetif_init, tcpip_input) != ERR_OK)
+    {
+      printf("[ETH] netif init failed\r\n");
+      return ETH_ERR_CONFIG;
+    }
+    g_netif_added = 1;
+#if LWIP_NETIF_LINK_CALLBACK
+    LOCK_TCPIP_CORE();
+    lwip_link_status_updated(&g_lwip_netif);
+    netif_set_link_callback(&g_lwip_netif, lwip_link_status_updated);
+    UNLOCK_TCPIP_CORE();
+#endif
+  }
+
+  if (netifapi_netif_set_default(&g_lwip_netif) != ERR_OK)
+    return ETH_ERR_CONFIG;
+
+#if LWIP_NETIF_LINK_CALLBACK
+  if (g_link_thread.thread_handle == NULL)
+  {
+    g_link_thread = sys_thread_new("eth_link", lwip_link_thread, &g_lwip_netif,
+                                   LWIP_LINK_STK_SIZE, LWIP_LINK_TASK_PRIO);
+    if (g_link_thread.thread_handle == NULL)
+      return ETH_ERR_CONFIG;
+  }
+#endif
+#if LWIP_DHCP
+  if (g_dhcp_thread.thread_handle == NULL)
+  {
+    g_dhcp_thread = sys_thread_new("eth_dhcp", lwip_dhcp_process, &g_lwip_netif,
+                                   LWIP_DHCP_STK_SIZE, LWIP_DHCP_TASK_PRIO);
+    if (g_dhcp_thread.thread_handle == NULL)
+      return ETH_ERR_CONFIG;
+  }
 #endif
 
-  g_lwipdev.link_status = LWIP_LINK_OFF;  /* 初始标记断链（链接线程马上会更新） */
-  g_m2_eth_inited = 1;                    /* 标记已初始化 */
+  g_m2_eth_inited = 1;
   return ETH_OK;
 }
 
@@ -257,6 +237,8 @@ int32_t m2_ethernet_init(void)
  */
 int32_t m2_ethernet_link_wait(uint32_t timeout_ms)
 {
+  if (!g_m2_eth_inited)
+    return ETH_ERR_CONFIG;
   uint32_t elapsed = 0;                   /* 已等待时间（毫秒累计） */
 
   /* 循环查 lwip 的"链路已链接"标志：

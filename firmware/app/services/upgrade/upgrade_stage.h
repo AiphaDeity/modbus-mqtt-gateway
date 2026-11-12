@@ -84,6 +84,7 @@ typedef struct
  * 同步后端接口：长度/偏移为 B，超时为 ms；存储操作交给存储任务。
  * 回调须在期限内返回，返回前结束所有缓冲访问和后台修改；服务无法抢占阻塞回调。
  * write/read 的缓冲仅在调用期间有效，超时后结果不明须隔离会话，禁止复用。
+ * write 输入可能位于 CCM；后端使用 DMA 时须先复制到 DMA 可访问的缓冲。
  * context 在所有会话期间有效；候选槽占用不应长期持有总线锁。
  */
 typedef struct
@@ -117,6 +118,9 @@ typedef struct
                                const UpgradeStatePackage *candidate,
                                bool resolve_only,
                                UpgradeStageCommitState *state, uint32_t timeout_ms);
+  // 只读持久状态，与收包共用工作区；不得擦写或改变包槽占用。
+  UpgradeStageResult (*read_boot_state)(void *context, UpgradeStateProtection *state,
+                                         uint32_t timeout_ms);
 } UpgradeStageBackend;
 
 /*
@@ -129,6 +133,8 @@ bool UpgradeStage_ExecutorAllowed(void);
 
 // 启动装配时绑定完整后端一次；复制函数表，不保留 backend 指针，context 可为 NULL。
 UpgradeStageResult UpgradeStage_Bind(const UpgradeStageBackend *backend, void *context);
+// 仅升级执行任务在空闲或已清理ERROR阶段读取；timeout_ms为1～3000 ms，失败清零输出。
+UpgradeStageResult UpgradeStage_ReadBootState(UpgradeStateProtection *state, uint32_t timeout_ms);
 
 /*
  * Begin成功才输出非零会话号，失败输出0；package_sha256可读32 B，不保留指针。
@@ -140,7 +146,7 @@ UpgradeStageResult UpgradeStage_Begin(UpgradeStageSource source, uint32_t total_
                                      const uint8_t *package_sha256, uint32_t *session_id);
 
 /*
- * Write同步复制1～1016 B输入，返回后调用方可复用data；不保留输入指针。
+ * Write同步读取1～1016 B输入，data在返回前须可读且不变，返回后可复用；不保留指针。
  * 只接受连续追加或完全位于已确认区间、内容相同的重复块；读回确认后才推进。
  * 重复块、查询、错误请求均不延长30 s无进展期限，跨HAL tick回绕仍有效。
  */

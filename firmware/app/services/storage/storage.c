@@ -238,7 +238,7 @@ void Storage_Task(void *argument)
                     printf("[M3] time floor update failed\r\n");
             }
             (void)storage_ctrllog_maintenance();
-            storage_m2_process();
+            (void)storage_m2_process();
             storage_record_maintenance();
 
             /* 只在正常业务阶段挂载/恢复缓存；失败不会触发自动格式化。 */

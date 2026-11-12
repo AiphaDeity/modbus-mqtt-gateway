@@ -11,8 +11,9 @@
 #include "mb_internal.h"
 #include "main.h"
 #include "mb_pointmap.h"
+#include "app_monitor.h"
+#include "upgrade_quiesce.h"
 #include <stdio.h>
-#include "modbus_test.c"
 
 
 /* ========= 全局变量定义（mb_internal.h 里 extern 给其他文件）========= */
@@ -56,6 +57,17 @@ static uint8_t mb_poll_idle(void)
     mb_write_request_t write_req;
     if (osMessageQueueGet(mb_handle->xWriteReqQueue, &write_req, NULL, 0) == osOK)
     {
+        if (mb_runtime_paused() || !UpgradeQuiesce_AllowsMutation() ||
+            !mb_write_pending(&write_req))
+        {
+            mb_finish_write(&write_req, ERR_UPGRADE_BUSY);
+            return 0;
+        }
+        if (!mb_runtime_poll_begin())
+        {
+            mb_finish_write(&write_req, ERR_UPGRADE_BUSY);
+            return 0;
+        }
         static mb_write_request_t s_pending_write;   // poll 单线程，static 足够
         s_pending_write = write_req;
 
@@ -65,6 +77,8 @@ static uint8_t mb_poll_idle(void)
         mb_handle->state = MB_STATE_TX;
         return 1;
     }
+
+    if (!mb_runtime_poll_begin()) return 0;
 
     // ========== 2. 正常读轮询 ==========
     uint32_t now = osKernelGetTickCount();
@@ -169,9 +183,10 @@ static void mb_poll_wait_ack(void)
     if (notify_val == 0U)
     {
         // master 侧卡住（发送/中断异常）时，这里绝不能无限阻塞，按超时处理并复位状态机
-        MB_LOGE("wait_ack: no notify in %u ms, force TIMEOUT",
+        MB_LOGE("wait_ack: no notify in %u ms, result UNKNOWN",
                 (unsigned int)(TIMEOUT_MODBUS + 200U));
-        notify_val = (uint32_t)(int32_t)ERR_TIME_OUT;
+        notify_val = (uint32_t)(int32_t)ERR_UNKNOWN;
+        mb_runtime_fail();
     }
     mb_errot_t err = (mb_errot_t)(int32_t)notify_val;
 
@@ -181,16 +196,19 @@ static void mb_poll_wait_ack(void)
         mb_write_request_t *wr = mb_handle->pending_write;
         if (wr != NULL)
         {
-            if (wr->result_err_out != NULL) *wr->result_err_out = err;
+            mb_errot_t result = err;
+            if (err != ERR_OK_QUERY && err != ERR_UPGRADE_BUSY &&
+                err != ERR_BAD_SLAVE_ID && err != ERR_NOT_MASTER)
+                result = ERR_UNKNOWN;
+            mb_finish_write(wr, result);
 
             if (err == ERR_OK_QUERY)
                 MB_LOGI("write OK: slave=%d, FC=%d, addr=%u, count=%u",
                         wr->slave_id, wr->func_code, wr->reg_addr, wr->reg_count);
             else
-                MB_LOGE("write FAIL: slave=%d, FC=%d, err=%d",
-                        wr->slave_id, wr->func_code, err);
+                MB_LOGE("write result: slave=%d, FC=%d, err=%d",
+                        wr->slave_id, wr->func_code, result);
 
-            if (wr->result_sem != NULL) osSemaphoreRelease(wr->result_sem);
         }
         mb_handle->pending_write = NULL;
         mb_handle->waiting_is_write = 0;
@@ -300,7 +318,9 @@ void Modbus_Init(void)
 
     mb_handle_init();   // 初始化从站句柄（在 mb_slave.c）
 
+    if (mb_handle == NULL) return;
     ModbusStart(&hModbusMaster);  // 开启串口接收
+    if (!mb_runtime_init()) MB_LOGE("upgrade runtime init failed");
 }
 
 /**
@@ -310,23 +330,35 @@ void Modbus_Init(void)
  *  用于无传感器环境下验证遥测上行链路（采集→上报→云端收到）。
  *  接真实传感器时改为 0 即可恢复正常轮询。
  */
-#define MB_SIMULATE_DATA  1   /* 1=模拟数据(无传感器); 0=真实RS485轮询 */
+#define MB_SIMULATE_DATA  0   /* 1=模拟数据(无传感器); 0=真实RS485轮询 */
 
 void vModbusPollTask(void *argument)
 {
-    test_add_three_slaves();   /* 添加 3 个测试从站配置(含点位表) */
-
+    (void)argument;
+    if (!mb_runtime_start_health())
+    {
+        Monitor_ReportFatal(APP_MODULE_MODBUS);
+        return;
+    }
 #if MB_SIMULATE_DATA
+    test_add_three_slaves();   /* 添加 3 个测试从站配置(含点位表) */
     MB_LOGI("=== Modbus SIMULATE mode: no real sensors, injecting fake data ===");
     for (;;)
     {
-        mb_simulate_inject();
+        if (mb_runtime_poll_begin())
+        {
+            mb_simulate_inject();
+            mb_runtime_poll_end();
+        }
+        mb_runtime_report();
         osDelay(2000);   /* 2 秒一轮，和遥测周期匹配 */
     }
 #else
     for (;;)
     {
         mb_poll_slave();
+        if (mb_handle->state == MB_STATE_IDLE) mb_runtime_poll_end();
+        mb_runtime_report();
         if (mb_handle->idle_no_work)
         {
             osDelay(1);

@@ -1,4 +1,8 @@
 #include "upgrade_tf.h"
+#include "upgrade_quiesce.h"
+#include "app_upgrade.h"
+#include "app_monitor.h"
+#include "main.h"
 
 #include "cmsis_os2.h"
 #include "FreeRTOS.h"
@@ -7,9 +11,21 @@
 #include "mbedtls/sha256.h"
 
 #include <string.h>
+#include <stdio.h>
 
 #define TF_PASS_TIMEOUT_MS 180000U
 #define TF_CLOSE_TIMEOUT_MS 3000U
+#define TF_KEY_DEBOUNCE_MS 40U
+#define TF_KEY_HOLD_MS 3000U
+
+typedef struct
+{
+  bool sample;
+  bool down;
+  bool armed;
+  uint32_t changed_ms;
+  uint32_t pressed_ms;
+} TfButton;
 
 static UpgradeTfSource source;
 static bool bound;
@@ -19,6 +35,69 @@ static bool cancelled;
 static UpgradeEntryPeer active_peer;
 static uint32_t active_session;
 static uint8_t data[UPGRADE_STAGE_MAX_CHUNK_SIZE] __attribute__((aligned(8)));
+static bool initialized;
+static bool button_authorized;
+static uint32_t button_epoch;
+
+// 上电或导入结束后先等待一次稳定释放，忽略这之前已经按住的按键。
+static void ResetButton(TfButton *button, bool pressed, uint32_t now_ms)
+{
+  *button = (TfButton){.sample = pressed, .down = true, .changed_ms = now_ms};
+}
+
+// 消抖确认按下后计时；仅稳定松开且已满3s时返回一次true。
+static bool ButtonReleased(TfButton *button, bool pressed, uint32_t now_ms)
+{
+  if (pressed != button->sample)
+  {
+    button->sample = pressed;
+    button->changed_ms = now_ms;
+  }
+  if ((pressed == button->down) || ((uint32_t)(now_ms - button->changed_ms) < TF_KEY_DEBOUNCE_MS))
+  {
+    return false;
+  }
+  button->down = pressed;
+  if (pressed)
+  {
+    button->pressed_ms = now_ms;
+    return false;
+  }
+  bool released = button->armed
+               && ((uint32_t)(button->changed_ms - button->pressed_ms) >= TF_KEY_HOLD_MS);
+  button->armed = true;
+  return released;
+}
+
+// 只授权升级任务由本次实体按键触发的TF操作，网络来源保持未开放。
+static bool AuthorizeButton(void *context, const UpgradeEntryPeer *peer)
+{
+  (void)context;
+  if ((peer == NULL) || (peer->source != UPGRADE_STAGE_SOURCE_TF)
+      || !App_IsCurrentModuleTask(APP_MODULE_UPGRADE))
+  {
+    return false;
+  }
+  taskENTER_CRITICAL();
+  bool allowed = button_authorized && (peer->epoch != 0U) && (peer->epoch == button_epoch);
+  taskEXIT_CRITICAL();
+  return allowed;
+}
+
+// 在统一模块装配中绑定实体按键授权，不创建任务或访问介质。
+AppModuleInitResult UpgradeTf_Init(void)
+{
+  if (!initialized)
+  {
+    const UpgradeEntryPolicy policy = {AuthorizeButton, NULL};
+    if (UpgradeEntry_BindPolicy(&policy) != UPGRADE_STAGE_OK)
+    {
+      return APP_MODULE_INIT_FAILED;
+    }
+    initialized = true;
+  }
+  return APP_MODULE_INIT_OK;
+}
 
 // 在临界区读取导入取消标记。
 static bool Cancelled(void)
@@ -44,7 +123,15 @@ static UpgradeStageResult CloseFile(void)
     return UPGRADE_STAGE_OK;
   }
   uint32_t started_ms = HAL_GetTick();
+  if (!Monitor_UpgradeWait(TF_CLOSE_TIMEOUT_MS))
+  {
+    return UPGRADE_STAGE_INTERNAL;
+  }
   UpgradeStageResult result = source.close(source.context, TF_CLOSE_TIMEOUT_MS);
+  if (!Monitor_UpgradeProgress())
+  {
+    return UPGRADE_STAGE_INTERNAL;
+  }
   if ((uint32_t)(HAL_GetTick() - started_ms) >= TF_CLOSE_TIMEOUT_MS)
   {
     result = UPGRADE_STAGE_TIMEOUT;
@@ -123,7 +210,15 @@ static UpgradeStageResult ReadBlock(uint32_t offset, uint32_t size, uint32_t sta
   {
     remaining = wait_limit_ms;
   }
+  if (!Monitor_UpgradeWait(remaining))
+  {
+    return UPGRADE_STAGE_INTERNAL;
+  }
   UpgradeStageResult result = source.read(source.context, offset, data, *count, remaining);
+  if (!Monitor_UpgradeProgress())
+  {
+    return UPGRADE_STAGE_INTERNAL;
+  }
   if (Remaining(started_ms) == 0U)
   {
     return UPGRADE_STAGE_TIMEOUT;
@@ -235,7 +330,18 @@ UpgradeStageResult UpgradeTf_Import(const UpgradeEntryPeer *peer, const char *pa
     {
       file_open = true; // open失败也可能取得租约，必须尝试幂等close。
       uint32_t started_ms = HAL_GetTick();
-      output->result = source.open(source.context, UPGRADE_TF_PATH, &size, TF_CLOSE_TIMEOUT_MS);
+      if (!Monitor_UpgradeWait(TF_CLOSE_TIMEOUT_MS))
+      {
+        output->result = UPGRADE_STAGE_INTERNAL;
+      }
+      else
+      {
+        output->result = source.open(source.context, UPGRADE_TF_PATH, &size, TF_CLOSE_TIMEOUT_MS);
+        if (!Monitor_UpgradeProgress())
+        {
+          output->result = UPGRADE_STAGE_INTERNAL;
+        }
+      }
       if ((uint32_t)(HAL_GetTick() - started_ms) >= TF_CLOSE_TIMEOUT_MS)
       {
         output->result = UPGRADE_STAGE_TIMEOUT;
@@ -284,4 +390,137 @@ UpgradeStageResult UpgradeTf_Import(const UpgradeEntryPeer *peer, const char *pa
   busy = false;
   taskEXIT_CRITICAL();
   return output->result;
+}
+
+// 重试上次导入的关闭与取消；提交不明或已提交状态仍由Stage保护。
+static UpgradeStageResult CleanupButtonImport(UpgradeTfResult *output)
+{
+  UpgradeStageResult result = CloseFile();
+  if (result != UPGRADE_STAGE_OK)
+  {
+    output->close_error = result;
+    return result;
+  }
+  if (button_epoch == 0U)
+  {
+    return UPGRADE_STAGE_OK;
+  }
+  const UpgradeEntryPeer peer = {UPGRADE_STAGE_SOURCE_TF, button_epoch};
+  result = UpgradeEntry_Disconnect(&peer);
+  if ((result != UPGRADE_STAGE_OK) && (result != UPGRADE_STAGE_MODE))
+  {
+    output->abort_error = result;
+    return result;
+  }
+  return UPGRADE_STAGE_OK;
+}
+
+// 检查正常启动身份和必需依赖，通过后才按本次按键身份导入固定文件。
+static void ImportFromButton(void)
+{
+  UpgradeStageStatus status;
+  UpgradeMessage identity;
+  if (!App_UpgradeCanCommit() || !App_UpgradeGetBootIdentity(&identity))
+  {
+    printf("TF upgrade rejected: normal Boot identity required\r\n");
+    return;
+  }
+  if (UpgradeStage_GetStatus(&status) != UPGRADE_STAGE_OK || status.busy
+      || (status.phase == UPGRADE_STAGE_QUIESCING) || (status.phase == UPGRADE_STAGE_REBOOT_PENDING))
+  {
+    printf("TF upgrade rejected: upgrade busy or unavailable\r\n");
+    return;
+  }
+  if (file_open || status.cleanup_pending || (status.resume_error != UPGRADE_STAGE_OK))
+  {
+    UpgradeTfResult previous = {0};
+    UpgradeStageResult cleanup = CleanupButtonImport(&previous);
+    if (cleanup == UPGRADE_STAGE_OK)
+    {
+      cleanup = UpgradeStage_GetStatus(&status);
+    }
+    if (cleanup != UPGRADE_STAGE_OK)
+    {
+      printf("TF upgrade cleanup failed: result=%u close=%u abort=%u\r\n",
+             (unsigned)cleanup, (unsigned)previous.close_error, (unsigned)previous.abort_error);
+      return;
+    }
+  }
+  taskENTER_CRITICAL();
+  bool file_service_ready = bound;
+  taskEXIT_CRITICAL();
+  if (!status.backend_ready || !file_service_ready || !UpgradeQuiesce_IsReady())
+  {
+    printf("TF upgrade rejected: storage, trust or module callbacks not ready\r\n");
+    return;
+  }
+  if (status.cleanup_pending || (status.resume_error != UPGRADE_STAGE_OK)
+      || ((status.phase != UPGRADE_STAGE_IDLE) && (status.phase != UPGRADE_STAGE_ERROR))
+      || (button_epoch == UINT32_MAX))
+  {
+    printf("TF upgrade rejected: previous session not settled\r\n");
+    return;
+  }
+  if (HAL_GPIO_ReadPin(SD_CARD_DET_GPIO_Port, SD_CARD_DET_Pin) != GPIO_PIN_RESET)
+  {
+    printf("TF upgrade rejected: no card\r\n");
+    return;
+  }
+  taskENTER_CRITICAL();
+  button_epoch++;
+  button_authorized = true;
+  taskEXIT_CRITICAL();
+  const UpgradeEntryPeer peer = {UPGRADE_STAGE_SOURCE_TF, button_epoch};
+  UpgradeTfResult output;
+  printf("TF upgrade begin: epoch=%lu\r\n", (unsigned long)peer.epoch);
+  (void)UpgradeTf_Import(&peer, UPGRADE_TF_PATH, &output);
+  if (output.result != UPGRADE_STAGE_OK)
+  {
+    (void)CleanupButtonImport(&output);
+  }
+  taskENTER_CRITICAL();
+  button_authorized = false;
+  taskEXIT_CRITICAL();
+  const char *phase = UpgradeStage_GetStatus(&status) == UPGRADE_STAGE_OK
+                    ? UpgradeEntry_PhaseName(status.phase) : "UNKNOWN";
+  printf("TF upgrade: result=%u session=%lu phase=%s close=%u abort=%u\r\n",
+         (unsigned)output.result, (unsigned long)output.session_id, phase,
+         (unsigned)output.close_error, (unsigned)output.abort_error);
+}
+
+// 每20ms检测PA0；导入期间不接收按键请求，结束后必须先释放再重新长按。
+void UpgradeTf_Task(void *argument)
+{
+  (void)argument;
+  if (!initialized || !Monitor_RegisterHealth(APP_MODULE_UPGRADE, 3000U,
+                                               UPGRADE_STAGE_PREPARE_TIMEOUT_MS + 1000U))
+  {
+    Error_Handler();
+    return;
+  }
+  TfButton button;
+  ResetButton(&button, HAL_GPIO_ReadPin(TF_UPGRADE_KEY_GPIO_Port, TF_UPGRADE_KEY_Pin) == GPIO_PIN_SET,
+              HAL_GetTick());
+  uint32_t poll_ticks = (osKernelGetTickFreq() + 49U) / 50U;
+  for (;;)
+  {
+    if (!Monitor_UpgradeProgress())
+    {
+      Error_Handler();
+      return;
+    }
+    App_UpgradePollResult(HAL_GetTick());
+    bool pressed = HAL_GPIO_ReadPin(TF_UPGRADE_KEY_GPIO_Port, TF_UPGRADE_KEY_Pin) == GPIO_PIN_SET;
+    if (ButtonReleased(&button, pressed, HAL_GetTick()))
+    {
+      ImportFromButton();
+      ResetButton(&button, HAL_GPIO_ReadPin(TF_UPGRADE_KEY_GPIO_Port, TF_UPGRADE_KEY_Pin) == GPIO_PIN_SET,
+                  HAL_GetTick());
+    }
+    if (osDelay(poll_ticks) != osOK)
+    {
+      Error_Handler();
+      return;
+    }
+  }
 }

@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdio.h>
 
 #include "FreeRTOS.h"
 #include "task.h"
@@ -10,6 +11,8 @@
 #include "storage.h"
 #include "mqtt_client.h"
 #include "telemetry_task.h"
+#include "mb_api.h"
+#include "upgrade_tf.h"
 
 #define STORAGE_STACK_SIZE_BYTES (6U * 1024U)  /* FatFs + storage_record，M3 说 8K 实测后可降 6K */
 #define CONFIG_STACK_SIZE_BYTES  (512U)         /* M1 config 还没实现，占位 */
@@ -17,6 +20,7 @@
 #define MQTT_STACK_SIZE_BYTES    (6U * 1024U)   /* netconn + snprintf 调用链深，4K 实测溢出 */
 #define TELEMETRY_STACK_SIZE_BYTES (2560U)       /* snprintf + printf 栈开销大，2.5K */
 #define MONITOR_STACK_SIZE_BYTES (2U * 1024U) // 监督任务使用 2 KiB 栈。
+#define UPGRADE_STACK_SIZE_BYTES (6U * 1024U)
 
 typedef AppModuleInitResult (*AppModuleInitFn)(void);
 
@@ -40,11 +44,12 @@ typedef struct
  * 所有栈按 Cortex-M4 FreeRTOS 端口要求对齐到 8 B。
  */
 _Alignas(8) static StackType_t storage_stack[STORAGE_STACK_SIZE_BYTES / sizeof(StackType_t)];
-_Alignas(8) static StackType_t config_stack[CONFIG_STACK_SIZE_BYTES / sizeof(StackType_t)]  __attribute__((section(".ccmram")));
-_Alignas(8) static StackType_t modbus_stack[MODBUS_STACK_SIZE_BYTES / sizeof(StackType_t)]  __attribute__((section(".ccmram")));
-_Alignas(8) static StackType_t mqtt_stack[MQTT_STACK_SIZE_BYTES / sizeof(StackType_t)]  __attribute__((section(".ccmram")));
-_Alignas(8) static StackType_t telemetry_stack[TELEMETRY_STACK_SIZE_BYTES / sizeof(StackType_t)]  __attribute__((section(".ccmram")));
-_Alignas(8) static StackType_t monitor_stack[MONITOR_STACK_SIZE_BYTES / sizeof(StackType_t)] __attribute__((section(".ccmram")));
+_Alignas(8) static StackType_t config_stack[CONFIG_STACK_SIZE_BYTES / sizeof(StackType_t)]  __attribute__((section(".bss.ccmram")));
+_Alignas(8) static StackType_t modbus_stack[MODBUS_STACK_SIZE_BYTES / sizeof(StackType_t)]  __attribute__((section(".bss.ccmram")));
+_Alignas(8) static StackType_t mqtt_stack[MQTT_STACK_SIZE_BYTES / sizeof(StackType_t)]  __attribute__((section(".bss.ccmram")));
+_Alignas(8) static StackType_t telemetry_stack[TELEMETRY_STACK_SIZE_BYTES / sizeof(StackType_t)]  __attribute__((section(".bss.ccmram")));
+_Alignas(8) static StackType_t monitor_stack[MONITOR_STACK_SIZE_BYTES / sizeof(StackType_t)];
+_Alignas(8) static StackType_t upgrade_stack[UPGRADE_STACK_SIZE_BYTES / sizeof(StackType_t)];
 
 static StaticTask_t storage_control_block;
 static StaticTask_t config_control_block;
@@ -52,6 +57,7 @@ static StaticTask_t modbus_control_block;
 static StaticTask_t mqtt_control_block;
 static StaticTask_t telemetry_control_block;
 static StaticTask_t monitor_control_block;
+static StaticTask_t upgrade_control_block;
 
 // CMSIS-RTOS2 的 stack_size 单位为字节；任务优先级数值越大越高
 static const osThreadAttr_t storage_attributes =
@@ -114,6 +120,16 @@ static const osThreadAttr_t monitor_attributes =
   .priority = osPriorityAboveNormal // 高于启动任务；每100ms只做短检查，不执行业务I/O。
 };
 
+static const osThreadAttr_t upgrade_attributes =
+{
+  .name = "upgrade",
+  .cb_mem = &upgrade_control_block,
+  .cb_size = sizeof(upgrade_control_block),
+  .stack_mem = upgrade_stack,
+  .stack_size = sizeof(upgrade_stack),
+  .priority = osPriorityNormal
+};
+
 /*
  * init/task 必须成对绑定；均为 NULL 表示未接入，只绑定一个视为错误。
  * 监督任务提前创建；其余任务在基础初始化完成后，经统一入口创建。
@@ -137,17 +153,30 @@ static AppModuleSlot module_slots[APP_MODULE_COUNT] =
   },
   [APP_MODULE_MQTT] =
   {
+#if GATEWAY_ENABLE_M2
     .init = MqttClient_Init, .task = MqttClient_Task, .attributes = &mqtt_attributes,
+#else
+    .init = NULL, .task = NULL, .attributes = &mqtt_attributes,
+#endif
     .result = APP_MODULE_INIT_NOT_READY, .task_state = APP_MODULE_TASK_NOT_STARTED
   },
   [APP_MODULE_TELEMETRY] =
   {
+#if GATEWAY_ENABLE_M2
     .init = Telemetry_Init, .task = Telemetry_Task, .attributes = &telemetry_attributes,
+#else
+    .init = NULL, .task = NULL, .attributes = &telemetry_attributes,
+#endif
     .result = APP_MODULE_INIT_NOT_READY, .task_state = APP_MODULE_TASK_NOT_STARTED
   },
   [APP_MODULE_MONITOR] =
   {
     .init = Monitor_Init, .task = Monitor_Task, .attributes = &monitor_attributes,
+    .result = APP_MODULE_INIT_NOT_READY, .task_state = APP_MODULE_TASK_NOT_STARTED
+  },
+  [APP_MODULE_UPGRADE] =
+  {
+    .init = UpgradeTf_Init, .task = UpgradeTf_Task, .attributes = &upgrade_attributes,
     .result = APP_MODULE_INIT_NOT_READY, .task_state = APP_MODULE_TASK_NOT_STARTED
   }
 };
@@ -155,7 +184,7 @@ static AppModuleSlot module_slots[APP_MODULE_COUNT] =
 static AppModuleInitResult modbus_init_wrapper(void)
 {
   Modbus_Init();
-  return APP_MODULE_INIT_OK;
+  return mb_runtime_ready() ? APP_MODULE_INIT_OK : APP_MODULE_INIT_FAILED;
 }
 
 static bool modules_initialized;

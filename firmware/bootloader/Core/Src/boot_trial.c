@@ -7,12 +7,13 @@
 static UpgradeMessage confirmation;
 static bool have_confirmation;
 
-// 在启动早期读取并消费邮箱，仅接受软件复位带来的确认消息。
+// 判断是软件复位，并且在邮箱中读出数据，并且是升级或者恢复
 void Boot_TrialBegin(volatile uint32_t *mailbox, bool software_reset)
 {
   have_confirmation = software_reset && UpgradeMailbox_Read(mailbox, &confirmation)
                    && ((confirmation.kind == UPGRADE_MESSAGE_CONFIRM)
                        || (confirmation.kind == UPGRADE_MESSAGE_RECOVERY_CONFIRM));
+  // 清空邮箱
   UpgradeMailbox_Clear(mailbox);
 }
 

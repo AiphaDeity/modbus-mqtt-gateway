@@ -9,8 +9,7 @@
  * 与 M4 升级框架的对接（M2 调用方，M4 已提供实现）：
  *   1. UpgradeEntry_BindPolicy(&policy)         —— 绑定权限策略（authorize 回调）
  *   2. UpgradeQuiesce_Bind(NETWORK, &participant) —— 绑定网络门控（pause/settle/sync/resume）
- *   3. Monitor_RegisterHealth(MQTT/TELEMETRY,..)  —— 登记健康检查
- *   4. 升级执行任务串行调：
+ *   3. 升级执行任务串行调：
  *        UpgradeEntry_Begin → UpgradeEntry_Write(循环) → UpgradeEntry_Finish → UpgradeEntry_Reboot
  *
  * 升级通知 JSON 格式（M2 定义，云端下发到 ota_task topic）：
@@ -27,8 +26,12 @@
  *   {"task_id":"...","phase":"downloading","offset":12345,"total":262144}
  *   {"task_id":"...","phase":"verifying"}
  *   {"task_id":"...","phase":"ready"}
- *   {"task_id":"...","phase":"installed","result":"success"}   // 重启后
+ *   {"type":"boot_result","tx_id":"0000000000000007","sequence":9,
+ *    "phase":"confirmed","image_sha256":"64个小写hex字符"}  // 本次Boot已核验结果
  *   {"task_id":"...","phase":"failed","err":"E_INTEGRITY"}     // 失败
+ * 启动结果phase为trial/confirmed/rolled_back；UNKNOWN不报终态。
+ * tx_id是16个小写hex字符的持久事务号，sequence不是云端task_id，image_sha256是明文镜像摘要。
+ * 网络任务空闲时重试至匹配PUBACK；云端任务关联/去重由M2及云端完成，不伪造task_id。
  */
 #ifndef NETWORK_UPGRADE_H
 #define NETWORK_UPGRADE_H
@@ -56,7 +59,7 @@ extern "C" {
 
 /**
  * @brief  网络升级模块初始化（装配阶段调用，不创建任务）
- * @note   绑定 UpgradeEntryPolicy + UpgradeQuiesce(NETWORK) + Monitor 健康。
+ * @note   绑定 UpgradeEntryPolicy + UpgradeQuiesce(NETWORK)；任务自行登记并报告健康。
  *         绑定失败只记日志不阻断启动（升级不可用 ≠ 整机不可用）。
  *         必须在 App_ModulesInit 之后、App_ModulesStart 之前调用。
  */
@@ -80,23 +83,16 @@ int NetworkUpgrade_Notify(const char *json);
 
 /**
  * @brief  查询当前升级状态字符串（供 MQTT 周期上报）
- * @return 静态字符串指针（idle/downloading/verifying/ready/rebooting/installed/failed）
+ * @return 静态字符串指针（idle/downloading/verifying/ready/rebooting/installed/failed/trial/rolled_back）
  */
 const char *NetworkUpgrade_GetPhaseString(void);
 
 /**
  * @brief  查询网络业务是否被门控暂停（升级期间）
- * @return true=已暂停（Telemetry/MQTT 遥测应跳过），false=正常运行
- * @note   Telemetry_Task 主循环每轮开始检查此标志。MQTT 保活和 ota_status 不受影响。
+ * @return true=已请求暂停，false=未请求；不代替任务停稳确认。
+ * @note   停稳由quiesce_settle核对MQTT/Telemetry自身确认；保活和ota_status继续运行。
  */
 bool NetworkUpgrade_IsQuiesced(void);
-
-/**
- * @brief  重启后调用：查 Boot 身份 + GetStatus，上报最终升级结果
- * @note   在 App_Entry 或 MQTT 上线后调用一次。读 App_UpgradeIsTrial() 判断是否升级后启动，
- *         调 UpgradeEntry_GetStatus() 查安装结果，PUBLISH 到 ota_status。
- */
-void NetworkUpgrade_ReportFinalResult(void);
 
 #ifdef __cplusplus
 }

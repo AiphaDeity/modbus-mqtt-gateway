@@ -55,6 +55,7 @@ static bool s_ready;
 static bool s_bootstrap;
 static bool s_healthy;
 static bool s_syncing;
+static bool s_draining;
 static bool s_faulted;
 static uint32_t s_mutations;
 static uint32_t s_deadline;
@@ -86,9 +87,11 @@ bool storage_runtime_is_owner(void)
 bool storage_mutation_allowed(void)
 {
     taskENTER_CRITICAL();
-    bool allowed = !s_faulted && !s_paused && (s_ready || (s_bootstrap && storage_runtime_is_owner()));
+    bool owner = storage_runtime_is_owner();
+    bool continuing = owner && (s_mutations != 0U || s_draining);
+    bool allowed = !s_faulted && (!s_paused || continuing) && (s_ready || (s_bootstrap && owner));
     taskEXIT_CRITICAL();
-    return allowed && UpgradeQuiesce_AllowsMutation();
+    return allowed && (continuing ? App_UpgradeCanCommit() : UpgradeQuiesce_AllowsMutation());
 }
 
 /* 递归锁覆盖业务操作及其嵌套序号/日志写入，暂停不与半个操作交错。 */
@@ -291,7 +294,15 @@ static UpgradeStageResult runtime_pause(void *context, uint32_t timeout_ms)
 static UpgradeStageResult runtime_settle(void *context, uint32_t timeout_ms)
 {
     (void)context;
-    return runtime_exchange(STORAGE_SETTLE, timeout_ms, NULL);
+    uint32_t started_ms = HAL_GetTick();
+    for (;;) {
+        uint32_t elapsed = (uint32_t)(HAL_GetTick() - started_ms);
+        if (elapsed >= timeout_ms) return UPGRADE_STAGE_TIMEOUT;
+        uint32_t remaining = timeout_ms - elapsed;
+        UpgradeStageResult result = runtime_exchange(STORAGE_SETTLE, remaining, NULL);
+        if (result != UPGRADE_STAGE_BUSY) return result;
+        if (osDelay(1U) != osOK) return UPGRADE_STAGE_INTERNAL;
+    }
 }
 
 /* 请求存储所有者刷新已有文件和环状态，失败不声明落盘完成。 */
@@ -407,12 +418,21 @@ void storage_runtime_report(void)
 /* Storage_Task在业务门控之外处理，暂停期间仍能结算和回复客户端。 */
 void storage_runtime_process(void)
 {
+    /* 只放行存储所有者收尾旧队列，不重新开放生产者或周期业务。 */
+    HAL_StatusTypeDef m2_result = HAL_OK;
+    if (s_paused && s_ready && s_healthy && !s_faulted) {
+        s_draining = true;
+        m2_result = storage_m2_process();
+        s_draining = false;
+    }
     storage_run_req_t req;
     storage_run_rsp_t rsp = {0};
     if (osMessageQueueGet(s_requests, &req, NULL, 0U) != osOK) return;
     rsp.id = req.id;
     rsp.result = UPGRADE_STAGE_TIMEOUT;
-    s_deadline = req.deadline_ms;
+    /* RPC不能延长存储任务已经声明的本轮I/O及监督期限。 */
+    if (runtime_remaining(req.deadline_ms) < runtime_remaining(s_deadline))
+        s_deadline = req.deadline_ms;
     if (!storage_runtime_expired()) {
         if (req.action == STORAGE_SEQUENCE) {
             HAL_StatusTypeDef st = storage_seq_alloc(&rsp.sequence);
@@ -420,6 +440,8 @@ void storage_runtime_process(void)
                          st == HAL_TIMEOUT ? UPGRADE_STAGE_TIMEOUT : UPGRADE_STAGE_BUSY;
         } else if (!s_paused || !s_ready || !s_healthy) {
             rsp.result = UPGRADE_STAGE_NOT_READY;
+        } else if (m2_result == HAL_ERROR || m2_result == HAL_TIMEOUT) {
+            rsp.result = m2_result == HAL_TIMEOUT ? UPGRADE_STAGE_TIMEOUT : UPGRADE_STAGE_STORAGE;
         } else if (!runtime_settled()) {
             rsp.result = UPGRADE_STAGE_BUSY;
         } else if (req.action == STORAGE_SETTLE) {
