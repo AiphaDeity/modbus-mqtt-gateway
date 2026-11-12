@@ -5,6 +5,7 @@ set(MODBUS_SRCS
     ${CMAKE_CURRENT_SOURCE_DIR}/mb_api.c
     ${CMAKE_CURRENT_SOURCE_DIR}/mb_pointmap.c
     ${CMAKE_CURRENT_SOURCE_DIR}/mb_runtime.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/mb_fixed_points.c
 )
 
 add_library(modbus STATIC ${MODBUS_SRCS})

@@ -29,7 +29,7 @@ static const app_config_t s_default_config = {
     /* Modbus 参数（M1） */
     .mb_slave_count = 4,
     .mb_slave_addr = {1, 2, 3, 4},
-    .mb_baudrate = 115200,
+    .mb_baudrate = 9600,              /* 匹配传感器出厂默认（B-RS-L30/TAS-SJ-R 均 9600） */
     .mb_data_bits = 8,
     .mb_stop_bits = 1,
     .mb_parity = 0,        /* NONE */

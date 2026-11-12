@@ -23,19 +23,19 @@
  *   偏移 0    magic(4)  = 'FRMT'
  *   偏移 4    format_version(2)
  *   偏移 6    kind(2)              1=telemetry 2=event
- *   偏移 8    payload_len(2)       ≤512
+ *   偏移 8    payload_len(2)       ≤768
  *   偏移 10   flags(2)
  *   偏移 12   captured_at_ms(8)    Unix 毫秒；未校时 = 0
  *   偏移 20   seq(8)               uint64 单调递增（M2 经 storage_seq 分配）
  *   偏移 28   reserved(4)
- *   偏移 32   payload(payload_len) JSON 原文 UTF-8，最大 512B
+ *   偏移 32   payload(payload_len) JSON 原文 UTF-8，最大 768B
  *   偏移 32+len  crc32(4)          覆盖 [0, 32+len)
  *   偏移 572  commit(4) = 'RCDT'   最后写入
  */
 
-#define RECORD_FORMAT_VERSION    2U
-#define RECORD_SLOT_SIZE         576U
-#define RECORD_PAYLOAD_MAX       512U
+#define RECORD_FORMAT_VERSION    3U  /* v3: PAYLOAD_MAX 512→768（16点完整报文） */
+#define RECORD_SLOT_SIZE         832U  /* 32B 头 + 768B payload + 4B CRC + 4B commit + 22B 对齐余量 */
+#define RECORD_PAYLOAD_MAX       768U
 #define RECORD_SEGMENT_SIZE      (4U * 1024U * 1024U)  /* 4 MiB */
 #define RECORD_SEGMENT_SLOTS     (RECORD_SEGMENT_SIZE / RECORD_SLOT_SIZE)
 #define RECORD_SEGMENT_COUNT     48U

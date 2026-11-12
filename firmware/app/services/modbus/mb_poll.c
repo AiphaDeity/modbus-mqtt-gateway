@@ -11,6 +11,7 @@
 #include "mb_internal.h"
 #include "main.h"
 #include "mb_pointmap.h"
+#include "mb_fixed_points.h"
 #include "app_monitor.h"
 #include "upgrade_quiesce.h"
 #include <stdio.h>
@@ -354,6 +355,15 @@ void vModbusPollTask(void *argument)
         osDelay(2000);   /* 2 秒一轮，和遥测周期匹配 */
     }
 #else
+    /* 真实 RS485 轮询：应用编译期固定点表（最小配置首次启用入口）
+     * 后续接入 storage_config 持久化后，此处改为"Flash 无配置时降级用固定点表" */
+    if (!mb_fixed_points_apply())
+    {
+        MB_LOGE("固定点表应用失败，Modbus 无从站可轮询");
+        Monitor_ReportFatal(APP_MODULE_MODBUS);
+        return;
+    }
+    MB_LOGI("=== Modbus REAL mode: 4 stations (1 light + 3 water leak) ===");
     for (;;)
     {
         mb_poll_slave();

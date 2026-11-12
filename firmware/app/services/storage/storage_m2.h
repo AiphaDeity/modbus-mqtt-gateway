@@ -27,8 +27,8 @@ typedef struct {
     uint8_t  kind;            /* 1=telemetry 2=event */
     uint64_t seq;             /* M2 经 storage_seq_alloc 分配，单调递增 */
     uint64_t captured_at_ms;  /* Unix 毫秒；未校时 = 0 */
-    uint16_t payload_len;     /* ≤512 */
-    uint8_t  payload[512];    /* JSON 原文 */
+    uint16_t payload_len;     /* ≤RECORD_PAYLOAD_MAX */
+    uint8_t  payload[RECORD_PAYLOAD_MAX];    /* JSON 原文 */
 } storage_write_req_t;
 
 /* 4.2 M2 → M3：补传拉取请求 */

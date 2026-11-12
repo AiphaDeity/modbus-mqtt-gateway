@@ -40,8 +40,8 @@
 /* 上报周期：Modbus 采集本身可能 1~2 秒一轮，这里 2 秒足够 */
 #define TELEMETRY_PERIOD_MS   2000U
 
-/* 单条 payload 上限：storage_write_req_t.payload[512] */
-#define PAYLOAD_MAX           512U
+/* 单条 payload 上限：与 RECORD_PAYLOAD_MAX 对齐（16点完整报文需 ~768B） */
+#define PAYLOAD_MAX           768U
 
 /* 最多收集的从站 ID 数（MB_SLAVE_HARD_MAX=16） */
 #define TEL_MAX_SLAVES        16U
