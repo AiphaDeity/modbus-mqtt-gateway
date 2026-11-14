@@ -3,6 +3,25 @@
  *
  * 在已有 TCP netconn 上叠加 TLS1.2（ECDHE-RSA-AES128-GCM-SHA256）。
  * mbedTLS 通过 bio 回调收发加密记录，bio 内部走 netconn_write/recv。
+ *
+ * 架构层次：
+ *   ┌─────────────────────────────────────┐
+ *   │ network_upgrade_downloader.c        │  应用层：HTTP GET / 收 body
+ *   ├─────────────────────────────────────┤
+ *   │ https_tls.c (本文件)                │  包装层：握手/加密发送/加密接收
+ *   ├─────────────────────────────────────┤
+ *   │ mbedTLS (ssl_tls/ssl_msg/...)       │  TLS 协议层：记录加密/解密/握手
+ *   ├─────────────────────────────────────┤
+ *   │ bio_send / bio_recv (回调)          │  BIO 层：mbedTLS ←→ netconn 桥接
+ *   ├─────────────────────────────────────┤
+ *   │ lwIP netconn (TCP)                  │  传输层：TCP 可靠传输
+ *   └─────────────────────────────────────┘
+ *
+ * 模块生命周期：
+ *   HttpsTls_Init()     一次性初始化（熵源 + CTR_DRBG + 时间注册）
+ *   HttpsTls_Connect()  每次下载新建 TLS 会话（握手 + 证书校验）
+ *   HttpsTls_Send/Recv  加密收发数据
+ *   HttpsTls_Close()    关闭会话（close_notify + 释放资源）
  */
 #include "https_tls.h"
 
@@ -153,7 +172,23 @@ https_tls_result_t HttpsTls_Init(void)
     return HTTPS_TLS_OK;
 }
 
-/* ===== TLS 握手 ===== */
+/* ===== TLS 握手 =====
+ * 在已建立的 TCP 连接上执行 TLS 握手，完成后可加密收发。
+ *
+ * 握手流程（mbedTLS 内部自动处理，这里只做配置和驱动）：
+ *   ClientHello → ServerHello → Certificate → ServerKeyExchange →
+ *   ServerHelloDone → ClientKeyExchange → ChangeCipherSpec → Finished
+ *
+ * 握手时 mbedTLS 通过 bio 回调收发 TLS 记录（bio_send/bio_recv）。
+ * 证书校验：用预置的 CA 证书验证服务器证书链。
+ *
+ * 参数：
+ *   conn         已连接的 TCP netconn
+ *   hostname     服务器域名（用于 SNI + 证书 CN 校验）
+ *   ca_cert_der  CA 根证书 DER 数据（NULL=跳过校验，仅测试用）
+ *   ca_cert_len  CA 证书长度
+ *   timeout_ms   netconn 收超时（握手期间）
+ */
 https_tls_result_t HttpsTls_Connect(https_tls_session_t *session,
                                      struct netconn *conn,
                                      const char *hostname,
@@ -167,16 +202,17 @@ https_tls_result_t HttpsTls_Connect(https_tls_session_t *session,
     memset(session, 0, sizeof(*session));
     session->conn = conn;
 
-    /* 重置 bio 残余缓冲 */
+    /* 重置 bio 残余缓冲（上次会话可能残留数据） */
     s_bio_buf.len = 0;
     s_bio_buf.offset = 0;
 
-    /* 初始化 SSL 上下文 */
+    /* 1. 初始化 SSL 上下文（ssl + config + CA 证书三个结构） */
     mbedtls_ssl_init(&session->ssl);
     mbedtls_ssl_config_init(&session->conf);
     mbedtls_x509_crt_init(&session->cacert);
 
-    /* 加载 CA 证书（可选：NULL=跳过验证，仅测试用） */
+    /* 2. 加载 CA 证书（DER → mbedTLS 内部结构）
+     * nocopy 模式：直接引用 Flash 中的 DER 数据，不额外分配 RAM */
     if (ca_cert_der && ca_cert_len > 0)
     {
         int ret = mbedtls_x509_crt_parse_der_nocopy(&session->cacert,
@@ -189,35 +225,41 @@ https_tls_result_t HttpsTls_Connect(https_tls_session_t *session,
     }
     else
     {
+        /* 无 CA 证书 = 跳过证书校验（仅测试用，生产环境必须传 CA） */
         printf("[TLS] WARNING: no CA cert, skipping server verification (test only)\r\n");
     }
 
-    /* 配置 SSL */
+    /* 3. 配置 SSL：客户端模式 + TLS1.2 流式传输 + 默认安全预设 */
     int ret = mbedtls_ssl_config_defaults(&session->conf,
-                                           MBEDTLS_SSL_IS_CLIENT,
-                                           MBEDTLS_SSL_TRANSPORT_STREAM,
-                                           MBEDTLS_SSL_PRESET_DEFAULT);
+                                           MBEDTLS_SSL_IS_CLIENT,        /* 客户端 */
+                                           MBEDTLS_SSL_TRANSPORT_STREAM, /* TLS（非 DTLS） */
+                                           MBEDTLS_SSL_PRESET_DEFAULT);  /* 默认安全等级 */
     if (ret != 0)
     {
         printf("[TLS] config_defaults fail: -0x%04x\r\n", (unsigned)-ret);
         goto cleanup;
     }
 
-    /* 设置 CA 证书链 */
+    /* 4. 设置证书校验策略 */
     if (ca_cert_der && ca_cert_len > 0)
     {
+        /* 有 CA 证书：设置 CA 链 + 强制校验（VERIFY_REQUIRED）
+         * 服务器证书必须由预置 CA 签发，否则握手失败 */
         mbedtls_ssl_conf_ca_chain(&session->conf, &session->cacert, NULL);
         mbedtls_ssl_conf_authmode(&session->conf, MBEDTLS_SSL_VERIFY_REQUIRED);
     }
     else
     {
+        /* 无 CA 证书：不校验（VERIFY_NONE），任何人可中间人，仅测试用 */
         mbedtls_ssl_conf_authmode(&session->conf, MBEDTLS_SSL_VERIFY_NONE);
     }
 
-    /* 设置 RNG */
+    /* 5. 设置 RNG（随机数生成器）：CTR_DRBG（基于熵源的确定性随机）
+     * TLS 握手需要随机数生成 ClientHello.random 和密钥材料 */
     mbedtls_ssl_conf_rng(&session->conf, mbedtls_ctr_drbg_random, &s_ctr_drbg);
 
-    /* SNI */
+    /* 6. SNI（Server Name Indication）：把域名发给服务器
+     * 服务器根据 SNI 选择对应证书（一个 IP 托管多域名时需要） */
     ret = mbedtls_ssl_set_hostname(&session->ssl, hostname);
     if (ret != 0)
     {
@@ -225,7 +267,7 @@ https_tls_result_t HttpsTls_Connect(https_tls_session_t *session,
         goto cleanup;
     }
 
-    /* 应用配置 */
+    /* 7. 应用配置到 SSL 上下文（分配发送/接收缓冲等资源） */
     ret = mbedtls_ssl_setup(&session->ssl, &session->conf);
     if (ret != 0)
     {
@@ -233,13 +275,14 @@ https_tls_result_t HttpsTls_Connect(https_tls_session_t *session,
         goto cleanup;
     }
 
-    /* 设置 bio 回调 */
+    /* 8. 设置 BIO 回调：mbedTLS 通过 bio_send/bio_recv 收发 TLS 记录 */
     mbedtls_ssl_set_bio(&session->ssl, session, bio_send, bio_recv, NULL);
 
-    /* 设置 netconn recv 超时 */
+    /* 9. 设置 netconn 收超时（握手期间） */
     netconn_set_recvtimeout(conn, (int)timeout_ms);
 
-    /* 执行握手 */
+    /* 10. 执行 TLS 握手（阻塞直到完成或失败）
+     * WANT_READ/WANT_WRITE 是正常的非阻塞返回，继续重试即可 */
     printf("[TLS] handshake with %s ...\r\n", hostname);
     while ((ret = mbedtls_ssl_handshake(&session->ssl)) != 0)
     {
@@ -253,7 +296,7 @@ https_tls_result_t HttpsTls_Connect(https_tls_session_t *session,
 
     session->active = true;
 
-    /* 打印协商结果 */
+    /* 11. 检查证书校验结果（即使 VERIFY_REQUIRED，也可能有警告） */
     uint32_t flags = mbedtls_ssl_get_verify_result(&session->ssl);
     if (flags != 0 && (ca_cert_der && ca_cert_len > 0))
     {
@@ -267,6 +310,7 @@ https_tls_result_t HttpsTls_Connect(https_tls_session_t *session,
     return HTTPS_TLS_OK;
 
 cleanup:
+    /* 握手失败：释放 SSL 资源（TCP 连接由调用方关闭） */
     mbedtls_ssl_free(&session->ssl);
     mbedtls_ssl_config_free(&session->conf);
     mbedtls_x509_crt_free(&session->cacert);
