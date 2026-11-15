@@ -606,7 +606,7 @@ static HAL_StatusTypeDef storage_record_append_impl(uint8_t kind, uint64_t seq,
 static void storage_record_ack_upto_impl(uint64_t ack_upto_seq)
 {
     if (!s_ready) return;
-    if (ack_upto_seq <= s_ack_wm) return;
+    if (ack_upto_seq <= s_ack_wm || ack_upto_seq > s_last_seq) return;
 
     s_ack_wm = ack_upto_seq;
     s_state_dirty = true;   /* maintenance 节流落盘 */
@@ -650,7 +650,9 @@ HAL_StatusTypeDef storage_record_fetch(uint16_t max_count,
         char path[64];
         seg_path(seg, path, sizeof(path));
 
-        if (f_stat(path, &fi) != FR_OK || fi.fsize == 0) {
+        FRESULT fr = f_stat(path, &fi);
+        if (fr != FR_OK && fr != FR_NO_FILE) goto io_error;
+        if (fr == FR_NO_FILE || fi.fsize == 0) {
             seg = (int)((seg + 1U) % RECORD_SEGMENT_COUNT);
             slot = 0;
             visited++;
@@ -658,26 +660,24 @@ HAL_StatusTypeDef storage_record_fetch(uint16_t max_count,
         }
 
         FIL f;
-        if (f_open(&f, path, FA_READ) != FR_OK) {
-            seg = (int)((seg + 1U) % RECORD_SEGMENT_COUNT);
-            slot = 0;
-            visited++;
-            continue;
-        }
+        if (f_open(&f, path, FA_READ) != FR_OK) goto io_error;
 
         /* 游标在段内 → 直接 seek 跳过已处理部分，不搬数据 */
         if (slot > 0) {
             if (f_lseek(&f, (FSIZE_t)slot * RECORD_SLOT_SIZE) != FR_OK) {
                 f_close(&f);
-                break;
+                goto io_error;
             }
         }
 
         uint8_t buf[RECORD_SLOT_SIZE];
         UINT br;
         while (slot < RECORD_SEGMENT_SLOTS) {
-            if (f_read(&f, buf, RECORD_SLOT_SIZE, &br) != FR_OK ||
-                br < RECORD_SLOT_SIZE) {
+            if (f_read(&f, buf, RECORD_SLOT_SIZE, &br) != FR_OK) {
+                f_close(&f);
+                goto io_error;
+            }
+            if (br < RECORD_SLOT_SIZE) {
                 done = true;      /* 到文件尾 */
                 break;
             }
@@ -703,7 +703,7 @@ HAL_StatusTypeDef storage_record_fetch(uint16_t max_count,
 
             if (*count >= max_count) { done = true; break; }
         }
-        f_close(&f);
+        if (f_close(&f) != FR_OK) goto io_error;
 
         if (done) break;
 
@@ -714,6 +714,12 @@ HAL_StatusTypeDef storage_record_fetch(uint16_t max_count,
 
     /* 没有可推进的 ack 时游标原地不动，保证未 ack 数据可重读 */
     return HAL_OK;
+
+io_error:
+    // 部分读取也不交付成功批次，避免后续确认跨过读失败的记录。
+    *count = 0U;
+    s_last_pos_valid = false;
+    return HAL_ERROR;
 }
 
 void storage_record_stats(uint32_t *pending, uint32_t *dropped)

@@ -7,7 +7,7 @@
  *   - 下行命令分发：订阅 cmd 主题 -> 解析 JSON -> 调 M1 mb_inject_write 写寄存器 -> 回 ACK
  *   - 离线补传驱动：MQTT 连上后从 M3 storage_m2 队列拉历史记录逐条 PUBLISH + 发 ack 回执
  *     （旧版独立的 replay_task 已删除，补传统一走 storage_m2 协议，避免两套缓存机制冲突）
- *   - 遥测上报由 telemetry_task 负责（周期采 Modbus -> JSON -> M3 缓存 + 在线直发）
+ *   - 遥测由telemetry_task采集入库；MQTT统一发送已提交记录并补record_id，PUBACK不回收缓存。
  *
  * 对外接口（5 个，被 app_modules.c 装配表 + telemetry_task.c 调用，签名不可变）：
  *   MqttClient_Init / MqttClient_Task / MqttClient_Publish / MqttClient_IsConnected / MqttClient_ReportEvent
@@ -68,7 +68,7 @@ int MqttClient_Publish(const char *topic, const uint8_t *payload, size_t plen);
  * @brief  线程安全的 PUBLISH（QoS1）——OTA状态/补传等需要可靠传输的场景
  * @param  topic   主题字符串（\0 结尾）
  * @param  payload 数据指针
- * @param  plen    数据长度（≤512B，QoS1 pending 缓冲上限）
+ * @param  plen    数据长度（≤RECORD_PAYLOAD_MAX，与存储记录上限一致）
  * @return 0=已发送(等PUBACK), -1=未连接或发送锁不可用, -2=发送失败, -3=过大, -4=pending队列满, -5=业务暂停
  * @note   内部拷贝 payload 到 pending 槽，函数返回后 payload 可释放。
  *         PUBACK 30s 未到则保持原 packet_id 重发（设计 5.2）。
@@ -102,6 +102,9 @@ int MqttClient_ReportEvent(const char *event_type, const char *detail);
  * @return 主题字符串指针（只读，生命周期同 mqtt 模块）
  */
 const char *MqttClient_TopicTelemetry(void);
+
+// 复制本次运行使用的网关身份；优先已置备身份，否则取配置ClientID；容量含NUL，失败false。
+bool MqttClient_GetGatewayId(char *out, size_t capacity);
 
 /**
  * @brief  获取 OTA 状态上报主题（Init 时按当前上云模式拼好）

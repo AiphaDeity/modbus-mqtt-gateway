@@ -8,7 +8,7 @@
  *   ④ 状态与结果上报：消费M4核验的Boot结果，PUBLISH ota_status并等待PUBACK
  *   ⑤ 网络暂停和门控：UpgradeQuiesce_Bind(NETWORK)
  *
- * 不在 MQTT 回调里执行下载/Flash/密码运算（README 明确要求）。
+ * MQTT只解析并散列通知；ECDSA、RTC和下载在原网络升级任务中执行。
  */
 #include "network_upgrade.h"
 #include "network_upgrade_downloader.h"
@@ -30,6 +30,9 @@
 #include "app_monitor.h"
 #include "mqtt_client.h"
 #include "telemetry_task.h"
+#include "storage_time.h"
+#include "storage_identity.h"
+#include "mbedtls/sha256.h"
 
 /* ===== 升级通知请求结构（JSON 解析结果） ===== */
 typedef struct
@@ -40,6 +43,10 @@ typedef struct
     uint8_t  sha256[UPGRADE_STAGE_SHA256_SIZE];
     char     url[NW_UPG_URL_MAX];
     char     token[NW_UPG_TOKEN_MAX];
+    uint32_t issued_at;
+    uint32_t expires_at;
+    uint8_t  notice_digest[32];
+    uint8_t  signature[64];
     bool     valid;
 } nw_upgrade_request_t;
 
@@ -62,6 +69,10 @@ static osThreadId_t s_upgrade_thread;
 static NetworkUpgradeAuthorization s_authorization;
 static bool s_authorization_bound;
 static bool s_authorized;
+static bool s_tls_ready;
+static bool s_revoked;
+static uint32_t s_authorized_until_ms;
+static uint32_t s_last_issued_at;
 static bool s_cleanup_pending; // 仅执行任务读写，区别于Notify尚未发布的请求。
 
 /* 升级执行任务同步：Notify 设 request + 释放信号量，Task 获取后执行 */
@@ -76,53 +87,41 @@ static bool s_boot_result_done;
 /* epoch 分配计数器（每次下载尝试唯一，本次启动不复用） */
 static volatile uint32_t s_epoch_counter = 0;
 
-// 有界读取通知字符串；缺省字段留空，转义、控制字符或截断均拒绝。
-static bool json_extract_string(const char *json, const char *key, char *out, int out_max)
+// 按工具生成的固定字段顺序读ASCII字符串；无空白、转义、截断或未知字段。
+static bool notice_text(const char **cursor, const char *key, char *out, size_t capacity)
 {
-    char needle[64];
-    snprintf(needle, sizeof(needle), "\"%s\"", key);
-    const char *p = strstr(json, needle);
-    out[0] = '\0';
-    if (!p) return true;
-    p += strlen(needle);
-    p += strspn(p, " \t\r\n");
-    if (*p++ != ':') return false;
-    p += strspn(p, " \t\r\n");
-    if (*p != '"') return false;
-    p++;
-    int i = 0;
-    while (*p && *p != '"')
+    size_t n = strlen(key);
+    if (strncmp(*cursor, key, n) != 0) return false;
+    const char *p = *cursor + n;
+    size_t length = 0U;
+    while (*p != '"')
     {
-        if ((unsigned char)*p < 0x20U || *p == '\\' || i >= out_max - 1) return false;
-        out[i++] = *p++;
+        if ((unsigned char)*p < 0x20U || (unsigned char)*p >= 0x7FU || *p == '\\' ||
+            length + 1U >= capacity) return false;
+        out[length++] = *p++;
     }
-    out[i] = '\0';
-    if (*p++ != '"') return false;
-    p += strspn(p, " \t\r\n");
-    return *p == ',' || *p == '}';
+    out[length] = '\0';
+    *cursor = p + 1;
+    return true;
 }
 
-// 包长只接受十进制整数；在累加前检查槽容量，拒绝溢出及非法尾部。
-static int32_t json_extract_int(const char *json, const char *key)
+// 接受规范十进制uint32，不允许符号、前导零、小数或累加溢出。
+static bool notice_uint(const char **cursor, const char *key, uint32_t *out)
 {
-    char needle[64];
-    snprintf(needle, sizeof(needle), "\"%s\"", key);
-    const char *p = strstr(json, needle);
-    if (!p) return -1;
-    p += strlen(needle);
-    p += strspn(p, " \t\r\n");
-    if (*p++ != ':') return -1;
-    p += strspn(p, " \t\r\n");
-    if (*p < '0' || *p > '9' || (*p == '0' && p[1] >= '0' && p[1] <= '9')) return -1;
+    size_t n = strlen(key);
+    if (strncmp(*cursor, key, n) != 0) return false;
+    const char *p = *cursor + n;
+    if (*p < '0' || *p > '9' || (*p == '0' && p[1] >= '0' && p[1] <= '9')) return false;
     uint32_t value = 0U;
     while (*p >= '0' && *p <= '9')
     {
         uint32_t digit = (uint32_t)(*p++ - '0');
-        if (value > (UPGRADE_STAGE_MAX_PACKAGE_SIZE - digit) / 10U) return -1;
+        if (value > (UINT32_MAX - digit) / 10U) return false;
         value = value * 10U + digit;
     }
-    p += strspn(p, " \t\r\n");
-    return (*p == ',' || *p == '}') ? (int32_t)value : -1;
+    *cursor = p;
+    *out = value;
+    return true;
 }
 
 /* hex 字符串转字节数组（sha256: 64 hex char → 32B） */
@@ -139,6 +138,64 @@ static int hex_to_bytes(const char *hex, uint8_t *out, int out_max)
         out[i] = (uint8_t)((h << 4) | l);
     }
     return 0;
+}
+
+// 严格解析并散列签名覆盖的原始正文；MQTT任务只做有界SHA256，不执行ECDSA。
+static bool parse_notice(const char *json, nw_upgrade_request_t *request)
+{
+    static const char start[] = "{\"type\":\"upgrade\"";
+    static const char domain[] = "GWOTA-NOTICE-V1\n";
+    if (strlen(json) > NW_UPG_NOTICE_MAX || strncmp(json, start, sizeof(start) - 1U) != 0) return false;
+    const char *p = json + sizeof(start) - 1U;
+    char text[129], gateway[GATEWAY_ID_MAX_LEN];
+    UpgradeMessage current;
+    if (!notice_text(&p, ",\"task_id\":\"", request->task_id, sizeof(request->task_id)) ||
+        !notice_text(&p, ",\"gateway_id\":\"", text, GATEWAY_ID_MAX_LEN) ||
+        !MqttClient_GetGatewayId(gateway, sizeof(gateway)) || strcmp(text, gateway) != 0 ||
+        !notice_text(&p, ",\"version\":\"", request->version, sizeof(request->version)) ||
+        !notice_uint(&p, ",\"size\":", &request->size) ||
+        !notice_text(&p, ",\"sha256\":\"", text, 65U) ||
+        hex_to_bytes(text, request->sha256, 32) != 0 ||
+        !notice_text(&p, ",\"image_sha256\":\"", text, 65U) ||
+        hex_to_bytes(text, request->notice_digest, 32) != 0 ||
+        !App_UpgradeGetStartupIdentity(&current) ||
+        memcmp(current.digest, request->notice_digest, 32U) == 0 ||
+        !notice_text(&p, ",\"url\":\"", request->url, sizeof(request->url)) ||
+        !notice_text(&p, ",\"token\":\"", request->token, sizeof(request->token)) ||
+        !notice_uint(&p, ",\"issued_at\":", &request->issued_at) ||
+        !notice_uint(&p, ",\"expires_at\":", &request->expires_at)) return false;
+    const char *signature_key = p;
+    if (!notice_text(&p, ",\"signature\":\"", text, sizeof(text)) || strcmp(p, "}") != 0 ||
+        hex_to_bytes(text, request->signature, 64) != 0 || request->task_id[0] == '\0' ||
+        request->version[0] == '\0' || request->size < UPGRADE_STAGE_MIN_PACKAGE_SIZE ||
+        request->size > UPGRADE_STAGE_MAX_PACKAGE_SIZE || request->expires_at <= request->issued_at ||
+        request->expires_at - request->issued_at > NW_UPG_NOTICE_MAX_VALIDITY_S ||
+        strncmp(request->url, NW_UPG_BOS_PREFIX, sizeof(NW_UPG_BOS_PREFIX) - 1U) != 0 ||
+        request->url[sizeof(NW_UPG_BOS_PREFIX) - 1U] == '\0' || strpbrk(request->url, " #") != NULL)
+        return false;
+    mbedtls_sha256_context hash;
+    mbedtls_sha256_init(&hash);
+    int result = mbedtls_sha256_starts(&hash, 0);
+    if (result == 0) result = mbedtls_sha256_update(&hash, (const uint8_t *)domain, sizeof(domain) - 1U);
+    if (result == 0) result = mbedtls_sha256_update(&hash, (const uint8_t *)json, (size_t)(signature_key - json));
+    if (result == 0) result = mbedtls_sha256_update(&hash, (const uint8_t *)"}", 1U);
+    if (result == 0) result = mbedtls_sha256_finish(&hash, request->notice_digest);
+    mbedtls_sha256_free(&hash);
+    return result == 0;
+}
+
+// 通知验签在原网络升级任务执行，Stage操作锁与包认证共用。
+static UpgradeStageResult verify_notice(void *context, const uint8_t *digest, const uint8_t *signature)
+{
+    (void)context;
+    return UpgradeStage_VerifyNotice(digest, signature);
+}
+
+// UTC秒须在签名窗口内，且晚于本次启动已核验通知的签发时间。
+static bool notice_time_valid(const nw_upgrade_request_t *request, uint32_t utc)
+{
+    return utc != 0U && request->issued_at <= utc && request->expires_at > utc
+        && request->issued_at > s_last_issued_at;
 }
 
 /* ===== 状态上报：PUBLISH ota_status ===== */
@@ -219,7 +276,9 @@ bool NetworkUpgrade_Authorize(const UpgradeEntryPeer *peer)
         || (osThreadGetId() != s_upgrade_thread)) return false;
     taskENTER_CRITICAL();
     bool allowed = s_initialized && s_task_started && s_authorization_bound
-                && s_upgrade_in_progress && s_authorized && (peer->epoch == s_epoch_counter);
+                && s_upgrade_in_progress && s_authorized && !s_revoked
+                && (int32_t)(s_authorized_until_ms - HAL_GetTick()) > 0
+                && (peer->epoch == s_epoch_counter);
     taskEXIT_CRITICAL();
     return allowed;
 }
@@ -231,6 +290,7 @@ UpgradeStageResult NetworkUpgrade_Revoke(void)
         || !App_IsCurrentModuleTask(APP_MODULE_MQTT)) return UPGRADE_STAGE_MODE;
     taskENTER_CRITICAL();
     bool active = s_upgrade_in_progress;
+    s_revoked = true;
     UpgradeEntryPeer peer = {UPGRADE_STAGE_SOURCE_NETWORK, s_epoch_counter};
     s_authorized = false;
     taskEXIT_CRITICAL();
@@ -371,6 +431,12 @@ static const UpgradeQuiesceParticipant s_quiesce_participant =
 AppModuleInitResult NetworkUpgrade_Init(void)
 {
     if (s_initialized) return APP_MODULE_INIT_OK;
+    if (!s_authorization_bound)
+    {
+        const NetworkUpgradeAuthorization authorization = {verify_notice, NULL};
+        if (NetworkUpgrade_BindAuthorization(&authorization) != UPGRADE_STAGE_OK)
+            return APP_MODULE_INIT_FAILED;
+    }
 
     /* 信号量：Notify 释放，Task 获取（初始 0，每次 Notify 释放 1） */
     if (!s_notify_sem) s_notify_sem = osSemaphoreNew(1, 0, NULL);
@@ -391,10 +457,12 @@ AppModuleInitResult NetworkUpgrade_Init(void)
 
     /* 初始化 TLS 模块（熵源 + CTR_DRBG + 时间函数注册） */
     https_tls_result_t tls_ret = HttpsTls_Init();
+    s_tls_ready = tls_ret == HTTPS_TLS_OK;
     if (tls_ret != HTTPS_TLS_OK)
     {
         printf("[NWUPG] TLS init fail: %d (HTTPS download unavailable)\r\n", (int)tls_ret);
-        /* 不阻断启动：HTTP 下载仍可用，仅 HTTPS 不可用 */
+        // 保留结果上报，拒绝新的HTTPS升级任务，不回退到明文HTTP。
+
     }
 
     s_initialized = true;
@@ -410,7 +478,8 @@ int NetworkUpgrade_Notify(const char *json)
     if ((__get_IPSR() != 0U) || (osKernelGetState() != osKernelRunning)
         || !App_IsCurrentModuleTask(APP_MODULE_MQTT)) return -3;
     taskENTER_CRITICAL();
-    if (!s_initialized || !s_task_started || !s_authorization_bound || (s_epoch_counter == UINT32_MAX))
+    if (!s_initialized || !s_task_started || !s_authorization_bound || !s_tls_ready ||
+        (s_epoch_counter == UINT32_MAX))
     {
         taskEXIT_CRITICAL();
         return -3;
@@ -423,38 +492,14 @@ int NetworkUpgrade_Notify(const char *json)
     // 发布请求前占用原单槽，防止执行任务取走前被下一条通知覆盖。
     s_upgrade_in_progress = true;
     s_authorized = false;
+    s_revoked = false;
     ++s_epoch_counter;
     taskEXIT_CRITICAL();
     int result = -1;
-
-    /* 解析 JSON 到 s_pending_req */
     memset(&s_pending_req, 0, sizeof(s_pending_req));
-    char sha256_hex[NW_UPG_SHA256_HEX_LEN + 1];
-    if (!json_extract_string(json, "task_id", s_pending_req.task_id, sizeof(s_pending_req.task_id)) ||
-        !json_extract_string(json, "version", s_pending_req.version, sizeof(s_pending_req.version)) ||
-        !json_extract_string(json, "sha256", sha256_hex, sizeof(sha256_hex)) ||
-        !json_extract_string(json, "url", s_pending_req.url, sizeof(s_pending_req.url)) ||
-        !json_extract_string(json, "token", s_pending_req.token, sizeof(s_pending_req.token))) goto rejected;
-    int32_t size = json_extract_int(json, "size");
-    s_pending_req.size = size > 0 ? (uint32_t)size : 0U;
-
-    /* 校验必填字段 */
-    if (s_pending_req.task_id[0] == '\0' || s_pending_req.version[0] == '\0' ||
-        s_pending_req.url[0] == '\0' || s_pending_req.size < UPGRADE_STAGE_MIN_PACKAGE_SIZE ||
-        hex_to_bytes(sha256_hex, s_pending_req.sha256, sizeof(s_pending_req.sha256)) != 0)
-    {
-        printf("[NWUPG] Notify: invalid required fields\r\n");
-        goto rejected;
-    }
-
-    // 核验这条完整通知后才发布本次epoch的许可，不能复用上一条通知的核验结果。
-    result = -3;
-    if (!s_authorization.verify(s_authorization.context, json)) goto rejected;
-    s_authorized = true;
+    if (!parse_notice(json, &s_pending_req)) goto rejected;
+    /* 这里只受理待验通知；执行任务验签通过前不发布升级许可。 */
     s_pending_req.valid = true;
-    printf("[NWUPG] Notify: task=%s ver=%s size=%u\r\n",
-           s_pending_req.task_id, s_pending_req.version,
-           (unsigned)s_pending_req.size);
 
     /* 唤醒执行任务 */
     if (osSemaphoreRelease(s_notify_sem) != osOK) goto rejected;
@@ -518,6 +563,39 @@ void NetworkUpgrade_Task(void *argument)
         memcpy(&req, &s_pending_req, sizeof(req));
         s_pending_req.valid = false;
 
+        if (!Monitor_UpgradeWait(3000U)) return;
+        uint32_t utc = storage_get_unix_time();
+        if (!Monitor_UpgradeProgress()) return;
+        UpgradeStageResult authorized = UPGRADE_STAGE_AUTH;
+        if (notice_time_valid(&req, utc))
+            authorized = s_authorization.verify(s_authorization.context, req.notice_digest, req.signature);
+        if (authorized == UPGRADE_STAGE_OK)
+        {
+            if (!Monitor_UpgradeWait(3000U)) return;
+            utc = storage_get_unix_time();
+            if (!Monitor_UpgradeProgress()) return;
+            if (!notice_time_valid(&req, utc)) authorized = UPGRADE_STAGE_AUTH;
+        }
+        taskENTER_CRITICAL();
+        if (authorized == UPGRADE_STAGE_OK)
+        {
+            s_last_issued_at = req.issued_at;
+            if (s_revoked) authorized = UPGRADE_STAGE_MODE;
+            else
+            {
+                s_authorized_until_ms = HAL_GetTick() + (req.expires_at - utc) * 1000U;
+                s_authorized = true;
+            }
+        }
+        if (authorized != UPGRADE_STAGE_OK) s_upgrade_in_progress = false;
+        taskEXIT_CRITICAL();
+        if (authorized != UPGRADE_STAGE_OK)
+        {
+            s_phase = 6;
+            report_status(req.task_id, "failed", UpgradeEntry_ErrorName(authorized));
+            continue;
+        }
+
         printf("[NWUPG] === upgrade start: task=%s ===\r\n", req.task_id);
         AppMemory_Report("network-begin");
 
@@ -556,6 +634,12 @@ void NetworkUpgrade_Task(void *argument)
             .total_size = req.size,
         };
 
+        int32_t lease_ms = (int32_t)(s_authorized_until_ms - HAL_GetTick());
+        if (lease_ms <= 0)
+        {
+            cleanup_attempt(&peer);
+            continue;
+        }
         nw_dl_params_t dl_params =
         {
             .url = req.url,
@@ -563,7 +647,7 @@ void NetworkUpgrade_Task(void *argument)
             .total_size = req.size,
             .cb = download_chunk_callback,
             .ctx = &dl_ctx,
-            .timeout_ms = 120000,
+            .timeout_ms = lease_ms < 120000 ? (uint32_t)lease_ms : 120000U,
             .chunk_size = UPGRADE_STAGE_MAX_CHUNK_SIZE,
         };
 

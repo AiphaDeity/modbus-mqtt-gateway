@@ -42,7 +42,7 @@ typedef struct {
     record_out_t records[STORAGE_M2_FETCH_BATCH_MAX];
 } storage_fetch_resp_t;
 
-/* 4.4 M2 → M3：上传成功回执（按 seq 水位删除，取本批最大 seq） */
+// 4.4 M2 → M3：仅提交已发送且逐条业务确认的连续批次前缀，不能取任意最大seq。
 typedef struct {
     uint64_t ack_upto_seq;
 } storage_ack_t;

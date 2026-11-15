@@ -2,7 +2,7 @@
 
 核对日期：2026-11-15。本文说明当前源码的接口、持久格式和恢复操作；正式产品要求见[系统设计](https://hcn4ticlccda.feishu.cn/docx/JNMDdxoBio9f9bxxQPXcPINSnqh)。资源与引脚统一见[硬件与运行资源](../../../../docs/hardware-resources.md)。
 
-正常升级由 MQTT 通知、设备主动 HTTPS 下载，离线升级由 TF 文件导入；两者共用认证、安装和回退。USART2 仅用于 Boot 恢复，App 不开放串口配置或升级监听端口。HTTPS 下载器已接入源码，但真实通知核验回调尚未绑定，网络升级仍返回 NOT_READY，不能据此认定云端闭环完成。
+正常升级由 MQTT 通知、设备主动 HTTPS 下载，离线升级由 TF 文件导入；两者共用认证、安装和回退。USART2 仅用于 Boot 恢复，App 不开放串口配置或升级监听端口。HTTPS下载器和签名通知授权已接入源码；缺有效UTC、TLS或信任资料时仍拒绝，真实MQTT/BOS/安装及云端结果闭环尚待实板验证。
 
 TF 维护由 PA0 长按至少 3 s、稳定松开触发。根目录仅有 /config.json 时交 Config 保存，仅有 /firmware.gwp 时导入升级；两者都有或都没有则拒绝。其他文件保留，插卡或启动不自动导入。缺信任资料、介质、正常启动身份或必要角色时拒绝擦写。
 
@@ -52,11 +52,48 @@ Boot保留独立Flash驱动和保存入口；普通构建也具备实际安装�
 4. M1/M2/M3分别绑定真实UpgradeQuiesceParticipant，并在最终TX/配置提交/持久变更前检查UpgradeQuiesce_AllowsMutation。四个角色为Modbus、Storage、Config、Network；关闭M2构建时不要求Network角色。
 5. 各关键模块登记Monitor_RegisterHealth，按实际进展、有限等待和自检结果报告，并落实试运行门控；任务创建或接口注册不代替真实业务验证。
 6. storage_upgrade_tf提供UpgradeTfSource：open取得不可变文件租约、read完整值拷贝、close幂等且确认后台不再引用缓冲，所有I/O转交Storage_Task。不因插卡/启动自动导入。
-7. M2将授权后的下载交给升级执行任务，依次调用UpgradeEntry_Begin/Write/Finish；MQTT回调只处理通知和调度，不同步执行Flash/密码运算。Boot串口恢复使用独立入口，不通过App收包接口。
+7. MQTT回调严格解析签名通知并计算有界SHA256，网络升级任务完成RTC及P-256校验后才调用UpgradeEntry_Begin/Write/Finish；回调不执行ECDSA、TLS或Flash。Boot串口恢复使用独立入口，不通过App收包接口。
 
-网络初始化前通过NetworkUpgrade_BindAuthorization绑定一次真实通知核验回调；Notify只在MQTT任务中接收完整通知，回调核对来源、目标、权限及下载来源，通过后才发布本次epoch许可。当前未接入该回调，接收返回-3（未就绪/未授权），保留Boot结果上报，不绑定成功桩。原单槽在解析前占用，旧尝试结束并确认清理前不接受下一条；epoch非零且本次启动不复用，耗尽后拒绝。
+NetworkUpgrade_Init通过NetworkUpgrade_BindAuthorization默认绑定真实P-256验签。通知先进入原单槽，网络任务核对RTC有效、目标匹配、签名正确和有效期后才发布本次epoch许可。Stage_VerifyNotice复用原操作锁、可信映射和分段验签，空闲以外返回BUSY，不擦写或分配事务号；不与TF认证并发。缺TLS、信任资料或有效UTC时拒绝。单槽在解析前占用，旧尝试结束并确认清理前不接下一条；epoch非零且本次启动不复用。
 
-MQTT撤权或许可到期时调用NetworkUpgrade_Revoke，用原epoch通知Disconnect；执行任务继续取消结算，BUSY、清理失败或READY提交不明时保留占用。Finish认证后、提交前再次核对许可；进入提交后不保证还能撤销，不能把撤权当作已取消或恢复业务。初始化资源/暂停绑定失败不标记成功，不创建重复信号量。
+通知同时携带经包签名核验的image_sha256；与本次Boot已核验镜像相同的通知直接拒绝，不重复擦写或重装。通知许可同时绑定HAL单调截止时间，Write与Finish/提交前复查；到期失败沿原Disconnect结算。MQTT任务显式调用NetworkUpgrade_Revoke时锁存撤销，包括验签尚未完成的情况，不能在验签返回后重新授权。进入提交后仍按原规则解析结果，READY已持久不回滚，不等待云端回执无限推迟重启。
+
+### 签名通知与M2下发
+
+通知模式复用根目录tools/package_upgrade.py，无须设备AES或nonce账本，不重新制作包。通知过期只需重新签发通知，不能为了续期重置nonce账本或覆盖原包。先上传当前硬件匹配的.gwp到百度BOS，再签发通知；私钥留在制包电脑，M2只接收通知JSON和加密包。
+
+在制包说明书同一个PowerShell终端的口令try/finally内执行下面整段命令；变量沿用制包流程。运行前把网关ID、任务号、BOS文件名改为本次实际值。示例V123不是已交付包，不能直接引用不存在的文件。
+
+```powershell
+# 1. 输入已制作并上传BOS的.gwp；这里只读取原包，不修改包或nonce账本。
+# 2. 使用原签名私钥及临时口令环境变量，生成本次通知；同名输出拒绝覆盖。
+& $gwPython $gwTool --notification `
+  --input $gwPackage `
+  --signing-key $gwPrivateKey `
+  --signing-password-env GATEWAY_PACKAGE_SIGNING_PASSWORD `
+  --gateway-id '实际网关ID' `
+  --task-id 'ota-v123-001' `
+  --url 'https://modbus-mqtt-firmware.gz.bcebos.com/gateway-v123.gwp' `
+  --valid-for 900 `
+  --output (Join-Path $gwReleaseDir 'ota-v123-001.json')
+# 3. 出错时停止；外层finally仍清除临时口令，不把口令交给M2。
+if ($LASTEXITCODE -ne 0) { throw '签名通知生成失败。' }
+```
+
+| 项目 | 设备与工具共同约定 |
+| --- | --- |
+| 目标 | gateway_id与MqttClient_GetGatewayId相同：优先已置备身份，未置备时取本次运行配置mq_client_id；不是设备型号 |
+| 主题 | 现有commands；百度模式为`$iot/{DeviceKey}/user/commands`；UTF-8原始字节、retain=false |
+| 原文 | 固定字段顺序type/task_id/gateway_id/version/size/sha256/image_sha256/url/token/issued_at/expires_at/signature；无外部空白或转义，不重新排字段、格式化或再序列化 |
+| 签名 | 可信编号1的P-256公钥；SHA256输入为ASCII `GWOTA-NOTICE-V1`、一个LF和删除signature字段后的完整紧凑JSON；签名64 B原始r||s编码为128个hex字符；V1只是通知域，包封装和持久兼容号仍为2 |
+| 来源 | 仅`https://modbus-mqtt-firmware.gz.bcebos.com/`的非空文件路径；URL≤127 B，不含空白或fragment；下载仍做TLS主机名和证书检查 |
+| 时间 | UTC Unix秒，默认900 s、上限3600 s；issued_at不得晚于设备UTC，expires_at必须在未来；PC与RTC须正确校时 |
+| 重复 | 同一次启动只接受递增issued_at；忙时拒绝。合法通知在设备重启后仍可在有效期内重新尝试，不等于跨重启持久任务去重；RAM会话不续传 |
+| 输出 | 原包与签名私钥须匹配，生成前真实验原包签名，生成后真实验通知签名。可选`--token-env`从环境变量取下载认证头，不在命令行传明文token |
+
+M2直接读取生成文件的原始内容发布，不需要私钥。受理回执仅表示通知排队，后续签名/时间失败通过ota_status报错；不能把受理或READY当作升级成功。工具打印原包的镜像SHA256，云端应随task_id、目标及发布记录保存，用于关联重启后的真实Boot结果；该结果仍使用tx_id/sequence/image_sha256，不伪造RAM中的task_id。
+
+上述通知接入已实现，签名通知工具主机测试与构建可核对；真实MQTT通知、RTC/TLS峰值、BOS下载、网络安装和云端关联仍需联网实板验证。
 
 耗时操作只由升级执行任务调用，不在Storage_Task、Modbus、MQTT、网络核心线程或Monitor执行。TF使用已装配的upgrade任务，静态栈6 KiB普通SRAM；初始化不重复创建任务，没有按键请求队列。Stage入口按当前PSP与任务栈底检查至少4096 B可用空间；历史最低余量由监督另查，两者不能混用。任务按实际文件/队列应答和密码检查点报告进展，阻塞前按原操作剩余期限声明等待，给返回处理另留1000 ms裕量；此裕量不延长收包、认证或提交的总期限。
 

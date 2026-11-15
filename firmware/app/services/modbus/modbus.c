@@ -87,7 +87,7 @@ modbusHandler_t *mHandlers[MAX_M_HANDLERS];
 
 static bool sendTxBuffer(modbusHandler_t *modH);
 static int16_t getRxBuffer(modbusHandler_t *modH);
-static uint8_t validateAnswer(modbusHandler_t *modH);
+static int8_t validateAnswer(modbusHandler_t *modH, const modbus_t *telegram);
 static void buildException( uint8_t u8exception, modbusHandler_t *modH );
 static uint8_t validateRequest(modbusHandler_t * modH);
 static uint16_t word(uint8_t H, uint8_t l);
@@ -1147,7 +1147,7 @@ void StartTaskModbusMaster(void *argument)
 
 
 
-	  if ( modH->u8BufferSize < 6){
+	  if ( modH->u8BufferSize < 5){
 
 		  modH->i8state = COM_IDLE;
 		  modH->i8lastError = ERR_BAD_SIZE;
@@ -1160,7 +1160,7 @@ void StartTaskModbusMaster(void *argument)
 
 
 	  // validate message: id, CRC, FCT, exception
-	  int8_t u8exception = validateAnswer(modH);
+	  int8_t u8exception = validateAnswer(modH, &telegram);
 	  if (u8exception != 0)
 	  {
 		 modH->i8state = COM_IDLE;
@@ -1171,6 +1171,16 @@ void StartTaskModbusMaster(void *argument)
 
 	  modH->i8lastError = u8exception;
 
+      // 与快照和点表读取共用数据锁，避免32位值混入两轮寄存器。
+      if (osMutexAcquire(mb_handle->xSlaveDataMutex,
+                         pdMS_TO_TICKS(TIMEOUT_MODBUS + 200U)) != osOK)
+      {
+          modH->i8state = COM_IDLE;
+          modH->i8lastError = ERR_UNKNOWN;
+          mb_runtime_fail();
+          xTaskNotify((TaskHandle_t)telegram.u32CurrentTask, ERR_UNKNOWN, eSetValueWithOverwrite);
+          continue;
+      }
 	  xSemaphoreTake(modH->ModBusSphrHandle , portMAX_DELAY); //before processing the message get the semaphore
 	  // process answer
 	  switch( modH->u8Buffer[ FUNC ] )
@@ -1199,6 +1209,7 @@ void StartTaskModbusMaster(void *argument)
 	  if (modH->i8lastError ==0) // no error the error_OK, we need to use a different value than 0 to detect the timeout
 	  {
 		  xSemaphoreGive(modH->ModBusSphrHandle); //Release the semaphore
+          osMutexRelease(mb_handle->xSlaveDataMutex);
 		  xTaskNotify((TaskHandle_t)telegram.u32CurrentTask, ERR_OK_QUERY, eSetValueWithOverwrite);
 	  }
 
@@ -1260,8 +1271,11 @@ void get_FC3(modbusHandler_t *modH)
  * @return 0 if OK, EXCEPTION if anything fails
  * @ingroup buffer
  */
-uint8_t validateAnswer(modbusHandler_t *modH)
+// 核对本次请求的地址、功能、长度及写应答回显，成功后才允许复制寄存器。
+int8_t validateAnswer(modbusHandler_t *modH, const modbus_t *telegram)
 {
+    if (telegram == NULL || telegram->u16reg == NULL || modH->u8BufferSize < 5U)
+        return ERR_BAD_SIZE;
     // check message crc vs calculated crc
 
 #if ENABLE_TCP ==1
@@ -1281,11 +1295,16 @@ uint8_t validateAnswer(modbusHandler_t *modH)
 #endif
 
 
-    // check exception
+    if (modH->u8Buffer[ID] != telegram->u8id)
+        return ERR_BAD_SLAVE_ID;
+    if ((modH->u8Buffer[FUNC] & 0x7FU) != telegram->u8fct)
+        return EXC_FUNC_CODE;
+
+    // 异常应答固定5字节，不读取普通数据区。
     if ((modH->u8Buffer[ FUNC ] & 0x80) != 0)
     {
     	modH->u16errCnt ++;
-        return ERR_EXCEPTION;
+        return modH->u8BufferSize == 5U ? ERR_EXCEPTION : ERR_BAD_SIZE;
     }
 
     // check fct code
@@ -1304,7 +1323,31 @@ uint8_t validateAnswer(modbusHandler_t *modH)
         return EXC_FUNC_CODE;
     }
 
-    return 0; // OK, no exception code thrown
+    uint16_t count = telegram->u16CoilsNo;
+    if (telegram->u8fct == MB_FC_READ_COILS || telegram->u8fct == MB_FC_READ_DISCRETE_INPUT ||
+        telegram->u8fct == MB_FC_READ_REGISTERS || telegram->u8fct == MB_FC_READ_INPUT_REGISTER)
+    {
+        bool bits = telegram->u8fct == MB_FC_READ_COILS || telegram->u8fct == MB_FC_READ_DISCRETE_INPUT;
+        uint16_t capacity = bits ? MB_REG_MAX_PER_SLAVE * 16U : MB_REG_MAX_PER_SLAVE;
+        uint16_t bytes = bits ? (count + 7U) / 8U : count * 2U;
+        if (count == 0U || count > capacity || bytes + 5U != modH->u8BufferSize ||
+            modH->u8Buffer[2] != bytes)
+            return ERR_BAD_SIZE;
+    }
+    else
+    {
+        if (modH->u8BufferSize != 8U ||
+            word(modH->u8Buffer[ADD_HI], modH->u8Buffer[ADD_LO]) != telegram->u16RegAdd)
+            return ERR_BAD_SIZE;
+        uint16_t expected = count;
+        if (telegram->u8fct == MB_FC_WRITE_COIL)
+            expected = telegram->u16reg[0] != 0U ? 0xFF00U : 0U;
+        else if (telegram->u8fct == MB_FC_WRITE_REGISTER)
+            expected = telegram->u16reg[0];
+        if (word(modH->u8Buffer[NB_HI], modH->u8Buffer[NB_LO]) != expected)
+            return ERR_BAD_SIZE;
+    }
+    return 0;
 }
 
 

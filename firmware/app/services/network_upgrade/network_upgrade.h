@@ -12,15 +12,13 @@
  *   3. 升级执行任务串行调：
  *        UpgradeEntry_Begin → UpgradeEntry_Write(循环) → UpgradeEntry_Finish → UpgradeEntry_Reboot
  *
- * 升级通知 JSON 格式（M2 定义，当前从commands topic接收）：
- *   {
- *     "task_id": "cloud-task-uuid",   // 云端任务号（供关联，不传给M4）
- *     "version": "1.2.3",              // 目标版本号（仅日志/上报，不传给 M4）
- *     "size": 262144,                  // 升级包总字节数（传给 Begin 的 total_size）
- *     "sha256": "hexstring64chars",    // 32B 传输摘要 hex（传给 Begin 的 sha256）
- *     "url": "https://host/firmware.gwp", // 下载URL，HTTPS执行服务器证书校验
- *     "token": "optional-auth-header"  // 可选下载认证头
- *   }
+ * 升级通知由tools/package_upgrade.py --notification生成，M2原样发布到commands，retain=false。
+ * 固定字段顺序：type/task_id/gateway_id/version/size/sha256/image_sha256/url/token/issued_at/expires_at/signature。
+ * 无空白及转义；type固定upgrade；时间为UTC Unix秒，有效期1～3600 s；signature为r||s的128个hex字符。
+ * 签名正文为去掉最后signature字段的紧凑JSON对象，前置域GWOTA-NOTICE-V1和换行，再做SHA256/P-256。
+ * gateway_id使用MqttClient_GetGatewayId；只接受NW_UPG_BOS_PREFIX的HTTPS链接。
+ * image_sha256用于拒绝重装本次Boot已核验的同一镜像，并供云端关联启动结果。
+ * MQTT只解析/散列，网络任务验签并确认RTC有效后才授权；同次启动只接受递增issued_at。
  *
  * 状态上报（M2 PUBLISH 到 ota_status topic）：
  *   {"task_id":"...","phase":"downloading","offset":12345,"total":262144}
@@ -55,22 +53,24 @@ extern "C" {
 #define NW_UPG_VERSION_MAX    32      /* 版本号最多31 B */
 #define NW_UPG_TASK_ID_MAX    64      /* 云端任务号最多63 B */
 #define NW_UPG_TOKEN_MAX      128     /* 认证 token 最多127 B */
+#define NW_UPG_NOTICE_MAX 1024U
+#define NW_UPG_NOTICE_MAX_VALIDITY_S 3600U
+#define NW_UPG_BOS_PREFIX "https://modbus-mqtt-firmware.gz.bcebos.com/"
 #define NW_UPG_SHA256_HEX_LEN 64      /* SHA256 hex 字符串长度（32B → 64 hex char） */
 
 /* ===== 对外接口 ===== */
 
 typedef struct
 {
-    bool (*verify)(void *context, const char *json);
+    UpgradeStageResult (*verify)(void *context, const uint8_t *digest, const uint8_t *signature);
     void *context;
 } NetworkUpgradeAuthorization;
 
 /*
- * 初始化前在任务上下文绑定一次核验回调；回调/context在运行期间有效且不替换。
- * verify在MQTT任务的Notify中接收完整JSON，须严格校验消息结构、顶层字段、来源、目标、权限、时效及下载来源；
- * 只读、无I/O、不保留JSON指针，不得仅凭字段存在、连接状态或格式正确放行。
- * 通过后模块把许可绑定到本次非零epoch，后续入口只读查询该许可；未绑定拒绝接收。
- * MQTT撤权/许可到期时须调用Revoke；清理未确认或READY提交不明时不接下一包。
+ * 初始化前绑定一次只读验签回调，digest/signature可读32/64 B，返回Stage结果；指针只在调用内有效。
+ * 回调由原网络升级任务调用，须使用可信公钥并串行执行密码运算；不能从通知接受公钥。
+ * Init默认绑定Stage可信映射与分段P-256验签；缺时间、密钥、TLS或签名错误均不放行。
+ * 准入后按原HAL单调期限复查有效期；撤权/清理不明时不接受下一任务。
  */
 UpgradeStageResult NetworkUpgrade_BindAuthorization(const NetworkUpgradeAuthorization *authorization);
 // 供装配层唯一策略查询；只有当前网络执行任务及匹配的非零epoch能通过。
@@ -81,7 +81,7 @@ UpgradeStageResult NetworkUpgrade_Revoke(void);
 /**
  * @brief  网络升级模块初始化（装配阶段调用，不创建任务）
  * @note   只创建原信号量并绑定UpgradeQuiesce(NETWORK)，失败不标记初始化成功。
- *         由App_ModulesInit调用；缺任务许可时仍可上报Boot结果，接收保持NOT_READY。
+ *         由App_ModulesInit调用；自动绑定签名核验，依赖不可用时仍保留Boot结果上报。
  */
 AppModuleInitResult NetworkUpgrade_Init(void);
 
@@ -94,10 +94,9 @@ void NetworkUpgrade_Task(void *argument);
 /**
  * @brief  MQTT 回调收到升级通知时调用（不阻塞，只解析+唤醒执行任务）
  * @param  json  待核验的完整通知（\0结尾），仅MQTT任务调用，返回后可复用缓冲
- * @return 0=已接受，-1=格式错误，-2=会话/清理占用，-3=未就绪/未授权/非MQTT任务/epoch耗尽
- * @note   受理前检查task_id/version/url非空、字段无截断、包长及64个hex字符的摘要；token可缺省。
- *         当前字段采用无转义文本；边界检查不代替verify的完整消息校验。
- *         核验后把字段及32B摘要存到原静态结构体并唤醒执行任务，不在回调中下载或写Flash。
+ * @return 0=待验通知已入原单槽（不代表授权），-1=格式错误/目标或来源不符，-2=占用，-3=未就绪/上下文错误
+ * @note   只接收上述工具的原始JSON；严格字段/长度/目标/HTTPS来源检查后复制并计算通知摘要。
+ *         网络任务检查RTC、签名和本次启动的重放边界，通过后才发布当前epoch许可。
  */
 int NetworkUpgrade_Notify(const char *json);
 

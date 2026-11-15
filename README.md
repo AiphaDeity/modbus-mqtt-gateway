@@ -130,6 +130,7 @@ App 和 Boot 的 CubeMX 配置分别为 `firmware/app/modbus-mqtt-gateway.ioc`�
 
 - [硬件与运行资源](docs/hardware-resources.md)：引脚、Flash 分区、任务与当前内存占用。
 - [升级接口与恢复操作](firmware/app/services/upgrade/README.md)：包认证、持久格式、安装回退及维护协议。
+- [升级测试链路与验证记录](docs/upgrade-test-chain.md)：13 组已完成验证、逐步流程、剩余测试及 SPI 故障记录。
 - [Modbus 接口与 TF 配置](firmware/app/services/modbus/Modbus_Interface_Guide.md)：采集接口、配置文件和当前控制边界。
 - [需求规格说明书](https://hcn4ticlccda.feishu.cn/docx/N1fadpRf2oYcRCxiR2KcFpfKntc)
 - [系统设计说明书](https://hcn4ticlccda.feishu.cn/docx/JNMDdxoBio9f9bxxQPXcPINSnqh)

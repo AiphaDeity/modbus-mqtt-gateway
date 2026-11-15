@@ -260,6 +260,30 @@ UpgradeStageResult UpgradeStage_Bind(const UpgradeStageBackend *adapter, void *c
   return ReleaseOperation(UPGRADE_STAGE_OK);
 }
 
+// 通知验签独占原Stage操作边界，避免与TF包认证或TLS所在网络会话并发。
+UpgradeStageResult UpgradeStage_VerifyNotice(const uint8_t *digest, const uint8_t *signature)
+{
+  if (!UpgradeStage_ExecutorAllowed())
+  {
+    return UPGRADE_STAGE_MODE;
+  }
+  UpgradeStageResult result = TakeOperation();
+  if (result != UPGRADE_STAGE_OK)
+  {
+    return result;
+  }
+  if (!backend_ready)
+  {
+    return ReleaseOperation(UPGRADE_STAGE_NOT_READY);
+  }
+  if (storage_open || ((session.phase != UPGRADE_STAGE_IDLE) && (session.phase != UPGRADE_STAGE_ERROR))
+      || (session.commit_state == UPGRADE_COMMIT_UNKNOWN) || (session.resume_error != UPGRADE_STAGE_OK))
+  {
+    return ReleaseOperation(UPGRADE_STAGE_BUSY);
+  }
+  return ReleaseOperation(UpgradeStage_AuthenticateNotice(&backend, backend_context, digest, signature));
+}
+
 // 与收包共用修改占用，避免只读查询抢用存储请求和应答工作区。
 UpgradeStageResult UpgradeStage_ReadBootState(UpgradeStateProtection *state, uint32_t timeout_ms)
 {
