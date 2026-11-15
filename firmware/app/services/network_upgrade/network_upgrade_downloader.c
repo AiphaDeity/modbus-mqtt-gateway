@@ -150,44 +150,52 @@ static nw_dl_status_t download_connect(const char *host, uint16_t port)
  * 返回 0=成功，-1=格式错误
  * url 例：http://abc.baidubce.com:8080/fw/firmware.gwp
  *       https://abc.bcebos.com/firmware.gwp
+ *
+ * 解析后输出：
+ *   host     - 域名或 IP（不含端口和路径）
+ *   port     - 端口号（URL 没写则用默认：HTTP=80, HTTPS=443）
+ *   path     - 路径（URL 没写则用 "/"）
+ *   is_https - true=HTTPS(443+TLS), false=HTTP(80明文)
  */
 static int parse_url(const char *url, char *host, int host_max,
                      uint16_t *port, const char **path, bool *is_https)
 {
     *is_https = false;
 
+    /* 检查协议前缀，确定默认端口 */
     if (strncmp(url, "https://", 8) == 0)
     {
         *is_https = true;
-        *port = NW_DL_HTTPS_PORT;
+        *port = NW_DL_HTTPS_PORT;   /* 443 */
     }
     else if (strncmp(url, "http://", 7) == 0)
     {
         *is_https = false;
-        *port = NW_DL_HTTP_PORT;
+        *port = NW_DL_HTTP_PORT;    /* 80 */
     }
     else
     {
-        return -1;
+        return -1;   /* 不支持的协议 */
     }
 
+    /* 跳过协议前缀，指向 host 起点 */
     const char *p = url + (*is_https ? 8 : 7);
     const char *host_start = p;
-    /* 找 host 结尾（: / 或 \0） */
+    /* host 结尾标志：冒号(端口) / 斜杠(路径) / 结尾 */
     while (*p != ':' && *p != '/' && *p != '\0') p++;
     int host_len = p - host_start;
     if (host_len <= 0 || host_len >= host_max) return -1;
     memcpy(host, host_start, host_len);
     host[host_len] = '\0';
 
-    /* 解析端口（如有） */
+    /* 解析端口（如有 ":8080"） */
     if (*p == ':')
     {
         *port = (uint16_t)atoi(p + 1);
-        while (*p != '/' && *p != '\0') p++;
+        while (*p != '/' && *p != '\0') p++;   /* 跳过端口数字 */
     }
 
-    /* path */
+    /* path：有 "/" 则从斜杠开始，没有则用 "/" */
     *path = (*p == '/') ? p : "/";
     return 0;
 }
@@ -360,7 +368,10 @@ static nw_dl_status_t receive_response(struct netconn *conn, const nw_dl_params_
 }
 
 /* ===== HTTPS 下载路径（mbedTLS） =====
+ * 流程：DNS → TCP → TLS握手 → GET → 收头 → 收body → 回调
  * TLS 给出平字节流，头和 body 都直接 recv 到缓冲。
+ *
+ * 与 fetch_http 的区别仅在第 3 步多了 TLS 握手，收发用 HttpsTls_Send/Recv 替代 netconn_write/recv。
  */
 static nw_dl_status_t fetch_https(const nw_dl_params_t *params,
                                   const char *host, uint16_t port,
@@ -387,7 +398,8 @@ static nw_dl_status_t fetch_https(const nw_dl_params_t *params,
     g_using_tls = true;
     printf("[NWDL] TLS connected\r\n");
 
-    /* 发 HTTP GET 请求（经 TLS 加密） */
+    /* 4. 发 HTTP GET 请求（经 TLS 加密发送）
+     * 带 Authorization 头（如 params->auth_token 非空，如百度云 BOS 的临时 token） */
     char req[256];
     int req_len;
     if (params->auth_token && params->auth_token[0])
@@ -483,7 +495,7 @@ static nw_dl_status_t fetch_https(const nw_dl_params_t *params,
         }
     }
 
-    /* 循环收 body */
+    /* 8. 循环收剩余 body，按 chunk_size 分块回调 */
     while (offset < (uint32_t)content_len)
     {
         uint32_t space = chunk_size - chunk_accum;
@@ -495,9 +507,10 @@ static nw_dl_status_t fetch_https(const nw_dl_params_t *params,
             printf("[NWDL] TLS recv body fail at offset=%u\r\n", (unsigned)offset);
             return download_close(got == -HTTPS_TLS_ERR_TIMEOUT ? NW_DL_ERR_TIMEOUT : NW_DL_ERR_RECEIVE);
         }
-        if (got == 0) break;  /* EOF */
+        if (got == 0) break;  /* EOF：服务器关闭连接 */
 
         chunk_accum += (uint32_t)got;
+        /* 累积够一块或到文件末尾就回调写 Flash */
         if (chunk_accum >= chunk_size || offset + chunk_accum >= (uint32_t)content_len)
         {
             nw_dl_status_t cb_ret = params->cb(params->ctx, offset, g_chunk_buf, chunk_accum);
@@ -511,7 +524,7 @@ static nw_dl_status_t fetch_https(const nw_dl_params_t *params,
         }
     }
 
-    /* 残余 */
+    /* 最后一块不足 chunk_size 也要回调 */
     if (chunk_accum > 0)
     {
         nw_dl_status_t cb_ret = params->cb(params->ctx, offset, g_chunk_buf, chunk_accum);
@@ -520,6 +533,7 @@ static nw_dl_status_t fetch_https(const nw_dl_params_t *params,
         offset += chunk_accum;
     }
 
+    /* 校验完整性：收到的总字节数必须等于 Content-Length */
     if (offset != (uint32_t)content_len)
     {
         printf("[NWDL] incomplete: got %u expected %ld\r\n", (unsigned)offset, (long)content_len);
@@ -541,7 +555,7 @@ static nw_dl_status_t fetch_http(const nw_dl_params_t *params,
     if (connected != NW_DL_OK) return connected;
     struct netconn *conn = g_download_conn;
 
-    /* 发 HTTP GET */
+    /* 3. 发 HTTP GET（明文） */
     char req[256];
     int req_len;
     if (params->auth_token && params->auth_token[0])
@@ -578,7 +592,10 @@ static nw_dl_status_t fetch_http(const nw_dl_params_t *params,
     return result;
 }
 
-/* ===== 入口：解析 URL，分发 HTTP / HTTPS ===== */
+/* ===== 入口：解析 URL，分发 HTTP / HTTPS =====
+ * 对外接口，由 network_upgrade.c 的升级任务调用。
+ * 根据 URL 协议前缀自动选择 HTTP 或 HTTPS 下载路径。
+ * chunk_size 默认 1016（受 Flash 写入单元限制）。 */
 nw_dl_status_t NetworkDownloader_Fetch(const nw_dl_params_t *params)
 {
     char host[64];
@@ -593,13 +610,14 @@ nw_dl_status_t NetworkDownloader_Fetch(const nw_dl_params_t *params)
     if (g_timeout_ms > INT32_MAX) return NW_DL_ERR_TIMEOUT;
     g_started_ms = HAL_GetTick();
 
-    /* 清理上次残留连接 */
+    /* 清理上次残留连接（防止上次下载失败后连接泄漏） */
     if (download_close(NW_DL_OK) != NW_DL_OK) return NW_DL_ERR_INTERNAL;
 
+    /* chunk_size 限制：0=用默认，超 1016=截到 1016（Flash 写入块大小限制） */
     uint32_t chunk_size = params->chunk_size;
     if (chunk_size == 0 || chunk_size > 1016) chunk_size = 1016;
 
-    /* 解析 URL */
+    /* 解析 URL，确定协议/host/port/path */
     if (parse_url(params->url, host, sizeof(host), &port, &path, &is_https) != 0)
     {
         printf("[NWDL] URL parse fail\r\n");
@@ -614,6 +632,7 @@ nw_dl_status_t NetworkDownloader_Fetch(const nw_dl_params_t *params)
     return result == NW_DL_OK && download_remaining() == 0U ? NW_DL_ERR_TIMEOUT : result;
 }
 
+/* 错误码转可读字符串，用于日志输出 */
 const char *NetworkDownloader_ErrorString(nw_dl_status_t status)
 {
     switch (status)

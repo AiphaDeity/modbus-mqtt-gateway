@@ -1,3 +1,22 @@
+/*
+ * sys_arch.c —— lwIP FreeRTOS 操作系统抽象层移植
+ *
+ * lwIP 是一个独立的 TCP/IP 协议栈，不依赖特定 OS。
+ * 本文件实现 lwIP 要求的 OS 接口（sys_arch.h 定义），把 lwIP 的
+ * 互斥锁/信号量/消息队列/线程/时间 等 OS 原语映射到 FreeRTOS 的对应设施。
+ *
+ * 这是 M2 网络栈的底层依赖——lwIP 协议栈运行在 FreeRTOS 之上，需要本文件桥接。
+ *
+ * 映射关系：
+ *   lwIP 互斥锁 (sys_mutex_t)  → FreeRTOS 递归互斥锁 (xSemaphoreCreateRecursiveMutex)
+ *   lwIP 信号量 (sys_sem_t)    → FreeRTOS 二值信号量 (xSemaphoreCreateBinary)
+ *   lwIP 消息队列 (sys_mbox_t) → FreeRTOS 队列 (xQueueCreate)
+ *   lwIP 线程 (sys_thread_t)   → FreeRTOS 任务 (xTaskCreate)
+ *   lwIP 时间 (sys_now)        → FreeRTOS tick 计数 (xTaskGetTickCount)
+ *   lwIP 临界区 (sys_arch_protect) → FreeRTOS taskENTER_CRITICAL
+ *
+ * 本文件基于 lwIP 官方 FreeRTOS 移植模板，适配 STM32F407 + FreeRTOS。
+ */
 #include "lwip/debug.h"
 #include "lwip/def.h"
 #include "lwip/sys.h"
@@ -80,7 +99,9 @@ static SemaphoreHandle_t sys_arch_protect_mutex;
 static sys_prot_t sys_arch_protect_nesting;
 #endif
 
-/* Initialize this module (see description in sys.h) */
+/* 模块初始化（lwIP 启动时调一次）。
+ * 当前配置 LWIP_FREERTOS_SYS_ARCH_PROTECT_USES_MUTEX=0，
+ * 用 taskENTER_CRITICAL 做临界区保护，不需要初始化互斥锁。 */
 void
 sys_init(void)
 {
@@ -96,6 +117,8 @@ sys_init(void)
 #error This port requires 32 bit ticks or timer overflow will fail
 #endif
 
+/* 返回当前毫秒时间戳（lwIP 超时计算用）。
+ * 基于 FreeRTOS tick 计数换算：tick × portTICK_PERIOD_MS = 毫秒 */
 #if LWIP_FREERTOS_SYS_NOW_FROM_FREERTOS
 u32_t
 sys_now(void)
@@ -104,6 +127,7 @@ sys_now(void)
 }
 #endif
 
+/* 返回当前 jiffies（内核 tick 计数，用于 lwIP 内部时间统计） */
 u32_t
 sys_jiffies(void)
 {
@@ -111,6 +135,13 @@ sys_jiffies(void)
 }
 
 #if SYS_LIGHTWEIGHT_PROT
+
+/* ===== 临界区保护（lwIP 轻量级保护）=====
+ * sys_arch_protect：进入临界区（关中断/调度），返回保护标记
+ * sys_arch_unprotect：退出临界区（恢复中断/调度）
+ *
+ * 当前配置用 taskENTER_CRITICAL/EXIT_CRITICAL（关中断），
+ * 不用递归互斥锁（更轻量，但临界区内不可阻塞）。 */
 
 sys_prot_t
 sys_arch_protect(void)
@@ -221,6 +252,9 @@ sys_mutex_free(sys_mutex_t *mutex)
 
 #endif /* !LWIP_COMPAT_MUTEX */
 
+/* ===== lwIP 信号量（映射到 FreeRTOS 二值信号量）===== */
+
+/* 创建信号量。initial_count: 0=初始不可用, 1=初始可用 */
 err_t
 sys_sem_new(sys_sem_t *sem, u8_t initial_count)
 {
@@ -293,6 +327,10 @@ sys_sem_free(sys_sem_t *sem)
   sem->sem = NULL;
 }
 
+/* ===== lwIP 消息队列（映射到 FreeRTOS 队列）=====
+ * lwIP 用消息队列在 tcpip 线程和其他线程之间传递数据包和回调。 */
+
+/* 创建消息队列。size = 队列容量（消息数） */
 err_t
 sys_mbox_new(sys_mbox_t *mbox, int size)
 {
@@ -437,6 +475,8 @@ sys_mbox_free(sys_mbox_t *mbox)
   SYS_STATS_DEC(mbox.used);
 }
 
+/* ===== lwIP 线程（映射到 FreeRTOS 任务）=====
+ * lwIP 的 tcpip 线程和 netconn API 线程通过此函数创建。 */
 sys_thread_t
 sys_thread_new(const char *name, lwip_thread_fn thread, void *arg, int stacksize, int prio)
 {

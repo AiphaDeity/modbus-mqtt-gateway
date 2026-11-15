@@ -124,18 +124,21 @@ static bool notice_uint(const char **cursor, const char *key, uint32_t *out)
     return true;
 }
 
-/* hex 字符串转字节数组（sha256: 64 hex char → 32B） */
+/* hex 字符串转字节数组（sha256: 64 hex char → 32B）
+ * 返回 0=成功，-1=长度不符或含非法字符
+ * 用于把通知 JSON 里的 sha256 hex 字符串转成 32 字节摘要 */
 static int hex_to_bytes(const char *hex, uint8_t *out, int out_max)
 {
     int len = strlen(hex);
-    if (len != out_max * 2) return -1;
+    if (len != out_max * 2) return -1;   /* hex 字符数必须 = 字节数×2 */
     for (int i = 0; i < out_max; i++)
     {
         char hi = hex[i * 2], lo = hex[i * 2 + 1];
+        /* hex 字符转数值：0-9/a-f/A-F */
         int h = (hi >= '0' && hi <= '9') ? hi - '0' : (hi >= 'a' && hi <= 'f') ? hi - 'a' + 10 : (hi >= 'A' && hi <= 'F') ? hi - 'A' + 10 : -1;
         int l = (lo >= '0' && lo <= '9') ? lo - '0' : (lo >= 'a' && lo <= 'f') ? lo - 'a' + 10 : (lo >= 'A' && lo <= 'F') ? lo - 'A' + 10 : -1;
         if (h < 0 || l < 0) return -1;
-        out[i] = (uint8_t)((h << 4) | l);
+        out[i] = (uint8_t)((h << 4) | l);   /* 高 4 位 + 低 4 位拼一个字节 */
     }
     return 0;
 }
@@ -218,6 +221,9 @@ static void report_status(const char *task_id, const char *phase, const char *de
     MqttClient_PublishQos1(topic, (const uint8_t *)buf, (size_t)len);
 }
 
+/* 上报下载进度（偏移量 + 总大小）
+ * JSON: {"task_id":"...","phase":"downloading","offset":4096,"total":262144}
+ * 每 16KB 上报一次，避免频繁 PUBLISH 占带宽 */
 static void report_progress(const char *task_id, uint32_t offset, uint32_t total)
 {
     const char *topic = MqttClient_TopicOtaStatus();
@@ -229,19 +235,20 @@ static void report_progress(const char *task_id, uint32_t offset, uint32_t total
     MqttClient_PublishQos1(topic, (const uint8_t *)buf, (size_t)len);
 }
 
+/* 阶段编号 → 可读字符串（供云端和日志显示） */
 static const char *phase_to_string(int phase)
 {
     switch (phase)
     {
-        case 0: return "idle";
-        case 1: return "downloading";
-        case 2: return "verifying";
-        case 3: return "ready";
-        case 4: return "rebooting";
-        case 5: return "installed";
-        case 6: return "failed";
-        case 7: return "trial";
-        case 8: return "rolled_back";
+        case 0: return "idle";         /* 空闲 */
+        case 1: return "downloading";  /* 下载中 */
+        case 2: return "verifying";    /* 校验中（SHA256+签名） */
+        case 3: return "ready";        /* 校验通过，准备重启 */
+        case 4: return "rebooting";    /* 正在重启 */
+        case 5: return "installed";    /* 安装确认（Boot 核验通过） */
+        case 6: return "failed";       /* 失败 */
+        case 7: return "trial";        /* 试运行（Boot 核验通过但未确认） */
+        case 8: return "rolled_back";  /* 回退到已确认的旧镜像 */
         default: return "unknown";
     }
 }
@@ -326,13 +333,17 @@ static void cleanup_attempt(const UpgradeEntryPeer *peer)
     s_cleanup_pending = !closed;
 }
 
-/* ===== 下载回调：调 UpgradeEntry_Write ===== */
+/* ===== 下载回调：调 UpgradeEntry_Write =====
+ * 由 NetworkDownloader_Fetch 每收到一块数据时回调。
+ * offset = 当前块在整个文件中的字节偏移
+ * data/len = 当前块数据（≤1016B）
+ * 回调里调 M4 的 UpgradeEntry_Write 把数据写入 Flash。 */
 static nw_dl_status_t download_chunk_callback(void *ctx_, uint32_t offset,
                                               const uint8_t *data, uint32_t len)
 {
     nw_download_ctx_t *ctx = (nw_download_ctx_t *)ctx_;
 
-    /* 调 M4 接口写入 */
+    /* 调 M4 接口写入 Flash（UpgradeEntry_Write 内部处理 Flash 写入 + 偏移校验） */
     UpgradeStageResult ret = UpgradeEntry_Write(ctx->peer, ctx->session_id,
                                                 offset, data, len);
     if (ret != UPGRADE_STAGE_OK)
@@ -342,7 +353,7 @@ static nw_dl_status_t download_chunk_callback(void *ctx_, uint32_t offset,
         return NW_DL_ERR_CALLBACK;
     }
 
-    /* 上报进度（每 16KB 上报一次，避免频繁 PUBLISH） */
+    /* 上报进度（每 16KB 上报一次，用位运算判断是否跨越 16KB 边界） */
     if ((offset & ~0x3FFF) != ((offset + len) & ~0x3FFF))
     {
         report_progress(ctx->task_id, offset + len, ctx->total_size);
@@ -471,7 +482,7 @@ AppModuleInitResult NetworkUpgrade_Init(void)
     return tls_ret == HTTPS_TLS_OK ? APP_MODULE_INIT_OK : APP_MODULE_INIT_NOT_READY;
 }
 
-/* ===== MQTT 回调收到升级通知 ===== */
+// MQTT任务解析通知并计算摘要；返回0仅表示排队受理，签名与UTC许可由升级任务核验。
 int NetworkUpgrade_Notify(const char *json)
 {
     if (!json) return -1;
@@ -604,7 +615,7 @@ void NetworkUpgrade_Task(void *argument)
 
         UpgradeEntryPeer peer =
         {
-            .source = UPGRADE_STAGE_SOURCE_NETWORK,
+            .source = UPGRADE_STAGE_SOURCE_NETWORK,   /* 来源：网络下载 */
             .epoch = epoch,
         };
 
@@ -625,7 +636,8 @@ void NetworkUpgrade_Task(void *argument)
         }
         printf("[NWUPG] Begin OK: session=%u epoch=%u\r\n", (unsigned)session_id, (unsigned)epoch);
 
-        /* ② 下载（回调里调 Write） */
+        /* ② 下载（回调里调 Write 写 Flash）
+         * 构造下载参数：URL + auth_token + 回调 + chunk_size */
         nw_download_ctx_t dl_ctx =
         {
             .peer = &peer,
@@ -645,7 +657,7 @@ void NetworkUpgrade_Task(void *argument)
             .url = req.url,
             .auth_token = (req.token[0] != '\0') ? req.token : NULL,
             .total_size = req.size,
-            .cb = download_chunk_callback,
+            .cb = download_chunk_callback,            /* 每块回调写 Flash */
             .ctx = &dl_ctx,
             .timeout_ms = lease_ms < 120000 ? (uint32_t)lease_ms : 120000U,
             .chunk_size = UPGRADE_STAGE_MAX_CHUNK_SIZE,
@@ -663,7 +675,8 @@ void NetworkUpgrade_Task(void *argument)
             continue;
         }
 
-        /* ③ Finish（校验 + 提交 READY + 暂停业务） */
+        /* ③ Finish：M4 校验 SHA256 + 签名 → 提交 READY 状态 → 暂停业务
+         * Finish 成功 = 固件已完整写入 Flash 且校验通过，可以重启了 */
         s_phase = 2;
         report_status(req.task_id, "verifying", NULL);
 
@@ -683,7 +696,10 @@ void NetworkUpgrade_Task(void *argument)
         report_status(req.task_id, "ready", NULL);
         osDelay(1000);   /* 给云端 1s 收到 status 的时间 */
 
-        /* ④ Reboot */
+        /* ④ Reboot：M4 重启设备
+         * 重启后 Boot 核验新固件：通过 → 启动新 App → 上报 trial/confirmed
+         *                          失败 → 回滚旧固件 → 上报 rolled_back
+         * Reboot 成功不会返回（设备已重启），返回则说明失败 */
         s_phase = 4;
         report_status(req.task_id, "rebooting", NULL);
         ret = UpgradeEntry_Reboot(&peer, session_id);
@@ -696,15 +712,24 @@ void NetworkUpgrade_Task(void *argument)
     }
 }
 
-/* 只消费M4已核验的本次启动快照；同一结果在broker确认前保留并重试。 */
+/* ===== 启动结果上报 =====
+ * 设备重启后，Boot 核验新固件的结果（trial/confirmed/rolled_back）需要上报给云端。
+ * 由升级任务空闲时调用（每秒检查一次），通过 QoS1 发到 ota_status topic。
+ * 只消费M4已核验的本次启动快照；同一结果在broker确认前保留并重试。
+ *
+ * Boot 核验结果含义：
+ *   trial        = 新固件启动成功但未确认（试运行，可回滚）
+ *   confirmed    = 新固件确认安装（App 主动确认后不可回滚）
+ *   rolled_back  = 新固件启动失败，Boot 自动回滚到旧固件 */
 static void report_boot_result(void)
 {
-    if (s_boot_result_done) return;
+    if (s_boot_result_done) return;   /* 已上报成功，不重复 */
 
+    /* 从 M4 获取本次启动的身份信息（tx_id + sequence + digest） */
     UpgradeMessage identity;
     if (!App_UpgradeGetStartupIdentity(&identity))
     {
-        s_boot_result_done = true;
+        s_boot_result_done = true;   /* 无升级身份 = 非升级启动，不需要上报 */
         return;
     }
     AppUpgradeResult result = App_UpgradeGetResult();
@@ -713,15 +738,15 @@ static void report_boot_result(void)
     const char *phase;
     switch (result)
     {
-        case APP_UPGRADE_RESULT_TRIAL:
+        case APP_UPGRADE_RESULT_TRIAL:        /* 试运行 */
             phase = "trial";
             s_phase = 7;
             break;
-        case APP_UPGRADE_RESULT_CONFIRMED:
+        case APP_UPGRADE_RESULT_CONFIRMED:    /* 确认安装 */
             phase = "confirmed";
             s_phase = 5;
             break;
-        case APP_UPGRADE_RESULT_ROLLED_BACK:
+        case APP_UPGRADE_RESULT_ROLLED_BACK:  /* 回滚 */
             phase = "rolled_back";
             s_phase = 8;
             break;
@@ -729,6 +754,7 @@ static void report_boot_result(void)
             return;
     }
 
+    /* digest(32B) → hex 字符串(64字符)，用于云端校验固件指纹 */
     char digest[65];
     static const char hex[] = "0123456789abcdef";
     for (size_t i = 0; i < sizeof(identity.digest); i++)
@@ -738,6 +764,8 @@ static void report_boot_result(void)
     }
     digest[64] = '\0';
 
+    /* 拼启动结果 JSON：
+     * {"type":"boot_result","tx_id":"...","sequence":N,"phase":"trial","image_sha256":"..."} */
     char payload[256];
     int len = snprintf(payload, sizeof(payload),
         "{\"type\":\"boot_result\",\"tx_id\":\"%08lx%08lx\",\"sequence\":%lu,"
@@ -746,6 +774,8 @@ static void report_boot_result(void)
         (unsigned long)identity.sequence, phase, digest);
     if ((len <= 0) || ((size_t)len >= sizeof(payload))) return;
 
+    /* 用 PublishUpgradeResult 发送（复用 QoS1 槽，等 PUBACK 确认）
+     * 返回 1 = PUBACK 已到（broker 确认），标记完成不再重发 */
     if (MqttClient_PublishUpgradeResult((const uint8_t *)payload, (size_t)len) == 1)
     {
         s_boot_result_done = true;
