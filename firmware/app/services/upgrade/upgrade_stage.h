@@ -136,6 +136,9 @@ UpgradeStageResult UpgradeStage_Bind(const UpgradeStageBackend *backend, void *c
 // 仅升级执行任务在空闲或已清理ERROR阶段读取；timeout_ms为1～3000 ms，失败清零输出。
 UpgradeStageResult UpgradeStage_ReadBootState(UpgradeStateProtection *state, uint32_t timeout_ms);
 
+// 升级执行任务在空闲时验通知摘要32 B/原始签名64 B，复用操作锁及可信映射；不擦写或分配事务号。
+UpgradeStageResult UpgradeStage_VerifyNotice(const uint8_t *digest, const uint8_t *signature);
+
 /*
  * Begin成功才输出非零会话号，失败输出0；package_sha256可读32 B，不保留指针。
  * 外部调用方通过UpgradeEntry校验权限并绑定本次下载/TF操作；source不是授权凭证。

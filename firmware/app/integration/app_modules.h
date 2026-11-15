@@ -31,6 +31,7 @@ typedef enum
   APP_MODULE_TELEMETRY,
   APP_MODULE_MONITOR,
   APP_MODULE_UPGRADE,
+  APP_MODULE_NETWORK_UPGRADE,
   APP_MODULE_COUNT
 } AppModuleId;
 
@@ -91,5 +92,8 @@ void Monitor_Task(void *argument);
 bool App_GetModuleStackFree(AppModuleId module, uint32_t *bytes);
 // 查询当前任务是否为指定模块已登记的任务。
 bool App_IsCurrentModuleTask(AppModuleId module);
+
+// 在任务上下文汇总C堆扩展峰值、RTOS最低空闲和当前任务栈余量，单位B。
+void AppMemory_Report(const char *phase);
 
 #endif

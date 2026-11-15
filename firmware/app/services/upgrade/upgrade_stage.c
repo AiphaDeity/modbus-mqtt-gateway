@@ -40,14 +40,22 @@ static bool TaskContext(void)
   return (__get_IPSR() == 0U) && (osKernelGetState() == osKernelRunning);
 }
 
-// 排除业务和监督任务，并检查当前任务的历史最小空闲栈。
+// 排除业务和监督任务，按当前栈指针检查本次调用可用的栈空间。
 bool UpgradeStage_ExecutorAllowed(void)
 {
-  return TaskContext() && !App_IsCurrentModuleTask(APP_MODULE_STORAGE)
-      && !App_IsCurrentModuleTask(APP_MODULE_MQTT) && !App_IsCurrentModuleTask(APP_MODULE_MODBUS)
-      && !App_IsCurrentModuleTask(APP_MODULE_MONITOR)
-      && ((uint32_t)uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t)
-          >= UPGRADE_EXECUTOR_MIN_FREE_STACK_BYTES);
+  if (!TaskContext() || App_IsCurrentModuleTask(APP_MODULE_STORAGE)
+      || App_IsCurrentModuleTask(APP_MODULE_MQTT) || App_IsCurrentModuleTask(APP_MODULE_MODBUS)
+      || App_IsCurrentModuleTask(APP_MODULE_MONITOR))
+  {
+    return false;
+  }
+  TaskStatus_t task_status;
+  vTaskGetInfo(NULL, &task_status, pdFALSE, eRunning);
+  uintptr_t stack_base = (uintptr_t)task_status.pxStackBase;
+  uintptr_t stack_pointer = (uintptr_t)__get_PSP();
+  // Cortex-M4栈向低地址增长；历史最低余量仍由监督任务检查。
+  return (stack_pointer >= stack_base)
+      && ((stack_pointer - stack_base) >= UPGRADE_EXECUTOR_MIN_FREE_STACK_BYTES);
 }
 
 // 长操作期间不关闭中断；其他修改请求返回BUSY，查询仍可读取上次完整快照。
@@ -250,6 +258,30 @@ UpgradeStageResult UpgradeStage_Bind(const UpgradeStageBackend *adapter, void *c
   backend_context = context;
   backend_ready = true;
   return ReleaseOperation(UPGRADE_STAGE_OK);
+}
+
+// 通知验签独占原Stage操作边界，避免与TF包认证或TLS所在网络会话并发。
+UpgradeStageResult UpgradeStage_VerifyNotice(const uint8_t *digest, const uint8_t *signature)
+{
+  if (!UpgradeStage_ExecutorAllowed())
+  {
+    return UPGRADE_STAGE_MODE;
+  }
+  UpgradeStageResult result = TakeOperation();
+  if (result != UPGRADE_STAGE_OK)
+  {
+    return result;
+  }
+  if (!backend_ready)
+  {
+    return ReleaseOperation(UPGRADE_STAGE_NOT_READY);
+  }
+  if (storage_open || ((session.phase != UPGRADE_STAGE_IDLE) && (session.phase != UPGRADE_STAGE_ERROR))
+      || (session.commit_state == UPGRADE_COMMIT_UNKNOWN) || (session.resume_error != UPGRADE_STAGE_OK))
+  {
+    return ReleaseOperation(UPGRADE_STAGE_BUSY);
+  }
+  return ReleaseOperation(UpgradeStage_AuthenticateNotice(&backend, backend_context, digest, signature));
 }
 
 // 与收包共用修改占用，避免只读查询抢用存储请求和应答工作区。

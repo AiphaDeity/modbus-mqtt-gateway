@@ -7,12 +7,14 @@
  * 编译：
  *   arm-none-eabi-gcc -mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 -mfloat-abi=hard -Os \
  *     '-DMBEDTLS_CONFIG_FILE="https_tls_mbedtls_config.h"' \
- *     -Itools -Ifirmware/shared -Ifirmware/app/services/upgrade \
- *     -Ifirmware/bootloader/third_party/mbedtls/include \
- *     -Ifirmware/bootloader/third_party/mbedtls/library \
- *     -c tools/sizeof_extract.c -o build/sizeof_extract.o
+ *     -Ifirmware/shared \
+ *     -Ifirmware/third_party/mbedtls/include \
+ *     -Ifirmware/third_party/mbedtls/library \
+ *     -c tools/sizeof_extract.c -o build/AppDebug/sizeof_extract.o
  * 读值：
- *   arm-none-eabi-nm -S --size-sort build/sizeof_extract.o   (Size 列即 sizeof)
+ *   arm-none-eabi-nm -S --size-sort build/AppDebug/sizeof_extract.o   (Size 列即 sizeof)
+ * 从仓库根目录执行，沿用固件的 firmware/shared/https_tls_mbedtls_config.h。
+ * 此对象仅用于测量，不加入固件链接；以上续行写法适用于 Bash。
  */
 #include "mbedtls/build_info.h"
 #include "mbedtls/ssl.h"

@@ -109,7 +109,7 @@ int main(void)
   MX_DMA_Init();
   MX_ETH_Init();
   MX_I2C1_Init();
-  MX_SPI2_Init();
+  MX_SPI3_Init();
   MX_USART2_UART_Init();
   MX_USART3_UART_Init();
   MX_TIM7_Init();
@@ -120,7 +120,7 @@ int main(void)
   // 仅汇总早期初始化不喂狗区间，不因日志而额外刷新IWDG。
   printf("WDG BUDGET app peripherals elapsed_ms=%lu\r\n",
          (unsigned long)(HAL_GetTick() - watchdog_peripherals_started_ms));
-  printf("Gateway boot\r\n");
+  printf("Gateway boot V122\r\n");
   uint32_t reset_flags = RCC->CSR;
   printf("[BOOT] reset: POR=%d BOR=%d PIN=%d SW=%d IWDG=%d WWDG=%d LPWR=%d CSR=0x%08lX\r\n",
          (reset_flags & RCC_CSR_PORRSTF) ? 1 : 0, (reset_flags & RCC_CSR_BORRSTF) ? 1 : 0,

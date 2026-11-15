@@ -15,7 +15,7 @@ typedef struct
 
 // 启动装配、所有升级入口开放前绑定一次；不可ISR/并发调用，不复制密钥内容。
 bool UpgradeTrust_Bind(const UpgradeTrustKeys *keys);
-// 普通F407构建只读已锁定OTP；测试根与平台实现隔离，未配置时拒绝映射。
+// 普通F407构建只读Boot预留区；测试根与平台实现隔离，未配置时拒绝映射。
 bool UpgradeTrust_ReadPlatform(UpgradeTrustKeys *keys);
 // 读取平台保护区映射并绑定；缺少映射或校验失败时返回 false。
 bool UpgradeTrust_Initialize(void);

@@ -21,11 +21,14 @@ __attribute__((weak)) bool UpgradeTrust_ReadPlatform(UpgradeTrustKeys *keys)
 // 读取并绑定平台密钥映射，已有绑定时直接返回。
 bool UpgradeTrust_Initialize(void)
 {
+  // 已绑定时直接返回
   if (bound)
   {
     return true;
   }
+  // 准备一个局部结构体 keys
   UpgradeTrustKeys keys = {0};
+  // 从 Boot 预留区读取并检查平台资料，读取成功，才会保存映射
   return UpgradeTrust_ReadPlatform(&keys) && UpgradeTrust_Bind(&keys);
 }
 

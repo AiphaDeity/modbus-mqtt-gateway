@@ -6,10 +6,8 @@
  * 关键约束：
  *   - 写槽顺序：先写 header+payload+crc，最后单独写提交尾标 commit。
  *     掉电中断时 commit 不完整，读取方因 commit/crc 校验失败自动丢弃半成品。
- *   - 双区：当前区写满后，回收另一区（64KB 块擦除 × 8），再切换过去。
- *     回收在 maintenance() 中推进，期间 append 返回 HAL_BUSY。
- *   - 去重：内存中保留最近 128 条记录的 (stream, dedup_key)，启动时从
- *     两个区重放恢复；因此重启后仍能抑制重复执行。
+ *   - 当前区写满后只回收无已提交记录的另一区，不提前遗忘有效记录。
+ *   - 非零去重键查询两个保留区；同键异内容报错，不以RAM缓存代替持久记录。
  */
 
 #include "storage_runtime.h"
@@ -27,7 +25,6 @@
 #define CTRLLOG_HEADER_SIZE 32U
 #define CTRLLOG_COMMIT_OFF  (CTRLLOG_SLOT_SIZE - sizeof(uint32_t))
 #define CTRLLOG_SLOT_COUNT  (FLASH_CTRLLOG_AREA_SIZE / CTRLLOG_SLOT_SIZE)
-#define CTRLLOG_DEDUP_KEEP  128U
 
 /* header 字段偏移 */
 #define OFF_MAGIC   0U
@@ -48,11 +45,6 @@ static uint32_t s_next_slot = 0;  /* 当前区下一个候选槽 */
 static uint64_t s_last_seq = 0;
 static uint32_t s_erase_offset;
 static int      s_erasing  = -1;  /* >=0 表示正在回收该区 */
-
-/* 去重索引（最近 128 条） */
-static uint64_t s_key[CTRLLOG_DEDUP_KEEP];
-static uint16_t s_key_stream[CTRLLOG_DEDUP_KEEP];
-static uint32_t s_key_count = 0;
 
 /* ---------- 工具函数 ---------- */
 
@@ -139,15 +131,6 @@ static bool parse_slot(const uint8_t *buf, ctrllog_record_t *rec)
     return true;
 }
 
-/* 读取一个槽并解析 */
-static bool slot_read_valid(int zone, uint32_t index, ctrllog_record_t *rec)
-{
-    uint8_t buf[CTRLLOG_SLOT_SIZE];
-    if (storage_flash_read(slot_addr(zone, index), buf, CTRLLOG_SLOT_SIZE) != HAL_OK)
-        return false;
-    return parse_slot(buf, rec);
-}
-
 /* 扫描一个区：返回有效记录数，最大 seq 及所在槽位；SPI 读失败返回错误 */
 static HAL_StatusTypeDef scan_zone(int zone, uint32_t *count,
                                    uint64_t *max_seq, uint32_t *max_seq_slot)
@@ -177,48 +160,40 @@ static HAL_StatusTypeDef scan_zone(int zone, uint32_t *count,
     return HAL_OK;
 }
 
-/* 从 s_next_slot 起找到第一个已擦除槽 */
-static bool find_writable_slot(void)
+/* 找到空槽返回OK，确实写满返回BUSY；读失败不能触发回收。 */
+static HAL_StatusTypeDef find_writable_slot(void)
 {
     uint8_t buf[CTRLLOG_SLOT_SIZE];
 
     for (uint32_t i = s_next_slot; i < CTRLLOG_SLOT_COUNT; i++) {
         if (storage_flash_read(slot_addr(s_active, i), buf, CTRLLOG_SLOT_SIZE) != HAL_OK)
-            return false;
+            return HAL_ERROR;
         if (slot_is_erased(buf)) {
             s_next_slot = i;
-            return true;
+            return HAL_OK;
         }
     }
     s_next_slot = CTRLLOG_SLOT_COUNT;
-    return false;
+    return HAL_BUSY;
 }
 
-/* ---------- 去重索引 ---------- */
+/* 去重比较只在同步遍历期间借用调用方数据，不保存其指针。 */
+typedef struct {
+    uint16_t stream, len;
+    uint64_t key;
+    const void *payload;
+    bool found, conflict;
+} dedup_query_t;
 
-static void dedup_reset(void)
+/* 相同键必须同时匹配完整内容，冲突不能被另一条匹配记录掩盖。 */
+static void dedup_visit(const ctrllog_record_t *rec, void *user)
 {
-    memset(s_key, 0, sizeof(s_key));
-    memset(s_key_stream, 0, sizeof(s_key_stream));
-    s_key_count = 0;
-}
-
-static bool dedup_contains(uint16_t stream, uint64_t key)
-{
-    if (key == 0) return false;
-    for (uint32_t i = 0; i < CTRLLOG_DEDUP_KEEP; i++) {
-        if (s_key[i] == key && s_key_stream[i] == stream) return true;
-    }
-    return false;
-}
-
-static void dedup_insert(uint16_t stream, uint64_t key)
-{
-    if (key == 0) return;
-    uint32_t pos = s_key_count % CTRLLOG_DEDUP_KEEP;
-    s_key[pos] = key;
-    s_key_stream[pos] = stream;
-    s_key_count++;
+    dedup_query_t *query = user;
+    if (rec->stream != query->stream || rec->dedup_key != query->key) return;
+    query->found = true;
+    if (rec->payload_len != query->len ||
+        (query->len != 0U && memcmp(rec->payload, query->payload, query->len) != 0))
+        query->conflict = true;
 }
 
 /* ---------- 对外 API ---------- */
@@ -234,7 +209,6 @@ HAL_StatusTypeDef storage_ctrllog_init(void)
     s_erasing  = -1;
     s_last_seq = 0;
     s_next_slot = 0;
-    dedup_reset();
 
     if (scan_zone(0, &cnt0, &seq0, &slot0) != HAL_OK) return HAL_ERROR;
     if (scan_zone(1, &cnt1, &seq1, &slot1) != HAL_OK) return HAL_ERROR;
@@ -256,22 +230,6 @@ HAL_StatusTypeDef storage_ctrllog_init(void)
         s_last_seq = (s_active == 0 ? seq0 : seq1);
     }
 
-    /* 重放去重键：旧区先、当前区后，保证"最近优先" */
-    int order[2] = { 1 - s_active, s_active };
-    for (int k = 0; k < 2; k++) {
-        for (uint32_t i = 0; i < CTRLLOG_SLOT_COUNT; i++) {
-            ctrllog_record_t rec;
-            uint8_t buf[CTRLLOG_SLOT_SIZE];
-            if (storage_flash_read(slot_addr(order[k], i), buf, CTRLLOG_SLOT_SIZE) != HAL_OK)
-                return HAL_ERROR;
-            if (!parse_slot(buf, &rec)) {
-            if (get_u32(buf + CTRLLOG_COMMIT_OFF) == CTRLLOG_COMMIT) return HAL_ERROR;
-            continue;
-        }
-            dedup_insert(rec.stream, rec.dedup_key);
-        }
-    }
-
     s_inited = true;
     return HAL_OK;
 }
@@ -290,13 +248,24 @@ static HAL_StatusTypeDef storage_ctrllog_append_impl(uint16_t stream, uint64_t d
     if (s_erasing >= 0) return HAL_BUSY;
 
     /* 去重 */
-    if (dedup_contains(stream, dedup_key)) {
-        if (is_duplicate != NULL) *is_duplicate = true;
-        return HAL_OK;
+    if (dedup_key != 0U) {
+        dedup_query_t query = { stream, len, dedup_key, payload, false, false };
+        HAL_StatusTypeDef status = storage_ctrllog_foreach(dedup_visit, &query);
+        if (status != HAL_OK || query.conflict) return HAL_ERROR;
+        if (query.found) {
+            if (is_duplicate != NULL) *is_duplicate = true;
+            return HAL_OK;
+        }
     }
 
-    /* 当前区写满则启动回收，本次返回忙 */
-    if (s_next_slot >= CTRLLOG_SLOT_COUNT || !find_writable_slot()) {
+    /* 不知道记录是否过期及可靠输出时，不能擦除已提交记录。 */
+    HAL_StatusTypeDef space = find_writable_slot();
+    if (space != HAL_OK) {
+        if (space != HAL_BUSY) return space;
+        uint32_t count, last_slot;
+        uint64_t last_seq;
+        if (scan_zone(1 - s_active, &count, &last_seq, &last_slot) != HAL_OK) return HAL_ERROR;
+        if (count != 0U) return HAL_BUSY;
         s_erase_offset = 0U;
         s_erasing = 1 - s_active;
         return HAL_BUSY;
@@ -335,12 +304,13 @@ static HAL_StatusTypeDef storage_ctrllog_append_impl(uint16_t stream, uint64_t d
 
     /* 3) 回读校验 */
     ctrllog_record_t verify;
-    if (!slot_read_valid(s_active, s_next_slot, &verify) || verify.seq != seq)
+    if (storage_flash_read(addr, slot, sizeof(slot)) != HAL_OK || !parse_slot(slot, &verify) ||
+        verify.seq != seq || verify.stream != stream || verify.dedup_key != dedup_key ||
+        verify.payload_len != len || (len != 0U && memcmp(verify.payload, payload, len) != 0))
         return HAL_ERROR;
 
     s_next_slot++;
     s_last_seq = seq;
-    dedup_insert(stream, dedup_key);
     return HAL_OK;
 }
 
@@ -353,7 +323,13 @@ HAL_StatusTypeDef storage_ctrllog_foreach(ctrllog_visit_fn fn, void *user)
     for (int k = 0; k < 2; k++) {
         for (uint32_t i = 0; i < CTRLLOG_SLOT_COUNT; i++) {
             ctrllog_record_t rec;
-            if (!slot_read_valid(order[k], i, &rec)) continue;
+            uint8_t buf[CTRLLOG_SLOT_SIZE];
+            if (storage_flash_read(slot_addr(order[k], i), buf, sizeof(buf)) != HAL_OK)
+                return HAL_ERROR;
+            if (!parse_slot(buf, &rec)) {
+                if (get_u32(buf + CTRLLOG_COMMIT_OFF) == CTRLLOG_COMMIT) return HAL_ERROR;
+                continue;
+            }
             fn(&rec, user);
         }
     }

@@ -4,10 +4,10 @@
 
 #include <string.h>
 
-static UpgradeMessage confirmation;
-static bool have_confirmation;
+static UpgradeMessage confirmation;  // 读出的消息
+static bool have_confirmation;  // 是否接受为候选确认消息
 
-// 判断是软件复位，并且在邮箱中读出数据，并且是升级或者恢复
+// 接收并保存候选确认消息
 void Boot_TrialBegin(volatile uint32_t *mailbox, bool software_reset)
 {
   have_confirmation = software_reset && UpgradeMailbox_Read(mailbox, &confirmation)

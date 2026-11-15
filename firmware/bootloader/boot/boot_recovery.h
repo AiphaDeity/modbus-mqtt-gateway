@@ -21,7 +21,7 @@ typedef UpgradeRecoveryRecord Boot_RecoveryState;
 #define BOOT_RECOVERY_BLOCKED UPGRADE_RECOVERY_BLOCKED
 
 /*
- * 同步普通上下文，调用方独占SPI2，输出失败清零。
+ * 同步普通上下文，调用方独占SPI3，输出失败清零。
  * EMPTY只表示启动屏障为空白；屏障已写而无有效记录必须留恢复，不回退普通启动。
  */
 Boot_UpgradeResult Boot_RecoveryLoad(Boot_RecoveryState *state);

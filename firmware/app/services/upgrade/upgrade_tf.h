@@ -4,9 +4,11 @@
 #include "upgrade_entry.h"
 #include "app_modules.h"
 
-// 装配时绑定按键操作授权；任务轮询PA0，长按至少3s后松开导入固定文件。
+// 任务轮询PA0，长按至少3s后松开导入固定文件；不自行绑定入口权限策略。
 AppModuleInitResult UpgradeTf_Init(void);
 void UpgradeTf_Task(void *argument);
+// 供装配层唯一策略只读查询：核对实体按键许可、操作epoch及升级执行任务。
+bool UpgradeTf_Authorize(const UpgradeEntryPeer *peer);
 
 typedef struct
 {

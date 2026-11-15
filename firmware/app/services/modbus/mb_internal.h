@@ -24,6 +24,7 @@ void mb_fire_cfg_change(mb_cfg_change_reason_t reason, uint8_t slave_id);
 /* 升级接入仅由本模块调用；配置准入必须成对归还。 */
 bool mb_runtime_init(void);
 bool mb_runtime_poll_begin(void);
+bool mb_runtime_configured_slave(uint8_t slave_id);
 void mb_runtime_poll_end(void);
 bool mb_runtime_paused(void);
 bool mb_runtime_config_begin(void);

@@ -11,10 +11,10 @@
 #include "mb_internal.h"
 #include "main.h"
 #include "mb_pointmap.h"
-#include "mb_fixed_points.h"
 #include "app_monitor.h"
 #include "upgrade_quiesce.h"
 #include <stdio.h>
+#include <string.h>
 
 
 /* ========= 全局变量定义（mb_internal.h 里 extern 给其他文件）========= */
@@ -89,7 +89,8 @@ static uint8_t mb_poll_idle(void)
     for (uint8_t i = 0; i < mb_handle->slave_max_num; i++)
     {
         mb_slave_runtime_t *slave = &mb_handle->slave_list[i];
-        if (!slave->valid || !slave->telegram.enable) continue;
+        if (!slave->valid || !slave->telegram.enable ||
+            !mb_runtime_configured_slave(slave->telegram.u8id)) continue;
 
         // 阶梯冷却
         if (slave->consecutive_fail > 0)
@@ -98,7 +99,10 @@ static uint8_t mb_poll_idle(void)
             if ((now - slave->last_trigger_tick) < cooling) continue;
         }
         // 采集周期
-        if ((now - slave->last_trigger_tick) < slave->telegram.collect_interval_ms) continue;
+        uint32_t interval = slave->telegram.collect_interval_ms;
+        if (interval == 0U) interval = AppConfig_Get()->mb_poll_interval_ms;
+        uint32_t interval_ticks = (uint32_t)(((uint64_t)interval * osKernelGetTickFreq() + 999U) / 1000U);
+        if ((now - slave->last_trigger_tick) < interval_ticks) continue;
 
         // 在"已到期"的从站里选最久没采集的那个：
         // 若按数组顺序遇到第一个就返回，排在前面的快周期从站会把后面的从站饿死
@@ -324,6 +328,44 @@ void Modbus_Init(void)
     if (!mb_runtime_init()) MB_LOGE("upgrade runtime init failed");
 }
 
+/** @brief Config任务在采样开放前应用一次总线格式；不重新创建Master任务或点表。 */
+bool Modbus_LoadConfig(const app_config_t *cfg)
+{
+    if (!App_IsCurrentModuleTask(APP_MODULE_CONFIG) || AppConfig_Get() != NULL ||
+        AppConfig_Validate(cfg) != APP_CONFIG_OK || !mb_runtime_ready() ||
+        mb_handle->state != MB_STATE_IDLE || hModbusMaster.i8state != COM_IDLE ||
+        osMessageQueueGetCount(hModbusMaster.QueueTelegramHandle) != 0U ||
+        hModbusMaster.xTypeHW != USART_HW) return false;
+    UART_HandleTypeDef *port = hModbusMaster.port;
+    if (HAL_UART_AbortReceive(port) != HAL_OK) return false;
+    port->Init.BaudRate = cfg->mb_baudrate;
+    port->Init.WordLength = cfg->mb_parity == 0U ? UART_WORDLENGTH_8B : UART_WORDLENGTH_9B;
+    port->Init.Parity = cfg->mb_parity == 0U ? UART_PARITY_NONE :
+                        cfg->mb_parity == 1U ? UART_PARITY_ODD : UART_PARITY_EVEN;
+    port->Init.StopBits = cfg->mb_stop_bits == 1U ? UART_STOPBITS_1 : UART_STOPBITS_2;
+    port->Init.HwFlowCtl = UART_HWCONTROL_NONE;
+    if (HAL_UART_Init(port) != HAL_OK || HAL_UART_Receive_IT(port, &hModbusMaster.dataRX, 1U) != HAL_OK)
+        return false;
+    if (osMutexAcquire(mb_handle->xSlaveCfgMutex, 0U) != osOK) return false;
+    memset(mb_handle->slave_list, 0, sizeof(*mb_handle->slave_list) * mb_handle->slave_max_num);
+    mb_handle->slave_actual_num = 0U;
+    osMutexRelease(mb_handle->xSlaveCfgMutex);
+    return true;
+}
+
+// 启动校验通过后逐站安装点表，未发布运行快照时Poll不会取用半张表。
+bool Modbus_LoadSlave(const modbus_t *config, const mb_point_t *points)
+{
+    if (config == NULL || points == NULL || !App_IsCurrentModuleTask(APP_MODULE_CONFIG) ||
+        AppConfig_Get() != NULL || !mb_runtime_ready() ||
+        osMutexAcquire(mb_handle->xSlaveCfgMutex, 0U) != osOK) return false;
+    modbus_t copy = *config;
+    bool loaded = mb_add_slave_nolock(&copy, NULL) == MB_STATUS_OK &&
+                  mb_pointmap_set_slave_points_nolock(copy.u8id, points) == MB_STATUS_OK;
+    osMutexRelease(mb_handle->xSlaveCfgMutex);
+    return loaded;
+}
+
 /**
  * @brief Modbus Poll 任务入口（在 app_modules.c 里注册）
  *
@@ -355,15 +397,6 @@ void vModbusPollTask(void *argument)
         osDelay(2000);   /* 2 秒一轮，和遥测周期匹配 */
     }
 #else
-    /* 真实 RS485 轮询：应用编译期固定点表（最小配置首次启用入口）
-     * 后续接入 storage_config 持久化后，此处改为"Flash 无配置时降级用固定点表" */
-    if (!mb_fixed_points_apply())
-    {
-        MB_LOGE("固定点表应用失败，Modbus 无从站可轮询");
-        Monitor_ReportFatal(APP_MODULE_MODBUS);
-        return;
-    }
-    MB_LOGI("=== Modbus REAL mode: 4 stations (1 light + 3 water leak) ===");
     for (;;)
     {
         mb_poll_slave();

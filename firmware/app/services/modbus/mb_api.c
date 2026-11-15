@@ -21,7 +21,6 @@ typedef struct
 } mb_write_result_t;
 
 static mb_write_result_t s_write_results[MB_WRITE_QUEUE_DEPTH + 1U];
-static uint32_t s_next_result;
 
 /** @brief 已完成结果也须等同步调用方取走，不能只看请求队列为空。 */
 bool mb_write_results_settled(void)
@@ -157,12 +156,7 @@ static mb_status_e mb_apply_slave_config_impl(mb_cfg_op_t op,
 
 /* ========= 外部写请求 ========= */
 
-/**
- * @brief 外部注入写请求（FC6 / FC16）
- *
- *  MQTT / 配置管理任务调用，请求投入队列后 poll 任务在 IDLE 优先取出。
- *  写入值直接拷贝，调用者传完即可释放。
- */
+// 旧入口没有命令身份、时效及持久受理信息，只保留签名并明确拒绝。
 mb_status_e mb_inject_write(uint8_t slave_id,
                             uint8_t func_code,
                             uint16_t reg_addr,
@@ -172,106 +166,15 @@ mb_status_e mb_inject_write(uint8_t slave_id,
                             mb_errot_t *result_err_out,
                             uint32_t result_timeout_ms)
 {
-    if (mb_handle == NULL)              return MB_HANDLE_STATUS_ERR;
-    if (__get_IPSR() != 0U || osKernelGetState() != osKernelRunning) return MB_UPGRADE_BUSY_ERR;
-    if (result_timeout_ms > INT32_MAX)  return MB_BUILD_REQUEST_ERR;
-    if (result_sem != NULL && !mb_runtime_can_wait()) return MB_UPGRADE_BUSY_ERR;
-    if (write_values == NULL)           return MB_BUILD_REQUEST_ERR;
-    if (func_code != MB_FC_WRITE_REGISTER &&
-        func_code != MB_FC_WRITE_MULTIPLE_REGISTERS &&
-        func_code != MB_FC_WRITE_COIL &&
-        func_code != MB_FC_WRITE_MULTIPLE_COILS)
-                                        return MB_NOT_SUPPORT_FC_ERR;
-    if (reg_count == 0 || reg_count > MB_REG_MAX_PER_SLAVE)
-                                        return MB_BUILD_REQUEST_ERR;
-
-    // FC05/FC06 语义上就是单值，强制 reg_count=1
-    if (func_code == MB_FC_WRITE_COIL || func_code == MB_FC_WRITE_REGISTER)
-        reg_count = 1;
-
-    mb_write_request_t wr;
-    memset(&wr, 0, sizeof(wr));
-    wr.slave_id       = slave_id;
-    wr.func_code      = func_code;
-    wr.reg_addr       = reg_addr;
-
-    if (func_code == MB_FC_WRITE_MULTIPLE_COILS)
-    {
-        // 移植库 FC15 直接把 u16reg[] 按字节发出，期望的是已打包 bit 字：
-        // bit i = 第 i 个线圈（1=合 0=分）。这里把 0/1 数组打包成 bit 字。
-        // wr.reg_count 保持线圈数（移植库据此 ceil(/16) 算字节数）。
-        wr.reg_count = reg_count;
-        for (uint16_t i = 0; i < reg_count; i++)
-        {
-            if (write_values[i])
-                wr.write_values[i / 16U] |= (uint16_t)(1U << (i % 16U));
-        }
-    }
-    else
-    {
-        // FC05：移植库自转 (>0 ? 0xFF00 : 0x0000)，直填 0/1
-        // FC06/16：寄存器值原样
-        wr.reg_count = reg_count;
-        for (uint16_t i = 0; i < reg_count; i++)
-            wr.write_values[i] = write_values[i];
-    }
-
-    if (result_sem == NULL && result_err_out != NULL) return MB_BUILD_REQUEST_ERR;
-    mb_write_result_t *result = NULL;
-    taskENTER_CRITICAL();
-    bool allowed = !mb_runtime_paused() && UpgradeQuiesce_AllowsMutation();
-    if (allowed && result_sem != NULL && s_next_result != UINT32_MAX)
-    {
-        for (uint32_t i = 0U; i < MB_WRITE_QUEUE_DEPTH + 1U; i++)
-        {
-            if (s_write_results[i].id != 0U) continue;
-            result = &s_write_results[i];
-            result->id = ++s_next_result;
-            result->state = MB_RESULT_WAITING;
-            wr.completion_id = result->id;
-            break;
-        }
-    }
-    bool queued = allowed && (result_sem == NULL || result != NULL) &&
-                  osMessageQueuePut(mb_handle->xWriteReqQueue, &wr, 0U, 0U) == osOK;
-    if (!queued && result != NULL) memset(result, 0, sizeof(*result));
-    taskEXIT_CRITICAL();
-    if (!allowed) return MB_UPGRADE_BUSY_ERR;
-    if (!queued)
-    {
-        MB_LOGW("write req queue full, slave=%d", slave_id);
-        return MB_QUEUE_FULL_ERR;
-    }
-
-    // 保留原同步调用方式，后台只更新模块票据；返回后不再持有调用者对象。
-    if (result_sem != NULL)
-    {
-        uint32_t timeout_ms = result_timeout_ms == 0U ? TIMEOUT_MODBUS + 1000U : result_timeout_ms;
-        uint32_t started = HAL_GetTick();
-        for (;;)
-        {
-            taskENTER_CRITICAL();
-            bool expired = (uint32_t)(HAL_GetTick() - started) >= timeout_ms;
-            bool done = result->state == MB_RESULT_DONE;
-            mb_errot_t error = result->error;
-            if (done) memset(result, 0, sizeof(*result));
-            else if (expired) result->state = MB_RESULT_ABANDONED;
-            taskEXIT_CRITICAL();
-            if (done && !expired)
-            {
-                if (result_err_out != NULL) *result_err_out = error;
-                return MB_STATUS_OK;
-            }
-            if (expired)
-            {
-                if (result_err_out != NULL) *result_err_out = ERR_UNKNOWN;
-                return MB_WAIT_TIMEOUT_ERR;
-            }
-            osDelay(1U);
-        }
-    }
-
-    return MB_STATUS_OK;
+    (void)slave_id;
+    (void)func_code;
+    (void)reg_addr;
+    (void)reg_count;
+    (void)write_values;
+    (void)result_sem;
+    (void)result_timeout_ms;
+    if (result_err_out != NULL) *result_err_out = ERR_CONTROL_REJECTED;
+    return MB_CONTROL_REJECTED_ERR;
 }
 
 /* ========= MQTT / 存储方 pull 接口 ========= */

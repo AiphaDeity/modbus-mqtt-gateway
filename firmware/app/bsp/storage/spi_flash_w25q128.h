@@ -3,53 +3,39 @@
 
 #include "stm32f4xx_hal.h"
 #include "cmsis_os2.h"
+#include "flash_partition.h"
 #include <stdbool.h>
 #include <stdint.h>
 
 /*
- * W25Q128 SPI Flash 驱动。
- * 硬件：SPI2，128Mbit = 16MB，4096字节扇区，64KB块。
- * 依赖：CubeMX 已生成 MX_SPI2_Init()，全局句柄 hspi2 可用。
- *       需确认 CS 片选引脚（CS 必须由软件手动拉低/拉高）。
+ * W25Q64 SPI Flash 驱动，沿用原驱动接口。
+ * 硬件：SPI3，8MiB，4096字节扇区，64KiB块。
+ * 依赖：CubeMX 已生成 MX_SPI3_Init()，全局句柄 hspi3 可用。
+ *       PD11/EXT_SPI_FLASH_CS 为片选，原 PE4 和 IMU PE7 始终保持高。
  *
  * 擦除单位为扇区（4KB），写入单位为页（256B）。
  * 擦除会将整个扇区全部置 0xFF，写入前必须先擦除目标区域。
  */
 
-#define W25Q128_FLASH_SIZE_BYTES  (16UL * 1024UL * 1024UL)
+#define W25Q128_FLASH_SIZE_BYTES  FLASH_CAPACITY_BYTES
 #define W25Q128_SECTOR_SIZE_BYTES (4UL * 1024UL)
 #define W25Q128_PAGE_SIZE_BYTES   (256U)
 
 /*
- * SPI2 总线互斥锁（W25Q128 独占 SPI2）。
+ * SPI3 总线互斥锁（外部 Flash 独占 SPI3）。
  * 由 spi_flash_w25q128_init() 创建；下方所有 Flash API 内部已自动加锁，
  * 因此外部（services 层、其他任务）直接调用即可，无需自己加锁。
- * 锁为递归锁，允许在同一线程内嵌套调用（如 write → wait_ready）。
+ * 有界读写将取锁、SPI收发和芯片忙等待计入同一绝对期限。
  */
-extern osMutexId_t g_m3_spi2_mutex;
+extern osMutexId_t g_m3_spi3_mutex;
 
-// 初始化：读 JEDEC ID，确认芯片在线
+// 初始化并检查W25Q64的JEDEC ID，失败不开放存储。
 HAL_StatusTypeDef spi_flash_w25q128_init(void);
 
 // 读 JEDEC ID（3字节，厂家ID + 容量ID），返回 0xFFFFFF 表示失败
 uint32_t spi_flash_w25q128_read_id(void);
 
-// 读数据
-HAL_StatusTypeDef spi_flash_w25q128_read(uint32_t addr, uint8_t *buf, uint32_t len);
-
-// 擦除一个扇区（4KB）
-HAL_StatusTypeDef spi_flash_w25q128_sector_erase(uint32_t addr);
-
-// 块擦除（64KB，地址需 64KB 对齐；用于控制日志整区回收，比扇区擦除快）
-HAL_StatusTypeDef spi_flash_w25q128_block64_erase(uint32_t addr);
-
-// 写数据（自动跨页；目标区域必须先擦除）
-HAL_StatusTypeDef spi_flash_w25q128_write(uint32_t addr, const uint8_t *buf, uint32_t len);
-
-// 等待写入完成（轮询忙位，有超时保护）
-HAL_StatusTypeDef spi_flash_w25q128_wait_ready(uint32_t timeout_ms);
-
-/* 升级专用有界I/O：deadline_ms为HAL绝对毫秒期限，覆盖取锁、SPI和内部忙等待。
+/* 业务和升级共用的有界I/O：deadline_ms为HAL绝对毫秒期限，覆盖取锁、SPI和内部忙等待。
  * read/write每次1~256B；write允许跨页。erase的block64选择64KiB块或4KiB扇区。
  * 返回前结束SPI访问；超时不表示已发出的Flash编程/擦除命令已撤销。 */
 HAL_StatusTypeDef spi_flash_w25q128_read_until(uint32_t addr, uint8_t *buf,
@@ -59,12 +45,7 @@ HAL_StatusTypeDef spi_flash_w25q128_write_until(uint32_t addr, const uint8_t *bu
 HAL_StatusTypeDef spi_flash_w25q128_erase_until(uint32_t addr, bool block64,
                                               uint32_t deadline_ms);
 
-/*
- * 【临时诊断】读状态寄存器，用于定位“写入返回成功但回读校验失败”。
- * SR1(0x05)：bit0 BUSY，bit1 WEL，bit2..4 BP0..2，bit7 SRP0
- * SR2(0x35)：bit0 SRP1
- * 定位完成后可删除这两个函数。
- */
+// 读取状态用于故障诊断；失败返回0xFF，不将该值作为成功或空闲的依据。
 uint8_t spi_flash_w25q128_read_sr1(void);
 uint8_t spi_flash_w25q128_read_sr2(void);
 

@@ -43,7 +43,7 @@ static MonitorModuleHealth health[APP_MODULE_COUNT];
 static bool ModuleRequired(uint32_t module)
 {
 #if !GATEWAY_ENABLE_M2
-  if (module == APP_MODULE_MQTT)
+  if (module == APP_MODULE_MQTT || module == APP_MODULE_NETWORK_UPGRADE)
   {
     return false;
   }
@@ -159,22 +159,31 @@ void Monitor_ReportFatal(AppModuleId module)
   }
 }
 
-// 仅由升级任务报告实际进展，其他执行上下文不代报。
+// 区分TF与网络升级的实际执行任务，不从其他上下文代报进展。
+static AppModuleId UpgradeModule(void)
+{
+  if (App_IsCurrentModuleTask(APP_MODULE_UPGRADE)) return APP_MODULE_UPGRADE;
+  if (App_IsCurrentModuleTask(APP_MODULE_NETWORK_UPGRADE)) return APP_MODULE_NETWORK_UPGRADE;
+  return APP_MODULE_COUNT;
+}
+
+// 升级检查点只更新当前执行任务，其他任务沿用各自的监督。
 bool Monitor_UpgradeProgress(void)
 {
-  return !App_IsCurrentModuleTask(APP_MODULE_UPGRADE)
-      || Monitor_ReportProgress(APP_MODULE_UPGRADE, true);
+  AppModuleId module = UpgradeModule();
+  return module == APP_MODULE_COUNT || Monitor_ReportProgress(module, true);
 }
 
 // 升级任务声明当前同步操作的有界等待，不从其他任务代报其心跳。
 bool Monitor_UpgradeWait(uint32_t timeout_ms)
 {
-  if (!App_IsCurrentModuleTask(APP_MODULE_UPGRADE))
+  AppModuleId module = UpgradeModule();
+  if (module == APP_MODULE_COUNT)
   {
     return true;
   }
   return (timeout_ms > 0U) && (timeout_ms <= UPGRADE_STAGE_PREPARE_TIMEOUT_MS)
-      && Monitor_BeginWait(APP_MODULE_UPGRADE, timeout_ms + 1000U);
+      && Monitor_BeginWait(module, timeout_ms + 1000U);
 }
 
 // 检查各模块进展和栈余量，输出平台及产品就绪结果。
@@ -182,7 +191,6 @@ static bool CheckModuleHealth(bool startup_complete, bool *product_ready)
 {
   bool runtime_healthy = true;
   bool ready = true;
-  uint32_t now_ms = HAL_GetTick();
   for (uint32_t i = 0U; i < APP_MODULE_COUNT; i++)
   {
     if (!ModuleRequired(i))
@@ -191,6 +199,8 @@ static bool CheckModuleHealth(bool startup_complete, bool *product_ready)
     }
     taskENTER_CRITICAL();
     MonitorModuleHealth snapshot = health[i];
+    // 在同一临界区取时间，避免新进展与旧时间相减而被误判超时。
+    uint32_t now_ms = HAL_GetTick();
     taskEXIT_CRITICAL();
     if (!snapshot.registered)
     {

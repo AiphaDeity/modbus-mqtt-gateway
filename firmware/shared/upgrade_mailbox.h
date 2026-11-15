@@ -12,7 +12,7 @@
 
 // Boot/偏移App链接脚本共同保留普通SRAM首64B，启动代码不清零此区域。
 #define UPGRADE_MAILBOX_ADDRESS 0x20000000U
-#define UPGRADE_MAILBOX_WORDS 16U
+#define UPGRADE_MAILBOX_WORDS 16U  // 64B
 
 typedef enum
 {

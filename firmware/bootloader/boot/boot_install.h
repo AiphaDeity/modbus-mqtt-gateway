@@ -5,7 +5,7 @@
 #include "boot_upgrade_state.h"
 
 /*
- * 安装接口在 Boot 主线程同步调用，HAL 时基须运行，调用方独占 SPI2 和 App Flash。
+ * 安装接口在 Boot 主线程同步调用，HAL 时基须运行，调用方独占 SPI3 和 App Flash。
  * 源包及可信公钥 65 B/AES 密钥 32 B 在调用期间有效且不变；接口不保留指针。
  */
 typedef enum

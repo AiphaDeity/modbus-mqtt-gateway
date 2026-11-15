@@ -21,6 +21,16 @@ static uint32_t s_master_tick;
 static uint32_t s_started_tick;
 static osThreadId_t s_poll_owner;
 
+/** @brief 按本次启动固定配置检查从站地址；未配置不允许总线作业。 */
+bool mb_runtime_configured_slave(uint8_t slave_id)
+{
+    const app_config_t *cfg = AppConfig_Get();
+    if (cfg == NULL) return false;
+    for (uint32_t i = 0; i < cfg->mb_slave_count; i++)
+        if (cfg->mb_slave_addr[i] == slave_id) return true;
+    return false;
+}
+
 /** @brief 判断当前操作是否为会改变从站状态的写功能码。 */
 static bool mb_is_write(uint8_t func)
 {
@@ -119,7 +129,8 @@ bool mb_runtime_ready(void)
 bool mb_runtime_poll_begin(void)
 {
     taskENTER_CRITICAL();
-    bool allowed = s_ready && !s_faulted && !s_paused && s_cfg_active == 0U &&
+    bool allowed = s_ready && AppConfig_Get() != NULL &&
+                   !s_faulted && !s_paused && s_cfg_active == 0U &&
                    !s_master_active &&
                    osMessageQueueGetCount(hModbusMaster.QueueTelegramHandle) == 0U;
     if (allowed) s_poll_active = true;
@@ -148,6 +159,7 @@ bool mb_runtime_paused(void)
 bool mb_runtime_config_begin(void)
 {
     if (__get_IPSR() != 0U || osKernelGetState() != osKernelRunning) return false;
+    if (AppConfig_Get() != NULL) return false; // 已发布的配置仅重启切换，不能旁路热改点表。
     taskENTER_CRITICAL();
     bool continuing = s_cfg_active != 0U && s_cfg_owner == osThreadGetId();
     bool allowed = s_ready && !s_faulted && !s_poll_active && !s_master_active &&
@@ -185,7 +197,7 @@ bool mb_runtime_enqueue(modbusHandler_t *handler, const modbus_t *telegram, bool
     taskENTER_CRITICAL();
     bool allowed = handler == &hModbusMaster && osThreadGetId() == s_poll_owner &&
                    s_ready && !s_faulted && !s_paused &&
-                   s_cfg_active == 0U &&
+                   s_cfg_active == 0U && mb_runtime_configured_slave(telegram->u8id) &&
                    (!mb_is_write(telegram->u8fct) || UpgradeQuiesce_AllowsMutation());
     BaseType_t result = pdFAIL;
     if (allowed)
@@ -224,6 +236,7 @@ HAL_StatusTypeDef mb_runtime_transmit(modbusHandler_t *handler)
     bool write_pending = !write || (mb_handle != NULL && mb_handle->waiting_is_write &&
                          mb_handle->pending_write != NULL && mb_write_pending(mb_handle->pending_write));
     bool allowed = handler == &hModbusMaster && s_ready && !s_faulted && !s_paused &&
+                   mb_runtime_configured_slave(handler->u8Buffer[0]) &&
                    s_cfg_active == 0U &&
                    write_pending && (!write || UpgradeQuiesce_AllowsMutation());
     HAL_StatusTypeDef result = HAL_BUSY;
