@@ -1,393 +1,389 @@
 /*
- * storage_config.c — 配置存储服务实现（A/B/C 三槽事务）
- *
- * 依据设计说明书 6.2 节：
- *   三槽各 80KiB，布局为 [头 64B][JSON 最多 64KiB][提交标记 4B]
- *   R = generation 最新且完整的运行槽
- *   S = 最近成功保存槽
- *   候选槽 = 既非 R 也非 S 的槽
- *
- * 事务：BEGIN（擦候选）→ CHUNK（分块写）→ VALIDATE（CRC）→ COMMIT（写标记）
- * M3 只存 JSON 字节流，不解析内容。
+ * storage_config.c — A/B/C配置事务；Storage_Task独占介质。
+ * 本次启动固定运行槽R；保存只更新S，候选不得覆盖R或最近一次S。
  */
-
 #include "storage_runtime.h"
 #include "storage_config.h"
 #include "config_slot.h"
 #include "flash_partition.h"
-#include "spi_flash_w25q128.h"
 #include <string.h>
 
-/* 三槽基址 */
 static const uint32_t slot_base[3] = {
-    FLASH_CONFIG_SLOT_A_BASE,
-    FLASH_CONFIG_SLOT_B_BASE,
-    FLASH_CONFIG_SLOT_C_BASE,
+    FLASH_CONFIG_SLOT_A_BASE, FLASH_CONFIG_SLOT_B_BASE, FLASH_CONFIG_SLOT_C_BASE
 };
+#define JSON_DATA_OFFSET sizeof(config_slot_header_t)
+#define COMMIT_MARKER_OFFSET (FLASH_CONFIG_SLOT_SIZE - 4U)
 
-/* JSON 数据在槽内的偏移（紧跟头部） */
-#define JSON_DATA_OFFSET   sizeof(config_slot_header_t)
-/* 提交标记在槽内的偏移（槽末尾 4 字节） */
-#define COMMIT_MARKER_OFFSET  (FLASH_CONFIG_SLOT_SIZE - 4)
-
-/* 事务状态 */
 typedef struct {
-    bool      active;
-    uint32_t  session_id;
-    int       slot_idx;       /* 候选槽索引 0-2 */
-    uint32_t  total_len;      /* 预期总长度 */
-    uint32_t  written_len;    /* 已写入长度 */
+    bool active;
+    bool failed;
+    bool validated;
+    bool commit_attempted;
+    uint32_t session_id;
+    int slot_idx;
+    uint32_t total_len;
+    uint32_t written_len;
+    uint32_t crc;
 } config_tx_t;
 
-static config_tx_t  s_tx = {0};
-static int          s_r_slot = -1;   /* 当前运行槽索引 */
+static config_tx_t s_tx;
+static int s_r_slot = -1;
+static int s_s_slot = -1;
+static uint32_t s_r_gen;
+static uint32_t s_s_gen;
+static uint32_t s_next_session;
+static uint32_t s_committed_session;
 static bool s_scan_error;
-static uint32_t     s_r_gen  = 0;    /* 当前运行槽 generation */
+static bool s_scanned;
 
-/* ---------- CRC32（标准 CRC-32，多项式 0xEDB88320） ---------- */
-
-static uint32_t crc32_calc(const uint8_t *data, uint32_t len)
+/* 增量CRC-32/ISO-HDLC，调用方负责初值和终值异或。 */
+static uint32_t crc32_update(uint32_t crc, const uint8_t *data, uint32_t len)
 {
-    uint32_t crc = 0xFFFFFFFF;
     for (uint32_t i = 0; i < len; i++) {
         crc ^= data[i];
-        for (int j = 0; j < 8; j++) {
-            crc = (crc >> 1) ^ ((crc & 1) ? 0xEDB88320 : 0);
-        }
+        for (uint32_t bit = 0; bit < 8U; bit++)
+            crc = (crc >> 1U) ^ ((crc & 1U) ? 0xEDB88320U : 0U);
     }
-    return ~crc;
+    return crc;
 }
 
-/* ---------- 槽操作辅助 ---------- */
-
-/* 读取槽的提交标记 */
-static HAL_StatusTypeDef slot_read_marker(int idx, uint32_t *marker)
+/* 只读计算指定槽JSON的CRC，不把整份配置放入RAM。 */
+static HAL_StatusTypeDef slot_crc(int slot, uint32_t len, uint32_t *value)
 {
-    return storage_flash_read(slot_base[idx] + COMMIT_MARKER_OFFSET,
-                                  (uint8_t *)marker, 4);
-}
-
-/* 读取槽的头部 */
-static HAL_StatusTypeDef slot_read_header(int idx, config_slot_header_t *hdr)
-{
-    return storage_flash_read(slot_base[idx], (uint8_t *)hdr,
-                                  sizeof(config_slot_header_t));
-}
-
-/* 检查槽是否完整（头部有效 + 提交标记有效） */
-static bool slot_is_complete(int idx)
-{
-    config_slot_header_t hdr;
-    uint32_t marker;
-    if (slot_read_header(idx, &hdr) != HAL_OK || slot_read_marker(idx, &marker) != HAL_OK) {
-        s_scan_error = true;
-        return false;
-    }
-    if (marker != CONFIG_SLOT_MARKER_VALID) return false;
-    uint32_t crc = crc32_calc((const uint8_t *)&hdr, 16U);
-    if (hdr.magic != CONFIG_SLOT_MAGIC || hdr.header_crc32 != crc ||
-        hdr.json_length > FLASH_CONFIG_JSON_MAX || hdr.generation == 0U) {
-        s_scan_error = true;
-        return false;
-    }
-    return true;
-}
-
-/* 擦除整个槽（80KiB = 20 个 4KiB 扇区） */
-static HAL_StatusTypeDef slot_erase(int idx)
-{
-    uint32_t addr = slot_base[idx];
-    for (int i = 0; i < 20; i++) {
-        HAL_StatusTypeDef st = storage_flash_erase(addr + i * 4096);
+    uint8_t data[256];
+    uint32_t crc = UINT32_MAX;
+    for (uint32_t offset = 0; offset < len;) {
+        uint32_t count = len - offset;
+        if (count > sizeof(data)) count = sizeof(data);
+        HAL_StatusTypeDef st = storage_flash_read(slot_base[slot] + JSON_DATA_OFFSET + offset, data, count);
         if (st != HAL_OK) return st;
+        crc = crc32_update(crc, data, count);
+        offset += count;
     }
+    *value = ~crc;
     return HAL_OK;
 }
 
-/* ---------- 启动时选择运行槽 ---------- */
+/* 只检查头部字段，不把坏长度或代次当作无配置。 */
+static bool slot_header_valid(const config_slot_header_t *header)
+{
+    return header->magic == CONFIG_SLOT_MAGIC && header->generation != 0U &&
+           header->json_length != 0U && header->json_length <= FLASH_CONFIG_JSON_MAX &&
+           header->header_crc32 == ~crc32_update(UINT32_MAX, (const uint8_t *)header, 16U);
+}
 
-/* 启动时扫三个槽，挑出"代次最大且校验完整"的那个为运行槽 */
+/* 完整槽同时要求提交标记、头CRC和实际JSON CRC有效。 */
+static HAL_StatusTypeDef slot_check(int slot, config_slot_header_t *header, bool *complete)
+{
+    uint32_t marker;
+    *complete = false;
+    HAL_StatusTypeDef st = storage_flash_read(slot_base[slot] + COMMIT_MARKER_OFFSET,
+                                              (uint8_t *)&marker, sizeof(marker));
+    if (st != HAL_OK) return st;
+    if (marker != CONFIG_SLOT_MARKER_VALID) return HAL_OK;
+    st = storage_flash_read(slot_base[slot], (uint8_t *)header, sizeof(*header));
+    if (st != HAL_OK) return st;
+    if (!slot_header_valid(header)) return HAL_ERROR;
+    uint32_t crc;
+    st = slot_crc(slot, header->json_length, &crc);
+    if (st != HAL_OK) return st;
+    if (crc != header->json_crc32) return HAL_ERROR;
+    *complete = true;
+    return HAL_OK;
+}
+
+/* 仅启动选槽；运行中保存不能重新选择R。读取失败不冒充空配置。 */
 static void config_select_running(void)
 {
     s_scan_error = false;
-    // 最佳槽下标，-1 表示还没找到
-    int best_idx = -1;
-    // 最佳槽的代次号，用于比较大小
-    uint32_t best_gen = 0;
-
-    // 遍历 A/B/C 三个槽
-    for (int i = 0; i < 3; i++) {
-        // 跳过校验未通过（CRC 错误、长度异常）的槽
-        if (!slot_is_complete(i)) continue;
-
-        // 读取该槽头部，拿 generation 字段
-        config_slot_header_t hdr;
-        if (slot_read_header(i, &hdr) != HAL_OK) {
+    int best = -1;
+    uint32_t generation = 0;
+    for (int slot = 0; slot < 3; slot++) {
+        config_slot_header_t header;
+        bool complete;
+        if (slot_check(slot, &header, &complete) != HAL_OK) {
             s_scan_error = true;
             continue;
         }
-
-        // 第一次遇到完整槽或代次更大时，更新最佳
-        if (best_idx == -1 || hdr.generation > best_gen) {
-            best_idx = i;
-            best_gen = hdr.generation;
+        if (complete && (best < 0 || header.generation > generation)) {
+            best = slot;
+            generation = header.generation;
+        } else if (complete && header.generation == generation) {
+            s_scan_error = true;
         }
     }
-
-    // 写回全局运行槽标记，若无完整槽则保持 -1
-    s_r_slot = s_scan_error ? -1 : best_idx;
-    s_r_gen = s_scan_error ? 0U : best_gen;
+    s_r_slot = s_scan_error ? -1 : best;
+    s_r_gen = s_scan_error ? 0U : generation;
+    s_s_slot = s_r_slot;
+    s_s_gen = s_r_gen;
+    s_scanned = true;
 }
 
-/* ---------- 公共 API ---------- */
-
-HAL_StatusTypeDef storage_config_open(storage_config_reader_t *rd)
+/* 打开本次启动固定的运行槽；无配置和I/O失败均不输出旧句柄。 */
+HAL_StatusTypeDef storage_config_open(storage_config_reader_t *reader)
 {
-    // 入参校验
-    if (rd == NULL) return HAL_ERROR;
-
-    // 检查有没有成功选出配置槽，如果还没选到，就重新执行一次三槽校验选槽，做一次兜底重试
-    if (s_r_slot < 0) {
-        config_select_running();
-    }
-
-    // 三槽都无完整配置，交由上层进入维护模式
-    if (s_r_slot < 0) return HAL_ERROR;
-
-    // 重读头部，避免描述符沿用旧的长度/CRC
-    config_slot_header_t hdr;
-    if (slot_read_header(s_r_slot, &hdr) != HAL_OK) return HAL_ERROR;
-
-    // 填充只读描述符：槽号定位数据、代次记录配置版本
-    rd->slot_idx   = (uint32_t)s_r_slot;
-    rd->generation = hdr.generation;
-    rd->total_len  = hdr.json_length;
-    rd->crc32      = hdr.json_crc32;
+    if (reader == NULL || !storage_runtime_is_owner()) return HAL_ERROR;
+    memset(reader, 0, sizeof(*reader));
+    if (!s_scanned) config_select_running();
+    if (s_scan_error || s_r_slot < 0) return HAL_ERROR;
+    config_slot_header_t header;
+    HAL_StatusTypeDef st = storage_flash_read(slot_base[s_r_slot], (uint8_t *)&header, sizeof(header));
+    if (st != HAL_OK) return st;
+    if (!slot_header_valid(&header) || header.generation != s_r_gen) return HAL_ERROR;
+    reader->slot_idx = (uint32_t)s_r_slot;
+    reader->generation = s_r_gen;
+    reader->total_len = header.json_length;
+    reader->crc32 = header.json_crc32;
     return HAL_OK;
 }
 
-HAL_StatusTypeDef storage_config_read_chunk(const storage_config_reader_t *rd,
-                                             uint32_t offset, uint8_t *buf,
-                                             uint32_t len)
+/* 读句柄只允许指向受保护的R/S，不接受任意Flash地址或过期候选。 */
+HAL_StatusTypeDef storage_config_read_chunk(const storage_config_reader_t *reader,
+                                            uint32_t offset, uint8_t *data, uint32_t len)
 {
-    if (rd == NULL || buf == NULL) return HAL_ERROR;
-    if (rd->slot_idx > 2) return HAL_ERROR;
-    if (offset > rd->total_len) return HAL_ERROR;
-    if (len > rd->total_len - offset) return HAL_ERROR;
-
-    return storage_flash_read(
-        slot_base[rd->slot_idx] + JSON_DATA_OFFSET + offset, buf, len);
+    if (!storage_runtime_is_owner() || reader == NULL || data == NULL ||
+        reader->slot_idx > 2U || reader->total_len > FLASH_CONFIG_JSON_MAX ||
+        offset > reader->total_len || len > reader->total_len - offset)
+        return HAL_ERROR;
+    int slot = (int)reader->slot_idx;
+    if (!((slot == s_r_slot && reader->generation == s_r_gen) ||
+          (slot == s_s_slot && reader->generation == s_s_gen))) return HAL_ERROR;
+    return storage_flash_read(slot_base[slot] + JSON_DATA_OFFSET + offset, data, len);
 }
 
-static HAL_StatusTypeDef storage_config_begin_impl(uint32_t total_len, uint32_t *session_id)
+/* 擦除前登记候选租约，擦写失败也保留归属供原客户端取消。 */
+static HAL_StatusTypeDef config_begin(uint32_t total_len, uint32_t session)
+{
+    if (!s_scanned || s_scan_error || total_len == 0U || total_len > FLASH_CONFIG_JSON_MAX ||
+        session == 0U || session <= s_next_session || s_s_gen == UINT32_MAX) return HAL_ERROR;
+    if (s_tx.active) return HAL_BUSY;
+    int candidate = -1;
+    for (int slot = 0; slot < 3; slot++)
+        if (slot != s_r_slot && slot != s_s_slot) { candidate = slot; break; }
+    if (candidate < 0) return HAL_ERROR;
+    s_next_session = session;
+    s_tx = (config_tx_t){.active = true, .session_id = session, .slot_idx = candidate,
+                         .total_len = total_len, .crc = UINT32_MAX};
+    /* 先擦尾标所在扇区；断电不能留下“有效提交标记+已擦坏正文”。 */
+    HAL_StatusTypeDef st = storage_flash_erase(slot_base[candidate] + FLASH_CONFIG_SLOT_SIZE - 4096U);
+    uint32_t marker = 0U;
+    if (st == HAL_OK)
+        st = storage_flash_read(slot_base[candidate] + COMMIT_MARKER_OFFSET,
+                                 (uint8_t *)&marker, sizeof(marker));
+    if (st != HAL_OK || marker != CONFIG_SLOT_MARKER_EMPTY) {
+        s_tx.failed = true;
+        return st == HAL_OK ? HAL_ERROR : st;
+    }
+    for (uint32_t offset = 0; offset < FLASH_CONFIG_SLOT_SIZE - 4096U; offset += 4096U) {
+        st = storage_flash_erase(slot_base[candidate] + offset);
+        if (st != HAL_OK) { s_tx.failed = true; return st; }
+    }
+    return HAL_OK;
+}
+
+/* 分配非零会话；失败可能仍有租约，调用方须用输出会话取消。 */
+HAL_StatusTypeDef storage_config_begin(uint32_t total_len, uint32_t *session_id)
 {
     if (session_id == NULL) return HAL_ERROR;
-    if (total_len > FLASH_CONFIG_JSON_MAX) return HAL_ERROR;
-    if (s_tx.active) return HAL_BUSY;
-
-    /* 选候选槽：非 R 的槽 */
-    int candidate = -1;
-    for (int i = 0; i < 3; i++) {
-        if (i != s_r_slot) {
-            candidate = i;
-            break;
-        }
+    *session_id = 0U;
+    if (!storage_mutation_begin()) return HAL_BUSY;
+    HAL_StatusTypeDef st = HAL_ERROR;
+    if (s_next_session != UINT32_MAX) {
+        *session_id = s_next_session + 1U;
+        st = config_begin(total_len, *session_id);
     }
-    if (candidate < 0) return HAL_ERROR;
-
-    /* 擦除候选槽 */
-    HAL_StatusTypeDef st = slot_erase(candidate);
-    if (st != HAL_OK) return st;
-
-    s_tx.active      = true;
-    s_tx.session_id  = (uint32_t)(s_r_gen + 1) * 1000 + candidate;
-    s_tx.slot_idx    = candidate;
-    s_tx.total_len   = total_len;
-    s_tx.written_len = 0;
-
-    *session_id = s_tx.session_id;
-    return HAL_OK;
+    storage_mutation_end();
+    return st;
 }
 
-static HAL_StatusTypeDef storage_config_chunk_impl(uint32_t session_id, uint32_t offset,
+/* 顺序写入并读回；不明写入锁存失败，不推进偏移或接受重写。 */
+HAL_StatusTypeDef storage_config_chunk(uint32_t session, uint32_t offset,
                                         const uint8_t *data, uint32_t len)
 {
-    if (!s_tx.active) return HAL_ERROR;
-    if (session_id != s_tx.session_id) return HAL_ERROR;
-    if (offset != s_tx.written_len) return HAL_ERROR;  /* 必须连续写入 */
-    if (offset > s_tx.total_len || len > s_tx.total_len - offset) return HAL_ERROR;
-
-    uint32_t addr = slot_base[s_tx.slot_idx] + JSON_DATA_OFFSET + offset;
-    HAL_StatusTypeDef st = storage_flash_write(addr, data, len);
-    if (st != HAL_OK) return st;
-
-    s_tx.written_len += len;
-    return HAL_OK;
+    if (!storage_mutation_begin()) return HAL_BUSY;
+    HAL_StatusTypeDef st = HAL_ERROR;
+    if (s_tx.active && !s_tx.failed && !s_tx.validated && session == s_tx.session_id &&
+        data != NULL && len != 0U && len <= STORAGE_CONFIG_CHUNK_MAX &&
+        offset == s_tx.written_len && offset <= s_tx.total_len && len <= s_tx.total_len - offset) {
+        uint8_t readback[STORAGE_CONFIG_CHUNK_MAX];
+        uint32_t address = slot_base[s_tx.slot_idx] + JSON_DATA_OFFSET + offset;
+        st = storage_flash_write(address, data, len);
+        if (st == HAL_OK) st = storage_flash_read(address, readback, len);
+        if (st == HAL_OK && memcmp(data, readback, len) != 0) st = HAL_ERROR;
+        if (st == HAL_OK) {
+            s_tx.crc = crc32_update(s_tx.crc, data, len);
+            s_tx.written_len += len;
+        } else s_tx.failed = true;
+    }
+    storage_mutation_end();
+    return st;
 }
 
-static HAL_StatusTypeDef storage_config_validate_impl(uint32_t session_id)
+/* 验证读回CRC与接纳的输入一致，空操作不构成校验成功。 */
+HAL_StatusTypeDef storage_config_validate(uint32_t session)
 {
-    if (!s_tx.active) return HAL_ERROR;
-    if (session_id != s_tx.session_id) return HAL_ERROR;
-    if (s_tx.written_len != s_tx.total_len) return HAL_ERROR;
-
-    /* 回读并计算 CRC */
-    /* 为节省内存，分块读取计算 CRC */
-    uint32_t crc = 0xFFFFFFFF;
-    uint32_t remaining = s_tx.total_len;
-    uint32_t offset = 0;
-    uint8_t buf[256];
-
-    while (remaining > 0) {
-        uint32_t chunk = (remaining > sizeof(buf)) ? sizeof(buf) : remaining;
-        HAL_StatusTypeDef st = storage_flash_read(
-            slot_base[s_tx.slot_idx] + JSON_DATA_OFFSET + offset,
-            buf, chunk);
-        if (st != HAL_OK) return st;
-
-        for (uint32_t i = 0; i < chunk; i++) {
-            crc ^= buf[i];
-            for (int j = 0; j < 8; j++) {
-                crc = (crc >> 1) ^ ((crc & 1) ? 0xEDB88320 : 0);
-            }
-        }
-        offset += chunk;
-        remaining -= chunk;
-    }
-    crc = ~crc;
-
-    /* CRC 校验通过。实际写入头部时由 COMMIT 重新计算。 */
-    return HAL_OK;
+    if (!storage_runtime_is_owner()) return HAL_ERROR;
+    if (!s_tx.active || s_tx.failed || session != s_tx.session_id ||
+        s_tx.written_len != s_tx.total_len) return HAL_ERROR;
+    uint32_t crc;
+    HAL_StatusTypeDef st = slot_crc(s_tx.slot_idx, s_tx.total_len, &crc);
+    if (st == HAL_OK && crc != ~s_tx.crc) st = HAL_ERROR;
+    s_tx.validated = st == HAL_OK;
+    if (st != HAL_OK) s_tx.failed = true;
+    return st;
 }
 
-static HAL_StatusTypeDef storage_config_commit_impl(uint32_t session_id)
+/* 只读解析曾尝试提交的候选；未知结果保留租约，不能重新擦写。 */
+static HAL_StatusTypeDef config_resolve(uint32_t session, bool *committed)
 {
-    if (!s_tx.active) return HAL_ERROR;
-    if (session_id != s_tx.session_id) return HAL_ERROR;
-    if (s_tx.written_len != s_tx.total_len) return HAL_ERROR;
-
-    /* 重新计算 CRC（validate 可能没被调用） */
-    uint32_t crc = 0xFFFFFFFF;
-    uint32_t remaining = s_tx.total_len;
-    uint32_t offset = 0;
-    uint8_t buf[256];
-
-    while (remaining > 0) {
-        uint32_t chunk = (remaining > sizeof(buf)) ? sizeof(buf) : remaining;
-        if (storage_flash_read(
-                slot_base[s_tx.slot_idx] + JSON_DATA_OFFSET + offset,
-                buf, chunk) != HAL_OK) return HAL_ERROR;
-        for (uint32_t i = 0; i < chunk; i++) {
-            crc ^= buf[i];
-            for (int j = 0; j < 8; j++) {
-                crc = (crc >> 1) ^ ((crc & 1) ? 0xEDB88320 : 0);
-            }
-        }
-        offset += chunk;
-        remaining -= chunk;
+    *committed = session != 0U && session == s_committed_session;
+    if (*committed) return HAL_OK;
+    if (!s_tx.active || session != s_tx.session_id) return HAL_ERROR;
+    if (!s_tx.commit_attempted) return HAL_OK;
+    config_slot_header_t header;
+    bool complete;
+    HAL_StatusTypeDef st = slot_check(s_tx.slot_idx, &header, &complete);
+    if (st != HAL_OK) return st;
+    if (!complete) {
+        s_tx.commit_attempted = false;
+        s_tx.failed = true;
+        return HAL_OK;
     }
-    crc = ~crc;
-
-    /* 写头部 */
-    config_slot_header_t hdr;
-    memset(&hdr, 0, sizeof(hdr));
-    hdr.magic       = CONFIG_SLOT_MAGIC;
-    hdr.generation  = s_r_gen + 1;
-    hdr.json_length = s_tx.total_len;
-    hdr.json_crc32  = crc;
-    hdr.header_crc32 = crc32_calc((uint8_t *)&hdr,
-                                    sizeof(hdr) - sizeof(uint32_t) - sizeof(hdr.reserved));
-
-    HAL_StatusTypeDef st = storage_flash_write(
-        slot_base[s_tx.slot_idx], (uint8_t *)&hdr, sizeof(hdr));
-    if (st != HAL_OK) return st;
-
-    /* 写提交标记（最后 4 字节） */
-    uint32_t marker = CONFIG_SLOT_MARKER_VALID;
-    st = storage_flash_write(
-        slot_base[s_tx.slot_idx] + COMMIT_MARKER_OFFSET,
-        (uint8_t *)&marker, 4);
-    if (st != HAL_OK) return st;
-
-    /* 事务完成，更新运行槽 */
-    s_r_slot = s_tx.slot_idx;
-    s_r_gen  = hdr.generation;
+    if (header.generation != s_s_gen + 1U || header.json_length != s_tx.total_len ||
+        header.json_crc32 != ~s_tx.crc) return HAL_ERROR;
+    s_s_slot = s_tx.slot_idx;
+    s_s_gen = header.generation;
+    s_committed_session = session;
     s_tx.active = false;
-
+    *committed = true;
     return HAL_OK;
 }
 
-static void storage_config_abort_impl(uint32_t session_id)
+/* 先提交头并读回，最后写标记；成功只切换S，R保持到下一次启动。 */
+HAL_StatusTypeDef storage_config_commit(uint32_t session)
 {
-    if (s_tx.active && session_id == s_tx.session_id) {
-        s_tx.active = false;
+    if (!storage_runtime_is_owner()) return HAL_ERROR;
+    if (session != 0U && session == s_committed_session) return HAL_OK;
+    if (s_tx.active && session == s_tx.session_id && s_tx.commit_attempted) {
+        bool committed;
+        HAL_StatusTypeDef st = config_resolve(session, &committed);
+        return st == HAL_OK && !committed ? HAL_ERROR : st;
     }
+    if (!storage_mutation_begin()) return HAL_BUSY;
+    HAL_StatusTypeDef st = HAL_ERROR;
+    if (s_tx.active && !s_tx.failed && s_tx.validated && session == s_tx.session_id) {
+        config_slot_header_t header = {0};
+        header.magic = CONFIG_SLOT_MAGIC;
+        header.generation = s_s_gen + 1U;
+        header.json_length = s_tx.total_len;
+        header.json_crc32 = ~s_tx.crc;
+        header.header_crc32 = ~crc32_update(UINT32_MAX, (const uint8_t *)&header, 16U);
+        config_slot_header_t readback;
+        st = storage_flash_write(slot_base[s_tx.slot_idx], (const uint8_t *)&header, sizeof(header));
+        if (st == HAL_OK) st = storage_flash_read(slot_base[s_tx.slot_idx], (uint8_t *)&readback, sizeof(readback));
+        if (st == HAL_OK && memcmp(&header, &readback, sizeof(header)) != 0) st = HAL_ERROR;
+        if (st == HAL_OK) {
+            uint32_t marker = CONFIG_SLOT_MARKER_VALID;
+            s_tx.commit_attempted = true;
+            st = storage_flash_write(slot_base[s_tx.slot_idx] + COMMIT_MARKER_OFFSET,
+                                      (const uint8_t *)&marker, sizeof(marker));
+            bool committed;
+            HAL_StatusTypeDef resolved = config_resolve(session, &committed);
+            if (resolved != HAL_OK) st = resolved;
+            else st = committed ? HAL_OK : HAL_ERROR;
+        } else s_tx.failed = true;
+    }
+    storage_mutation_end();
+    return st;
 }
 
+/* 取消只释放匹配的未提交租约，允许在升级暂停后结算，不擦介质。 */
+static HAL_StatusTypeDef config_abort(uint32_t session)
+{
+    if (!storage_runtime_is_owner() || session == 0U) return HAL_ERROR;
+    if (session == s_committed_session) return HAL_BUSY;
+    if (session != s_tx.session_id) return s_tx.active ? HAL_BUSY : HAL_OK;
+    if (s_tx.commit_attempted) return HAL_BUSY;
+    s_tx.active = false;
+    return HAL_OK;
+}
+
+/* 兼容已有存储侧取消入口；客户端使用process取得明确结果。 */
+void storage_config_abort(uint32_t session)
+{
+    (void)config_abort(session);
+}
+
+/* 运行generation不随保存改变。 */
 uint32_t storage_config_get_generation(void)
 {
     return s_r_gen;
 }
 
+/* 全空为未配置，不能在首次保存后通过重新扫描激活候选。 */
 bool storage_config_has_valid(void)
 {
-    if (s_r_slot < 0) config_select_running();
-    return (s_r_slot >= 0);
+    if (!storage_runtime_is_owner()) return false;
+    if (!s_scanned) config_select_running();
+    return !s_scan_error && s_r_slot >= 0;
 }
 
-/* 开始候选配置事务，完整擦除成功才返回会话。 */
-HAL_StatusTypeDef storage_config_begin(uint32_t total_len, uint32_t *session_id)
-{
-    if (!storage_mutation_begin()) return HAL_BUSY;
-    HAL_StatusTypeDef st = storage_config_begin_impl(total_len, session_id);
-    storage_mutation_end();
-    return st;
-}
-
-/* 按连续偏移写入当前配置事务，返回前结束介质访问。 */
-HAL_StatusTypeDef storage_config_chunk(uint32_t session_id, uint32_t offset, const uint8_t *data, uint32_t len)
-{
-    if (!storage_mutation_begin()) return HAL_BUSY;
-    HAL_StatusTypeDef st = storage_config_chunk_impl(session_id, offset, data, len);
-    storage_mutation_end();
-    return st;
-}
-
-/* 检查当前事务已收齐并可完整读回配置。 */
-HAL_StatusTypeDef storage_config_validate(uint32_t session_id)
-{
-    if (!storage_mutation_begin()) return HAL_BUSY;
-    HAL_StatusTypeDef st = storage_config_validate_impl(session_id);
-    storage_mutation_end();
-    return st;
-}
-
-/* 提交完整配置及尾标，成功后切换运行槽。 */
-HAL_StatusTypeDef storage_config_commit(uint32_t session_id)
-{
-    if (!storage_mutation_begin()) return HAL_BUSY;
-    HAL_StatusTypeDef st = storage_config_commit_impl(session_id);
-    storage_mutation_end();
-    return st;
-}
-
-/* 取消匹配的配置RAM事务，不提交或擦除已有配置。 */
-void storage_config_abort(uint32_t session_id)
-{
-    if (!storage_mutation_begin()) return;
-    storage_config_abort_impl(session_id);
-    storage_mutation_end();
-}
-
-/* 全空或未提交候选属于未配置，读取失败/已提交损坏不能降级成空配置。 */
+/* 启动执行一次完整只读恢复；不迁移、不擦除未知配置。 */
 HAL_StatusTypeDef storage_config_check(void)
 {
-    config_select_running();
+    if (!storage_runtime_is_owner()) return HAL_ERROR;
+    if (!s_scanned) config_select_running();
     return s_scan_error ? HAL_ERROR : HAL_OK;
 }
 
-/* 结算查询不取消配置会话，也不提交半份配置。 */
+/* 未结束的候选或不明提交均阻止Storage升级结算。 */
 bool storage_config_tx_active(void)
 {
     return s_tx.active;
+}
+
+/* Storage_Task处理Config值拷贝请求；不保留消息或客户端缓冲。 */
+HAL_StatusTypeDef storage_config_process(storage_config_message_t *message)
+{
+    if (!storage_runtime_is_owner() || message == NULL) return HAL_ERROR;
+    if (message->action == STORAGE_CONFIG_READ_RUNNING || message->action == STORAGE_CONFIG_READ_SAVED) {
+        if (!s_scanned || s_scan_error || message->len > sizeof(message->data)) return HAL_ERROR;
+        bool saved = message->action == STORAGE_CONFIG_READ_SAVED;
+        int slot = saved ? s_s_slot : s_r_slot;
+        message->generation = saved ? s_s_gen : s_r_gen;
+        message->total_len = 0U;
+        message->crc32 = 0U;
+        if (slot < 0) { message->len = 0U; return HAL_OK; }
+        config_slot_header_t header;
+        HAL_StatusTypeDef st = storage_flash_read(slot_base[slot], (uint8_t *)&header, sizeof(header));
+        if (st != HAL_OK) return st;
+        if (!slot_header_valid(&header) || header.generation != message->generation) return HAL_ERROR;
+        message->total_len = header.json_length;
+        message->crc32 = header.json_crc32;
+        if (message->offset > header.json_length) return HAL_ERROR;
+        if (message->len > header.json_length - message->offset)
+            message->len = header.json_length - message->offset;
+        return message->len == 0U ? HAL_OK :
+               storage_flash_read(slot_base[slot] + JSON_DATA_OFFSET + message->offset,
+                                   message->data, message->len);
+    }
+    if (message->action == STORAGE_CONFIG_RESOLVE) {
+        bool committed;
+        HAL_StatusTypeDef st = config_resolve(message->session_id, &committed);
+        message->generation = committed ? s_s_gen : 0U;
+        return st;
+    }
+    if (message->action == STORAGE_CONFIG_ABORT) return config_abort(message->session_id);
+    if (message->action == STORAGE_CONFIG_BEGIN) {
+        if (!storage_mutation_begin()) return HAL_BUSY;
+        HAL_StatusTypeDef st = config_begin(message->total_len, message->session_id);
+        message->generation = s_s_gen + 1U;
+        storage_mutation_end();
+        return st;
+    }
+    if (message->action == STORAGE_CONFIG_CHUNK)
+        return storage_config_chunk(message->session_id, message->offset, message->data, message->len);
+    if (message->action == STORAGE_CONFIG_VALIDATE) return storage_config_validate(message->session_id);
+    if (message->action == STORAGE_CONFIG_COMMIT) return storage_config_commit(message->session_id);
+    return HAL_ERROR;
 }

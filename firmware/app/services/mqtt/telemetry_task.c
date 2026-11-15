@@ -199,16 +199,18 @@ void Telemetry_Task(void *argument)
         osDelay(pdMS_TO_TICKS(5000U)) != osOK)
         goto health_fail;
     printf("[TEL] task started\r\n");
+    uint32_t next_cycle_ms = HAL_GetTick();
 
     for (;;)
     {
         taskENTER_CRITICAL();
         bool healthy = Monitor_ReportProgress(APP_MODULE_TELEMETRY, true);
-        bool paused = s_pause_requested || !UpgradeQuiesce_AllowsMutation();
+        const app_config_t *config = AppConfig_Get();
+        bool paused = s_pause_requested || !UpgradeQuiesce_AllowsMutation() || config == NULL;
         s_pause_acknowledged = s_pause_requested && healthy;
         taskEXIT_CRITICAL();
         if (!healthy) goto health_fail;
-        if (paused)
+        if (paused || (int32_t)(HAL_GetTick() - next_cycle_ms) < 0)
         {
             if (!Monitor_BeginWait(APP_MODULE_TELEMETRY, 1500U) ||
                 osDelay(pdMS_TO_TICKS(500U)) != osOK)
@@ -230,8 +232,10 @@ void Telemetry_Task(void *argument)
         }
 
         printf("[TEL] cycle done: %u slaves\r\n", (unsigned)cnt);
-        if (!Monitor_BeginWait(APP_MODULE_TELEMETRY, TELEMETRY_PERIOD_MS + 1000U) ||
-            osDelay(pdMS_TO_TICKS(TELEMETRY_PERIOD_MS)) != osOK)
+        /* 长上报周期仍每500ms检查暂停和真实任务进展，不声明整周期的健康豁免。 */
+        next_cycle_ms = HAL_GetTick() + config->mq_report_interval_ms;
+        if (!Monitor_BeginWait(APP_MODULE_TELEMETRY, 1500U) ||
+            osDelay(pdMS_TO_TICKS(500U)) != osOK)
             goto health_fail;
     }
 

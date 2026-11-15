@@ -8,8 +8,8 @@
  *   4. 状态/LWT retain=true，其余 retain=false（设计 5.1）
  *   5. 重连退避 1/2/4/8/16/32/60s + 20% 抖动，最长 72s（设计 5.1）
  *   6. 拒绝 RETAIN=1 的保留控制回放（设计 5.1）
- *   7. 补传每次取最多 4 条（内存收缩：原 10→4，STORAGE_M2_FETCH_BATCH_MAX=4）
- *   8. payload 最大 1024B（内存收缩：原 4096→1024，超长报文明确拒绝不截断）
+ *   7. 补传每次取最多 STORAGE_M2_FETCH_BATCH_MAX 条
+ *   8. payload 最大 4096B（M2-03，设计 5.2）
  *   9. 回执 30s 未到则保持原 ID 重发；PUBACK 不回收缓存（设计 5.2）
  *
  * 数据流：
@@ -27,6 +27,7 @@
 
 #include "cmsis_os2.h"
 #include "app_monitor.h"
+#include "app_readiness.h"
 #include "upgrade_quiesce.h"
 #include "stm32f4xx_hal.h"
 #include "FreeRTOS.h"
@@ -80,10 +81,8 @@
 #define MQTT_CONNACK_TIMEOUT_MS 5000  /* 等 CONNACK 超时（原 3000 改 5000，给云端更多处理时间） */
 #define MQTT_REPLAY_INTERVAL_MS 3000  /* 补传 pump 调度间隔（有新数据时） */
 #define MQTT_REPLAY_RESEND_MS  30000  /* 回执未到重发间隔（设计 5.2: 30s） */
-#define MQTT_MAX_PAYLOAD       1024   /* 内存收缩：原 4096→1024；超长报文拒绝不截断 */
+#define MQTT_MAX_PAYLOAD       4096   /* 超长报文明确拒绝，不截断处理 */
 /* 收发缓冲 = 载荷 + MQTT 头开销（固定头5 + topic_len2 + topic≤96 + packet_id2 ≈ 105），给 200 余量 */
-#define MQTT_TX_BUF_SIZE       (MQTT_MAX_PAYLOAD + 200)
-#define MQTT_RX_BUF_SIZE       (MQTT_MAX_PAYLOAD + 200)
 #define MQTT_IO_TIMEOUT_MS    10000U
 #define MQTT_TX_WAIT_MS       12000U
 #define MQTT_HEALTH_MARGIN_MS  1000U
@@ -144,18 +143,14 @@ static char g_topic_cmd_ack[96];
 static char g_topic_ota_status[96];
 
 /* ===== 收发缓冲（放 CCMRAM，不挤占 SRAM 里的 FreeRTOS 堆）
- * 内存收缩：tx_buf 4200→1224、rx_ring 4400→1224（载荷上限 1024 + 头开销 200）
  * 注意：netconn_write 用 NETCONN_COPY（拷贝到 LWIP 内部 pbuf），tx_buf 本身不需 DMA 可达，
- *       放 CCMRAM 安全；rx_ring/cmd_payload/ack_payload 全是 CPU 处理，同样安全 */
-static uint8_t tx_buf[MQTT_TX_BUF_SIZE]  __attribute__((section(".bss.ccmram")));
-static uint8_t rx_ring[MQTT_RX_BUF_SIZE] __attribute__((section(".bss.ccmram")));
+ *       放 CCMRAM 安全；rx_ring/rx_payload_buf 全是 CPU 处理，同样安全 */
+static uint8_t tx_buf[4200]  __attribute__((section(".bss.ccmram")));
+static uint8_t rx_ring[4400] __attribute__((section(".bss.ccmram")));
 static uint16_t rx_ring_len = 0;   /* rx_ring 当前已有效字节数 */
 
-/* 下行命令解析缓冲（PUBLISH 载荷拷贝出来，\0 结尾好给字符串解析） */
-static char cmd_payload_buf[MQTT_MAX_PAYLOAD + 16] __attribute__((section(".bss.ccmram")));
-
-/* 业务回执 payload 缓冲 */
-static char ack_payload_buf[MQTT_MAX_PAYLOAD + 16] __attribute__((section(".bss.ccmram")));
+/* 命令和回执仅由MQTT任务串行解析；处理返回前消费或拷贝数据，不向异步任务保留指针。 */
+static char rx_payload_buf[MQTT_MAX_PAYLOAD + 16] __attribute__((section(".bss.ccmram")));
 
 /* ===== 全局状态 ===== */
 static struct netconn *g_conn = NULL;
@@ -192,7 +187,7 @@ static uint32_t g_replay_last_tick = 0;
 static bool mqtt_health_progress(void)
 {
     if (osThreadGetId() != g_mqtt_thread)
-        return true;
+        return Monitor_UpgradeProgress();
     if (Monitor_ReportProgress(APP_MODULE_MQTT, true))
         return true;
     Monitor_ReportFatal(APP_MODULE_MQTT);
@@ -203,7 +198,7 @@ static bool mqtt_health_progress(void)
 static bool mqtt_health_wait(uint32_t timeout_ms)
 {
     if (osThreadGetId() != g_mqtt_thread)
-        return true;
+        return Monitor_UpgradeWait(timeout_ms);
     if (Monitor_BeginWait(APP_MODULE_MQTT, timeout_ms + MQTT_HEALTH_MARGIN_MS))
         return true;
     Monitor_ReportFatal(APP_MODULE_MQTT);
@@ -262,26 +257,6 @@ static err_t mqtt_write(const void *data, size_t size)
         err = ERR_ABRT;
     if (err != ERR_OK)
         g_connected = false;
-    return err;
-}
-
-/* 接收至多等待原有的1秒，超时返回由状态机处理，不能靠调用本身续期。 */
-static err_t mqtt_receive(struct netbuf **buffer)
-{
-    *buffer = NULL;
-    if (!mqtt_health_wait(1000U))
-        return ERR_ABRT;
-    err_t err = netconn_recv(g_conn, buffer);
-    if (!mqtt_health_progress())
-    {
-        if (*buffer != NULL)
-        {
-            netbuf_delete(*buffer);
-            *buffer = NULL;
-        }
-        g_connected = false;
-        return ERR_ABRT;
-    }
     return err;
 }
 
@@ -376,77 +351,18 @@ static void mqtt_config_load(void)
 
 #if MQTT_USE_BAIDU
 
-/* 百度云 IoT Core 认证参数生成（每次连接前调用，timestamp 变化需重算）
- *
- * 百度云官方签名算法（见 cloud.baidu.com/doc/IoTCore MQTT连接）：
- *   clientId   = DeviceKey
- *   username   = "thingidp@" + IoTCoreId + "|" + DeviceKey + "|" + timestamp + "|SHA256"
- *   password   = lowercase_hex( SHA256( DeviceKey + "&" + timestamp + "&SHA256" + DeviceSecret ) )
- *
- *   timestamp 以秒为单位，与服务器时间误差允许 10min；
- *   RTC 未校时时传 0 占位（百度云允许）。
- *
- * broker 地址 = {IoTCoreId}.iot.{region}.baidubce.com:1883（TCP 明文，免 TLS）
- * topic 完全自定义（无固定前缀），权限由设备 topic 列表控制。
+/*
+ * 每次连接前按DeviceKey和DeviceSecret生成百度MQTT认证参数。
+ * clientId=DeviceKey；username=thingidp@{IoTCoreId}|{DeviceKey}|0|SHA256。
+ * password为SHA256(DeviceKey + "&0&SHA256" + DeviceSecret)的小写hex。
  */
-/* ★★编译时间 → Unix 时间戳（替代硬编码 base timestamp）
- * __DATE__ 格式 "Mmm dd yyyy"（如 "Nov 10 2026"）
- * __TIME__ 格式 "hh:mm:ss"（如 "17:59:30"）
- * 每次构建自动获得新鲜时间戳，板子烧录后 + uptime 秒数 ≈ 实际时间，
- * 只要编译到烧录间隔 <10 分钟就在百度云允许窗口内。 */
-static uint32_t compile_time_to_unix(void)
-{
-    /* 月份缩写查找表 */
-    static const char *const months = "JanFebMarAprMayJunJulAugSepOctNovDec";
-    const char *mstr = __DATE__;   /* "Mmm dd yyyy" */
-    const char *tstr = __TIME__;   /* "hh:mm:ss"    */
-
-    /* 解析月份 */
-    char mon3[4] = {0};
-    mon3[0] = mstr[0]; mon3[1] = mstr[1]; mon3[2] = mstr[2];
-    const char *p = strstr(months, mon3);
-    int month = p ? (int)((p - months) / 3 + 1) : 1;
-
-    /* 解析日、年 */
-    int day = atoi(mstr + 4);       /* 跳过 "Mmm " */
-    int year = atoi(mstr + 7);      /* 跳过 "Mmm dd " */
-
-    /* 解析时:分:秒 */
-    int hour = atoi(tstr);
-    int min = atoi(tstr + 3);
-    int sec = atoi(tstr + 6);
-
-    /* 累加天数：1970→year-1 的完整年 */
-    uint32_t days = 0;
-    for (int y = 1970; y < year; y++)
-        days += ((y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)) ? 366 : 365;
-
-    /* 累加当年 1→month-1 的完整月 */
-    static const int dom[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-    for (int m = 1; m < month; m++)
-    {
-        days += dom[m - 1];
-        if (m == 2 && ((year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)))
-            days += 1;  /* 闰年 2 月多一天 */
-    }
-    days += (uint32_t)(day - 1);
-
-    /* ★★关键：__DATE__/__TIME__ 返回编译机的本地时间（北京 UTC+8），
-     * Unix 时间戳是 UTC，必须减去时区偏移。否则时间戳偏前 8 小时，
-     * 百度云认证失败返回 CONNACK rc=2。 */
-    return days * 86400U + (uint32_t)(hour * 3600 + min * 60 + sec) - 28800U;
-}
-
 static void baidu_build_auth(void)
 {
     const char *iotcore_id = BAIDU_IOTCORE_ID;
     const char *dk = BAIDU_DEVICE_KEY;
     const char *ds = BAIDU_DEVICE_SECRET;
 
-    /* timestamp：百度云官方文档明确允许传 0 占位（跳过时间校验）。
-     * ★★2026-11-10：之前用编译时间+uptime 算 timestamp，但编译本地时间(UTC+8)→UTC
-     * 转换有偏差导致认证失败(rc=2)。直接传 0 最安全——服务器跳过时间校验。
-     * 后续 SNTP 校时后再改回真实时间戳。 */
+    /* 当前MQTT认证使用0时间戳；不能作为HTTPS证书校验的时间来源。 */
     uint32_t ts = 0;  /* 0 = 不校验时间（百度云允许） */
 
     /* username = thingidp@{IoTCoreId}|{DeviceKey}|{timestamp}|SHA256 */
@@ -506,6 +422,12 @@ static void mqtt_topics_build(void)
     snprintf(g_topic_acks,      sizeof(g_topic_acks),      "%s/%s", g_cfg.client_id, MQTT_TOPIC_ACKS);
     snprintf(g_topic_cmd_ack,   sizeof(g_topic_cmd_ack),   "%s/%s", g_cfg.client_id, MQTT_TOPIC_CMD_ACK);
     snprintf(g_topic_ota_status,sizeof(g_topic_ota_status),"%s/%s", g_cfg.client_id, MQTT_TOPIC_OTA_STATUS);
+    const app_config_t *config = AppConfig_Get();
+    if (config != NULL)
+    {
+        snprintf(g_topic_telemetry, sizeof(g_topic_telemetry), "%s", config->mq_pub_topic);
+        snprintf(g_topic_commands, sizeof(g_topic_commands), "%s", config->mq_sub_topic);
+    }
 #endif
 }
 
@@ -712,30 +634,27 @@ static size_t mqtt_build_pingreq(void)
 
 /* ===== 收包帧重组 ===== */
 
-static void rx_ring_append(const uint8_t *data, size_t len)
+// 完整接收netbuf链；越界或读失败时断连，不将半帧尾部当作下一条命令。
+static bool rx_ring_append(struct netbuf *buffer)
 {
-    /* 超长报文明确拒绝，不截断执行（原实现滑窗保留尾部会导致半帧误解析）。
-     * 正常 MQTT 帧 ≤ 载荷1024 + 头~105 ≈ 1129 < ring(1224)，不会触发这里。 */
-    if (len >= sizeof(rx_ring))
+    netbuf_first(buffer);
+    do
     {
-        printf("[MQTT] drop oversize seg %u > ring %u (rejected, not truncated)\r\n",
-               (unsigned)len, (unsigned)sizeof(rx_ring));
-        rx_ring_len = 0;
-        return;
-    }
-    if (rx_ring_len + len > sizeof(rx_ring))
-    {
-        /* 累积溢出：前帧不完整且 ring 将满，说明帧超长或乱序，清空丢弃 */
-        printf("[MQTT] drop overflow %u+%u > ring %u (rejected, not truncated)\r\n",
-               (unsigned)rx_ring_len, (unsigned)len, (unsigned)sizeof(rx_ring));
-        rx_ring_len = 0;
-        /* ring 已清空，追加本段（可能是新帧开头）重新同步 */
-    }
-    memcpy(rx_ring + rx_ring_len, data, len);
-    rx_ring_len += len;
+        void *data = NULL;
+        uint16_t len = 0U;
+        if (netbuf_data(buffer, &data, &len) != ERR_OK ||
+            (len != 0U && data == NULL) || len > sizeof(rx_ring) - rx_ring_len)
+        {
+            printf("[MQTT] invalid receive chain or ring overflow\r\n");
+            return false;
+        }
+        if (len != 0U) memcpy(rx_ring + rx_ring_len, data, len);
+        rx_ring_len += len;
+    } while (netbuf_next(buffer) >= 0);
+    return true;
 }
 
-static size_t rx_ring_take_frame(uint8_t *out_type, uint8_t *out_flags,
+static int rx_ring_take_frame(uint8_t *out_type, uint8_t *out_flags,
                                  const uint8_t **out_body, uint32_t *out_body_len)
 {
     if (rx_ring_len < 2) return 0;
@@ -743,7 +662,7 @@ static size_t rx_ring_take_frame(uint8_t *out_type, uint8_t *out_flags,
     uint32_t remaining = 0;
     int rl_bytes = 0;
     if (mqtt_decode_remaining_length(&rx_ring[1], rx_ring_len - 1, &remaining, &rl_bytes) != 0)
-        return 0;
+        return rx_ring_len >= 5U ? -1 : 0;
 
     size_t frame_total = 1 + rl_bytes + remaining;
     /* 超长帧拒绝：单帧总长超过 ring 容量，永远装不下，清空丢弃不截断等待 */
@@ -751,8 +670,7 @@ static size_t rx_ring_take_frame(uint8_t *out_type, uint8_t *out_flags,
     {
         printf("[MQTT] drop oversize frame total=%u > ring %u (rejected)\r\n",
                (unsigned)frame_total, (unsigned)sizeof(rx_ring));
-        rx_ring_len = 0;
-        return 0;
+        return -1;
     }
     if (rx_ring_len < frame_total) return 0;
 
@@ -760,7 +678,7 @@ static size_t rx_ring_take_frame(uint8_t *out_type, uint8_t *out_flags,
     *out_flags = rx_ring[0] & 0x0F;
     *out_body  = &rx_ring[1 + rl_bytes];
     *out_body_len = remaining;
-    return frame_total;
+    return (int)frame_total;
 }
 
 static void rx_ring_consume(size_t frame_total)
@@ -774,6 +692,31 @@ static void rx_ring_consume(size_t frame_total)
         memmove(rx_ring, rx_ring + frame_total, rx_ring_len - frame_total);
         rx_ring_len -= frame_total;
     }
+}
+
+// 优先处理已缓存完整帧（buffer为NULL），否则最多接收1秒，保留未完整的帧。
+static err_t mqtt_receive(struct netbuf **buffer)
+{
+    *buffer = NULL;
+    uint8_t type, flags;
+    const uint8_t *body;
+    uint32_t body_len;
+    int frame = rx_ring_take_frame(&type, &flags, &body, &body_len);
+    if (frame < 0) return ERR_VAL;
+    if (frame > 0) return ERR_OK;
+    if (!mqtt_health_wait(1000U)) return ERR_ABRT;
+    err_t err = netconn_recv(g_conn, buffer);
+    if (!mqtt_health_progress())
+    {
+        if (*buffer != NULL)
+        {
+            netbuf_delete(*buffer);
+            *buffer = NULL;
+        }
+        g_connected = false;
+        return ERR_ABRT;
+    }
+    return err == ERR_OK && *buffer == NULL ? ERR_CLSD : err;
 }
 
 /* ===== 下行命令处理 =====
@@ -806,11 +749,15 @@ static void mqtt_handle_command(const uint8_t *body, uint32_t body_len, uint8_t 
     }
 
     /* 拷贝载荷到 \0 结尾缓冲 */
-    if (plen >= sizeof(cmd_payload_buf)) plen = sizeof(cmd_payload_buf) - 1;
-    memcpy(cmd_payload_buf, payload, plen);
-    cmd_payload_buf[plen] = '\0';
+    if (plen > MQTT_MAX_PAYLOAD || memchr(payload, '\0', plen) != NULL)
+    {
+        printf("[MQTT] invalid command payload: %lu\r\n", (unsigned long)plen);
+        return;
+    }
+    memcpy(rx_payload_buf, payload, plen);
+    rx_payload_buf[plen] = '\0';
 
-    printf("[MQTT] recv cmd: %s\r\n", cmd_payload_buf);
+    printf("[MQTT] recv cmd bytes=%lu\r\n", (unsigned long)plen);
 
 #if GATEWAY_ENABLE_M2
     /* ★OTA 升级通知分流：JSON 含 "url" + "sha256" → 升级通知，转给 NetworkUpgrade。
@@ -818,9 +765,9 @@ static void mqtt_handle_command(const uint8_t *body, uint32_t body_len, uint8_t 
      *   升级通知: {"task_id":"...","url":"http://...","sha256":"...","size":262144,...}
      *   普通命令: {"slave":2,"func":6,"addr":0,"val":100}
      * 不在回调里执行下载/Flash/密码运算（README 要求），只唤醒执行任务。 */
-    if (strstr(cmd_payload_buf, "\"url\"") && strstr(cmd_payload_buf, "\"sha256\""))
+    if (strstr(rx_payload_buf, "\"url\"") && strstr(rx_payload_buf, "\"sha256\""))
     {
-        int nr = NetworkUpgrade_Notify(cmd_payload_buf);
+        int nr = NetworkUpgrade_Notify(rx_payload_buf);
         char ack[96];
         int alen;
         if (nr == 0)
@@ -853,7 +800,7 @@ static void mqtt_handle_command(const uint8_t *body, uint32_t body_len, uint8_t 
     int *outs[] = { &slave, &func, &addr, &val };
     for (int k = 0; k < 4; k++)
     {
-        const char *p = strstr(cmd_payload_buf, keys[k]);
+        const char *p = strstr(rx_payload_buf, keys[k]);
         if (!p) continue;
         p += strlen(keys[k]);
         while (*p == ' ' || *p == ':' || *p == '\t') p++;
@@ -942,14 +889,18 @@ static void mqtt_handle_ack(const uint8_t *body, uint32_t body_len)
     }
 
     /* 拷贝到 \0 结尾缓冲 */
-    if (plen >= sizeof(ack_payload_buf)) plen = sizeof(ack_payload_buf) - 1;
-    memcpy(ack_payload_buf, payload, plen);
-    ack_payload_buf[plen] = '\0';
+    if (plen > MQTT_MAX_PAYLOAD)
+    {
+        printf("[MQTT] ack too large: %lu\r\n", (unsigned long)plen);
+        return;
+    }
+    memcpy(rx_payload_buf, payload, plen);
+    rx_payload_buf[plen] = '\0';
 
     /* 解析所有 record_id（格式 "gateway_id:seq:数字"），提取 seq 取最大值 */
     uint64_t max_seq = 0;
     int found = 0;
-    const char *p = ack_payload_buf;
+    const char *p = rx_payload_buf;
     while ((p = strstr(p, ":seq:")) != NULL)
     {
         p += 5;   /* 跳过 ":seq:" */
@@ -1017,7 +968,7 @@ static void mqtt_handle_puback(uint16_t packet_id)
  *   - 在线立即请求存储任务读取已提交记录，按现有 Topic 和 JSON 契约发布
  *   - PUBACK 后仅释放 MQTT packet_id，不回收缓存（业务回执才回收）
  *   - 回执 30s 未到则保持原 ID 重发，重试间隔不超过 60s
- *   - 恢复后每次取最多 4 条（内存收缩：原 10→4）
+ *   - 恢复后每次取最多 STORAGE_M2_FETCH_BATCH_MAX 条
  */
 static bool g_fetch_in_flight = false;
 static uint32_t g_fetch_req_id = 1;
@@ -1247,7 +1198,7 @@ int MqttClient_Publish(const char *topic, const uint8_t *payload, size_t plen)
         return -1;
     }
 
-    /* 载荷上限检查（内存收缩：MQTT_MAX_PAYLOAD=1024；超长明确拒绝不截断） */
+    /* 超过4 KiB的载荷明确拒绝，不截断处理。 */
     if (plen > MQTT_MAX_PAYLOAD)
     {
         return -3;   /* 超过载荷上限 */
@@ -1460,12 +1411,28 @@ void MqttClient_Task(void *argument)
     g_mqtt_thread = osThreadGetId();
     if (!Monitor_RegisterHealth(APP_MODULE_MQTT, 2000U, 30000U))
         goto health_fail;
+    bool config_loaded = false;
     printf("[MQTT] task started, broker=%s:%u cid=%s auth=%s\r\n",
            g_cfg.broker_host, g_cfg.broker_port, g_cfg.client_id,
            g_cfg.username[0] ? "yes" : "no");
 
     while (1)
     {
+        /* 无有效运行配置时只维持监督，不使用编译期默认平台启动业务。 */
+        if (!App_IsReady(APP_RESOURCE_CONFIG))
+        {
+            if (!mqtt_delay(500U)) goto health_fail;
+            continue;
+        }
+        if (!config_loaded)
+        {
+            mqtt_config_load();
+#if MQTT_USE_BAIDU
+            baidu_build_auth();
+#endif
+            mqtt_topics_build();
+            config_loaded = true;
+        }
         if (g_conn != NULL && !mqtt_connection_delete())
         {
             if (!mqtt_delay(mqtt_backoff_delay(g_backoff_attempt++))) goto health_fail;
@@ -1545,17 +1512,20 @@ void MqttClient_Task(void *argument)
             {
                 struct netbuf *nb;
                 err = mqtt_receive(&nb);
-                if (err == ERR_OK && nb != NULL)
+                if (err == ERR_OK)
                 {
-                    void *dp; uint16_t dl;
-                    netbuf_data(nb, &dp, &dl);
-                    rx_ring_append((const uint8_t *)dp, dl);
-                    netbuf_delete(nb);
+                    if (nb != NULL)
+                    {
+                        bool received = rx_ring_append(nb);
+                        netbuf_delete(nb);
+                        if (!received) goto conn_fail;
+                    }
 
                     uint8_t mtype, mflags;
                     const uint8_t *mbody;
                     uint32_t mbody_len;
-                    size_t flen = rx_ring_take_frame(&mtype, &mflags, &mbody, &mbody_len);
+                    int flen = rx_ring_take_frame(&mtype, &mflags, &mbody, &mbody_len);
+                    if (flen < 0) goto conn_fail;
                     if (flen > 0)
                     {
                         if (mtype == 2)  /* CONNACK = 0x20 >> 4 = 2 */
@@ -1617,17 +1587,20 @@ void MqttClient_Task(void *argument)
             {
                 struct netbuf *nb;
                 err = mqtt_receive(&nb);
-                if (err == ERR_OK && nb != NULL)
+                if (err == ERR_OK)
                 {
-                    void *dp; uint16_t dl;
-                    netbuf_data(nb, &dp, &dl);
-                    rx_ring_append((const uint8_t *)dp, dl);
-                    netbuf_delete(nb);
+                    if (nb != NULL)
+                    {
+                        bool received = rx_ring_append(nb);
+                        netbuf_delete(nb);
+                        if (!received) goto conn_fail;
+                    }
 
                     uint8_t mtype, mflags;
                     const uint8_t *mbody;
                     uint32_t mbody_len;
-                    size_t flen = rx_ring_take_frame(&mtype, &mflags, &mbody, &mbody_len);
+                    int flen = rx_ring_take_frame(&mtype, &mflags, &mbody, &mbody_len);
+                    if (flen < 0) goto conn_fail;
                     if (flen > 0)
                     {
                         if (mtype == 9)   /* SUBACK */
@@ -1737,24 +1710,27 @@ void MqttClient_Task(void *argument)
                     continue;
                 }
 
-                if (err != ERR_OK || nb == NULL)
+                if (err != ERR_OK)
                 {
                     printf("[MQTT] read err=%d, disconnect\r\n", (int)err);
                     break;
                 }
 
                 /* 追加到 rx_ring，循环切帧处理 */
-                void *dp; uint16_t dl;
-                netbuf_data(nb, &dp, &dl);
-                rx_ring_append((const uint8_t *)dp, dl);
-                netbuf_delete(nb);
+                if (nb != NULL)
+                {
+                    bool received = rx_ring_append(nb);
+                    netbuf_delete(nb);
+                    if (!received) goto conn_fail;
+                }
 
                 for (;;)
                 {
                     uint8_t mtype, mflags;
                     const uint8_t *mbody;
                     uint32_t mbody_len;
-                    size_t flen = rx_ring_take_frame(&mtype, &mflags, &mbody, &mbody_len);
+                    int flen = rx_ring_take_frame(&mtype, &mflags, &mbody, &mbody_len);
+                    if (flen < 0) goto conn_fail;
                     if (flen == 0) break;
 
                     if (mtype == 3)        /* PUBLISH：下行命令 / 业务回执 */

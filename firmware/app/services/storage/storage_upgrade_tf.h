@@ -2,6 +2,14 @@
 #define STORAGE_UPGRADE_TF_H
 
 #include <stdbool.h>
+#include "storage_config.h"
+
+#define STORAGE_TF_CONFIG_PATH "/config.json"
+#define STORAGE_TF_CONFIG_FILE 1U
+#define STORAGE_TF_FIRMWARE_FILE 2U
+
+/* 仅Storage_Task调用，复用原文件对象和磁盘回调，不增文件队列或任务。 */
+HAL_StatusTypeDef storage_config_tf(storage_config_message_t *message, uint32_t deadline_ms);
 
 /* Storage_Init创建静态文件服务队列；Storage_Task就绪后绑定UpgradeTfSource。 */
 bool storage_upgrade_tf_init(void);

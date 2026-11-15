@@ -107,7 +107,8 @@ typedef enum ERR_LIST
 	ERR_BAD_TCP_ID		          = -10,
 	ERR_OK_QUERY				  = -11,
     ERR_UPGRADE_BUSY              = -12,
-    ERR_UNKNOWN                   = -13
+    ERR_UNKNOWN                   = -13,
+    ERR_CONTROL_REJECTED          = -14
 
 }mb_errot_t;
 

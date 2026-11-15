@@ -26,7 +26,7 @@ import urllib.request
 import urllib.parse
 import urllib.error
 
-# ===== 设备三元组（从 firmware/app/integration/mqtt_client.c 抄过来，保持一致）=====
+# ===== 设备三元组（从 firmware/app/services/mqtt/mqtt_client.c 抄过来，保持一致）=====
 # ⚠️ git commit 前改成 "xxxxxxx" 占位符
 IOTCORE_ID    = "aeklwww"
 DEVICE_KEY    = "stm32_gw_01"

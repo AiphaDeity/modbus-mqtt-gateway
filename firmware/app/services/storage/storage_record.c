@@ -153,7 +153,8 @@ static FRESULT open_segment(int seg, bool create)
 
     s_cur_seg = seg;
     s_file_open = true;
-    return FR_OK;
+    /* 新建段先同步目录项，成功后Flash环状态才能引用该文件。 */
+    return create ? f_sync(&s_cur_file) : FR_OK;
 }
 
 /* 删除一段文件（段复用前调用） */

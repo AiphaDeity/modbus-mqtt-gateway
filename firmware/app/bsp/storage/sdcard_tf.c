@@ -14,11 +14,15 @@
 #include "stm32f4xx_hal_sd.h"
 #include "ff_gen_drv.h"   /* Disk_drvTypeDef / disk.is_initialized */
 #include "cmsis_os2.h"
+#include "FreeRTOS.h"
+#include "task.h"
 #include "sdio.h"
 #include "bsp_driver_sd.h"
 
 extern SD_HandleTypeDef hsd;
 extern Disk_drvTypeDef  disk;
+
+#define SDCARD_TRANSFER_TIMEOUT_MS 1000U
 
 static bool s_sd_ready = false;
 
@@ -47,7 +51,7 @@ uint8_t BSP_SD_Init(void)
 
     /* 读扇区0验证真实通路；读失败不得报告初始化成功。 */
     static uint8_t probe_buf[SDCARD_BLOCK_SIZE] __attribute__((aligned(4)));
-    return HAL_SD_ReadBlocks(&hsd, probe_buf, 0U, 1U, 1000U) == HAL_OK
+    return sdcard_tf_read_until(0U, probe_buf, HAL_GetTick() + SDCARD_TRANSFER_TIMEOUT_MS) == HAL_OK
            ? MSD_OK : MSD_ERROR;
 }
 
@@ -193,10 +197,17 @@ HAL_StatusTypeDef sdcard_tf_read_until(uint32_t block, uint8_t *buf, uint32_t de
     if (remaining <= 0) return HAL_TIMEOUT;
     if (buf == NULL || HAL_GPIO_ReadPin(SD_CARD_DET_GPIO_Port, SD_CARD_DET_Pin) != GPIO_PIN_RESET)
         return HAL_ERROR;
-    if (hsd.State != HAL_SD_STATE_READY || hsd.Context != SD_CONTEXT_NONE) return HAL_BUSY;
+    /* 轮询成功后HAL保留上次Context；READY才表示可以开始下一次同步传输。 */
+    if (hsd.State != HAL_SD_STATE_READY) return HAL_BUSY;
     if (block >= hsd.SdCard.LogBlockNbr) return HAL_ERROR;
 
-    HAL_StatusTypeDef st = HAL_SD_ReadBlocks(&hsd, buf, block, 1U, (uint32_t)remaining);
+    uint32_t timeout_ms = (uint32_t)remaining;
+    if (timeout_ms > SDCARD_TRANSFER_TIMEOUT_MS) timeout_ms = SDCARD_TRANSFER_TIMEOUT_MS;
+    /* 轮询搬运FIFO期间只锁调度，保留中断和HAL时基；与已有挂起层数配对。 */
+    bool scheduled = xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED;
+    if (scheduled) vTaskSuspendAll();
+    HAL_StatusTypeDef st = HAL_SD_ReadBlocks(&hsd, buf, block, 1U, timeout_ms);
+    if (scheduled) (void)xTaskResumeAll();
     if ((int32_t)(deadline_ms - HAL_GetTick()) <= 0) return HAL_TIMEOUT;
     return st;
 }
@@ -208,9 +219,14 @@ HAL_StatusTypeDef sdcard_tf_write_until(uint32_t block, const uint8_t *buf, uint
     if (remaining <= 0) return HAL_TIMEOUT;
     if (buf == NULL || HAL_GPIO_ReadPin(SD_CARD_DET_GPIO_Port, SD_CARD_DET_Pin) != GPIO_PIN_RESET)
         return HAL_ERROR;
-    if (hsd.State != HAL_SD_STATE_READY || hsd.Context != SD_CONTEXT_NONE) return HAL_BUSY;
+    if (hsd.State != HAL_SD_STATE_READY) return HAL_BUSY;
     if (block >= hsd.SdCard.LogBlockNbr) return HAL_ERROR;
-    HAL_StatusTypeDef st = HAL_SD_WriteBlocks(&hsd, (uint8_t *)buf, block, 1U, (uint32_t)remaining);
+    uint32_t timeout_ms = (uint32_t)remaining;
+    if (timeout_ms > SDCARD_TRANSFER_TIMEOUT_MS) timeout_ms = SDCARD_TRANSFER_TIMEOUT_MS;
+    bool scheduled = xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED;
+    if (scheduled) vTaskSuspendAll();
+    HAL_StatusTypeDef st = HAL_SD_WriteBlocks(&hsd, (uint8_t *)buf, block, 1U, timeout_ms);
+    if (scheduled) (void)xTaskResumeAll();
     if (st != HAL_OK) return st;
     while ((int32_t)(deadline_ms - HAL_GetTick()) > 0) {
         if (HAL_SD_GetCardState(&hsd) == HAL_SD_CARD_TRANSFER) return HAL_OK;

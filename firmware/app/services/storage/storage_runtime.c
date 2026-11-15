@@ -27,7 +27,7 @@
 #include <string.h>
 #include <stdio.h>
 
-enum { STORAGE_SETTLE = 1, STORAGE_SYNC, STORAGE_SEQUENCE };
+enum { STORAGE_SETTLE = 1, STORAGE_SYNC, STORAGE_SEQUENCE, STORAGE_CONFIG };
 typedef struct {
     uint32_t id;
     uint32_t deadline_ms;
@@ -61,6 +61,8 @@ static uint32_t s_mutations;
 static uint32_t s_deadline;
 static uint32_t s_next_request;
 static volatile uint32_t s_pending;
+/* 原客户端锁和pending号保护值拷贝邮箱；超时客户端不能覆盖未完成请求。 */
+static storage_config_message_t s_config_io;
 extern Disk_drvTypeDef disk;
 static Diskio_drvTypeDef s_disk;
 
@@ -240,7 +242,8 @@ static bool runtime_settled(void)
 }
 
 /* 唯一客户端锁和pending号隔离超时请求；不重发同步或分号操作。 */
-static UpgradeStageResult runtime_exchange(uint32_t action, uint32_t timeout_ms, uint64_t *sequence)
+static UpgradeStageResult runtime_exchange(uint32_t action, uint32_t timeout_ms, uint64_t *sequence,
+                                            storage_config_message_t *config)
 {
     if (s_client == NULL || s_requests == NULL || s_responses == NULL)
         return UPGRADE_STAGE_NOT_READY;
@@ -251,6 +254,12 @@ static UpgradeStageResult runtime_exchange(uint32_t action, uint32_t timeout_ms,
     UpgradeStageResult result = UPGRADE_STAGE_BUSY;
     if (s_pending == 0U && s_next_request != UINT32_MAX) {
         storage_run_req_t req = {++s_next_request, deadline, action};
+        if (config != NULL) {
+            /* BEGIN的归属在投递前确定，即使应答超时也能用原号取消。 */
+            if (config->action == STORAGE_CONFIG_BEGIN || config->action == STORAGE_CONFIG_TF_OPEN)
+                config->session_id = req.id;
+            s_config_io = *config;
+        }
         s_pending = req.id;
         uint32_t remaining = runtime_remaining(deadline);
         if (remaining == 0U || osMessageQueuePut(s_requests, &req, 0U, runtime_ticks(remaining)) != osOK) {
@@ -265,6 +274,7 @@ static UpgradeStageResult runtime_exchange(uint32_t action, uint32_t timeout_ms,
                 if (runtime_remaining(deadline) == 0U) break;
                 result = (UpgradeStageResult)rsp.result;
                 if (sequence != NULL && result == UPGRADE_STAGE_OK) *sequence = rsp.sequence;
+                if (config != NULL && result == UPGRADE_STAGE_OK) *config = s_config_io;
                 break;
             }
         }
@@ -299,7 +309,7 @@ static UpgradeStageResult runtime_settle(void *context, uint32_t timeout_ms)
         uint32_t elapsed = (uint32_t)(HAL_GetTick() - started_ms);
         if (elapsed >= timeout_ms) return UPGRADE_STAGE_TIMEOUT;
         uint32_t remaining = timeout_ms - elapsed;
-        UpgradeStageResult result = runtime_exchange(STORAGE_SETTLE, remaining, NULL);
+        UpgradeStageResult result = runtime_exchange(STORAGE_SETTLE, remaining, NULL, NULL);
         if (result != UPGRADE_STAGE_BUSY) return result;
         if (osDelay(1U) != osOK) return UPGRADE_STAGE_INTERNAL;
     }
@@ -309,7 +319,7 @@ static UpgradeStageResult runtime_settle(void *context, uint32_t timeout_ms)
 static UpgradeStageResult runtime_sync(void *context, uint32_t timeout_ms)
 {
     (void)context;
-    return runtime_exchange(STORAGE_SYNC, timeout_ms, NULL);
+    return runtime_exchange(STORAGE_SYNC, timeout_ms, NULL, NULL);
 }
 
 /* 超时同步还未结束时不开放业务，后续显式恢复可再次检查。 */
@@ -335,9 +345,20 @@ HAL_StatusTypeDef storage_runtime_alloc_seq(uint64_t *sequence)
     if (sequence == NULL) return HAL_ERROR;
     *sequence = 0U;
     if (!storage_mutation_allowed() || s_client == NULL) return HAL_BUSY;
-    UpgradeStageResult result = runtime_exchange(STORAGE_SEQUENCE, 2000U, sequence);
+    UpgradeStageResult result = runtime_exchange(STORAGE_SEQUENCE, 2000U, sequence, NULL);
     return result == UPGRADE_STAGE_OK ? HAL_OK :
            result == UPGRADE_STAGE_TIMEOUT ? HAL_TIMEOUT : HAL_BUSY;
+}
+
+/* Config只传消息值，Flash仍由Storage_Task独占；失败不复制不明输出。 */
+HAL_StatusTypeDef storage_runtime_config(storage_config_message_t *message, uint32_t timeout_ms)
+{
+    if (message == NULL || timeout_ms == 0U || timeout_ms > 20000U) return HAL_ERROR;
+    if (__get_IPSR() != 0U || osKernelGetState() != osKernelRunning) return HAL_BUSY;
+    UpgradeStageResult result = runtime_exchange(STORAGE_CONFIG, timeout_ms, NULL, message);
+    return result == UPGRADE_STAGE_OK ? HAL_OK :
+           result == UPGRADE_STAGE_TIMEOUT ? HAL_TIMEOUT :
+           result == UPGRADE_STAGE_STORAGE ? HAL_ERROR : HAL_BUSY;
 }
 
 /* 创建全部静态同步资源，不访问介质。 */
@@ -384,8 +405,10 @@ bool storage_runtime_start(void)
     const UpgradeQuiesceParticipant participant = {
         runtime_pause, runtime_settle, runtime_sync, runtime_resume, NULL
     };
+    /* 256分频扫描1MiB控制日志约需52s；恢复总限90s，每次I/O仍须报告进展。 */
+    s_deadline = HAL_GetTick() + 90000U;
     return UpgradeQuiesce_Bind(UPGRADE_QUIESCE_STORAGE, &participant) == UPGRADE_STAGE_OK &&
-           storage_runtime_wait(20000U);
+           Monitor_BeginWait(APP_MODULE_STORAGE, 6000U);
 }
 
 /* 固定本阶段总期限；后续进展只影响监督，不延长该期限。 */
@@ -430,30 +453,43 @@ void storage_runtime_process(void)
     if (osMessageQueueGet(s_requests, &req, NULL, 0U) != osOK) return;
     rsp.id = req.id;
     rsp.result = UPGRADE_STAGE_TIMEOUT;
-    /* RPC不能延长存储任务已经声明的本轮I/O及监督期限。 */
-    if (runtime_remaining(req.deadline_ms) < runtime_remaining(s_deadline))
-        s_deadline = req.deadline_ms;
-    if (!storage_runtime_expired()) {
-        if (req.action == STORAGE_SEQUENCE) {
-            HAL_StatusTypeDef st = storage_seq_alloc(&rsp.sequence);
+    /* Config在前段业务I/O已退出后开始独立操作，沿用请求的固定剩余期限。 */
+    if (req.action == STORAGE_CONFIG) {
+        uint32_t remaining = runtime_remaining(req.deadline_ms);
+        storage_runtime_report();
+        if (remaining != 0U && storage_runtime_wait(remaining)) {
+            HAL_StatusTypeDef st = s_config_io.action >= STORAGE_CONFIG_TF_PROBE ?
+                storage_config_tf(&s_config_io, req.deadline_ms) : storage_config_process(&s_config_io);
             rsp.result = st == HAL_OK ? UPGRADE_STAGE_OK :
-                         st == HAL_TIMEOUT ? UPGRADE_STAGE_TIMEOUT : UPGRADE_STAGE_BUSY;
-        } else if (!s_paused || !s_ready || !s_healthy) {
-            rsp.result = UPGRADE_STAGE_NOT_READY;
-        } else if (m2_result == HAL_ERROR || m2_result == HAL_TIMEOUT) {
-            rsp.result = m2_result == HAL_TIMEOUT ? UPGRADE_STAGE_TIMEOUT : UPGRADE_STAGE_STORAGE;
-        } else if (!runtime_settled()) {
-            rsp.result = UPGRADE_STAGE_BUSY;
-        } else if (req.action == STORAGE_SETTLE) {
-            rsp.result = UPGRADE_STAGE_OK;
-        } else if (req.action == STORAGE_SYNC) {
-            s_syncing = true;
-            HAL_StatusTypeDef st = storage_record_sync();
-            s_syncing = false;
-            rsp.result = st == HAL_OK ? UPGRADE_STAGE_OK :
-                         st == HAL_TIMEOUT ? UPGRADE_STAGE_TIMEOUT : UPGRADE_STAGE_STORAGE;
-        } else {
-            rsp.result = UPGRADE_STAGE_INVALID;
+                         st == HAL_TIMEOUT ? UPGRADE_STAGE_TIMEOUT :
+                         st == HAL_BUSY ? UPGRADE_STAGE_BUSY : UPGRADE_STAGE_STORAGE;
+        }
+    } else {
+        /* 既有序号/升级结算RPC不能延长本轮I/O及监督期限。 */
+        if (runtime_remaining(req.deadline_ms) < runtime_remaining(s_deadline))
+            s_deadline = req.deadline_ms;
+        if (!storage_runtime_expired()) {
+            if (req.action == STORAGE_SEQUENCE) {
+                HAL_StatusTypeDef st = storage_seq_alloc(&rsp.sequence);
+                rsp.result = st == HAL_OK ? UPGRADE_STAGE_OK :
+                             st == HAL_TIMEOUT ? UPGRADE_STAGE_TIMEOUT : UPGRADE_STAGE_BUSY;
+            } else if (!s_paused || !s_ready || !s_healthy) {
+                rsp.result = UPGRADE_STAGE_NOT_READY;
+            } else if (m2_result == HAL_ERROR || m2_result == HAL_TIMEOUT) {
+                rsp.result = m2_result == HAL_TIMEOUT ? UPGRADE_STAGE_TIMEOUT : UPGRADE_STAGE_STORAGE;
+            } else if (!runtime_settled()) {
+                rsp.result = UPGRADE_STAGE_BUSY;
+            } else if (req.action == STORAGE_SETTLE) {
+                rsp.result = UPGRADE_STAGE_OK;
+            } else if (req.action == STORAGE_SYNC) {
+                s_syncing = true;
+                HAL_StatusTypeDef st = storage_record_sync();
+                s_syncing = false;
+                rsp.result = st == HAL_OK ? UPGRADE_STAGE_OK :
+                             st == HAL_TIMEOUT ? UPGRADE_STAGE_TIMEOUT : UPGRADE_STAGE_STORAGE;
+            } else {
+                rsp.result = UPGRADE_STAGE_INVALID;
+            }
         }
     }
     if (s_pending == req.id) s_pending = 0U;

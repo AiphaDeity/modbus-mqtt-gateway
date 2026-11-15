@@ -29,6 +29,7 @@
 #include <string.h>
 #include "boot_app_flash.h"
 #include "boot_package_flash.h"
+#include "flash_partition.h"
 #include "boot_upgrade_state.h"
 #include "boot_trial.h"
 #include "boot_recovery.h"
@@ -168,6 +169,7 @@ static void Boot_TestGcm(void)
   {
     printf("GCM valid tag test failed (%d)\r\n", result);
   }
+  // 比较解密明文和预期明文
   else if (memcmp(plaintext, expected_plaintext, sizeof(plaintext)) != 0)
   {
     printf("GCM plaintext mismatch\r\n");
@@ -238,8 +240,8 @@ static void Boot_TestEcdsa(void)
   {
     printf("ECDSA valid signature accepted\r\n");
 
-    // 反向测试：篡改必须被拒绝
-    digest[0] ^= 1U;
+    // 反向测试：翻转摘要中的一位，再验签
+    digest[0] ^= 1U;  // 按位异或赋值，把第一个字节的最低位翻转
     result = Boot_PackageVerifyDigestResult(digest, signature, public_key_bytes);
     if (result == MBEDTLS_ERR_ECP_VERIFY_FAILED)
     {
@@ -256,8 +258,6 @@ static void Boot_TestEcdsa(void)
   }
 
 }
-
-
 #endif
 
 #if defined(DEBUG)
@@ -340,7 +340,7 @@ int main(void)
                                         | RCC_CSR_IWDGRSTF | RCC_CSR_WWDGRSTF)) == 0U);
   // 根据状态和邮箱地址，判断继续运行还是回滚
   Boot_TrialBegin((volatile uint32_t *)UPGRADE_MAILBOX_ADDRESS, software_reset);
-  // 清理标志位
+  // 先清理标志位
   __HAL_RCC_CLEAR_RESET_FLAGS();
 
   /* USER CODE END Init */
@@ -355,7 +355,7 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_USART1_UART_Init();
-  MX_SPI2_Init();
+  MX_SPI3_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
 
@@ -366,17 +366,21 @@ int main(void)
   {
     Error_Handler();
   }
-  // 记录下本次 Bootloader 启动的绝对起点
+  // 记录下本次 Bootloader 启狗成功后的绝对起点，再打印日志
   uint32_t boot_started_ms = HAL_GetTick();
   printf("Boot watchdog active\r\n");
 #endif
 
-  // 发送唤醒命令退出 Flash 深度掉电模式，不修改存储内容。
-  uint8_t wake_command = 0xABU;
-  HAL_GPIO_WritePin(SPI_FLASH_CS_GPIO_Port, SPI_FLASH_CS_Pin, GPIO_PIN_RESET);
-  HAL_StatusTypeDef wake_status = HAL_SPI_Transmit(&hspi2, &wake_command, 1U, 10U);
-  HAL_GPIO_WritePin(SPI_FLASH_CS_GPIO_Port, SPI_FLASH_CS_Pin, GPIO_PIN_SET);
+  // 发送 0xAB，唤醒外部 Flash
+  uint8_t wake_command = 0xABU;  // 准备退出深度掉电的命令
+  // 选中外部 Flash，开始本次通信
+  HAL_GPIO_WritePin(EXT_SPI_FLASH_CS_GPIO_Port, EXT_SPI_FLASH_CS_Pin, GPIO_PIN_RESET);
+  // 通过 SPI3 发送命令
+  HAL_StatusTypeDef wake_status = HAL_SPI_Transmit(&hspi3, &wake_command, 1U, 10U);
+  // 拉高结束本次通信
+  HAL_GPIO_WritePin(EXT_SPI_FLASH_CS_GPIO_Port, EXT_SPI_FLASH_CS_Pin, GPIO_PIN_SET);
   HAL_Delay(1U);
+  // 	输出 HAL 传输状态
   printf("Flash wake: HAL status=%u\r\n", (unsigned int)wake_status);
 
 #if defined(BOOT_STARTUP_DIAGNOSTICS)
@@ -397,8 +401,7 @@ int main(void)
   {
     printf("SHA-256 failed\r\n");
   }
-
-
+  // 正确签名能通过，篡改后应被拒绝
   Boot_TestEcdsa();
 #if !defined(BOOT_FLASH_READ_DIAGNOSTIC)
   // 完成一个诊断阶段后报告进展，仍沿用整组15s起点。
@@ -409,6 +412,8 @@ int main(void)
   }
 #endif
   Boot_TestGcm();
+
+  // 只诊断预设
 #if !defined(BOOT_FLASH_READ_DIAGNOSTIC)
   if (!Boot_WatchdogProgress(boot_started_ms, BOOT_STARTUP_TIMEOUT_MS))
   {
@@ -424,11 +429,13 @@ int main(void)
   for (uint32_t round = 0U; round < 16U; round++)
   {
     memset(rx, 0, sizeof(rx));
-    HAL_GPIO_WritePin(SPI_FLASH_CS_GPIO_Port, SPI_FLASH_CS_Pin, GPIO_PIN_RESET);
-    HAL_StatusTypeDef status = HAL_SPI_TransmitReceive(&hspi2, tx, rx, sizeof(tx), 10U);
-    HAL_GPIO_WritePin(SPI_FLASH_CS_GPIO_Port, SPI_FLASH_CS_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(EXT_SPI_FLASH_CS_GPIO_Port, EXT_SPI_FLASH_CS_Pin, GPIO_PIN_RESET);
+    HAL_StatusTypeDef status = HAL_SPI_TransmitReceive(&hspi3, tx, rx, sizeof(tx), 10U);
+    HAL_GPIO_WritePin(EXT_SPI_FLASH_CS_GPIO_Port, EXT_SPI_FLASH_CS_Pin, GPIO_PIN_SET);
 
-    if ((status == HAL_OK) && (rx[1] == 0xEFU) && (rx[2] == 0x40U) && (rx[3] == 0x18U))
+    // 核对厂家、类型和容量是否匹配外部Flash。
+    uint32_t id = ((uint32_t)rx[1] << 16U) | ((uint32_t)rx[2] << 8U) | rx[3];
+    if ((status == HAL_OK) && (id == FLASH_JEDEC_ID))
     {
       id_ok++;
     }
@@ -437,6 +444,7 @@ int main(void)
            (unsigned int)rx[1], (unsigned int)rx[2], (unsigned int)rx[3]);
     HAL_Delay(1U);
   }
+  // 统计16 次结果，并打印结果
   printf("JEDEC SUMMARY: correct=%lu/16\r\n", (unsigned long)id_ok);
 
   // 读取外部 Flash 起始位置的 16 字节，供串口检查。
@@ -511,10 +519,13 @@ int main(void)
     Error_Handler();
   }
 #else
+  // 初始化可信资料映射
   (void)UpgradeTrust_Initialize();
 #endif
-  const uint8_t *public_key = NULL;
-  const uint8_t *aes_key = NULL;
+  // 准备两个指针变量
+  const uint8_t *public_key = NULL;  // 指向65字节验签公钥，用来验证发布方签名
+  const uint8_t *aes_key = NULL;  // 指向32字节 AES 密钥，用来认证解密升级包
+  // 获是否成功取得对应资料
   bool keys_ready = UpgradeTrust_Get(1U, 1U, &public_key, &aes_key);
   Boot_InstallResult install_result = keys_ready ? Boot_InstallRun(public_key, aes_key) : BOOT_INSTALL_STATE_ERROR;
   Boot_ResetIfWatchdogFailed("install");

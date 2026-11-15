@@ -28,7 +28,7 @@ uint32_t storage_timefloor_get(void);
 // 若 now 比已存下界前进超过阈值则落盘；now 小于下界时不会下调
 HAL_StatusTypeDef storage_timefloor_update(uint32_t now);
 
-// 判断给定时间是否可信（下界为 0 时视为可信）
+// 初始化成功后判断给定UTC秒不早于下界；初始化失败/未完成返回false，合法空白下界不单独否定时间。
 bool storage_timefloor_trusted(uint32_t now);
 
 #endif /* STORAGE_TIMEFLOOR_H */

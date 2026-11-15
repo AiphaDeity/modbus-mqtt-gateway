@@ -50,23 +50,23 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
-    ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/boot_jump.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/boot_app_flash.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/boot_package.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/boot/boot_jump.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/boot/boot_app_flash.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/boot/boot_package.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../shared/upgrade_package.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/boot_package_flash.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/boot_upgrade_state.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/boot_package_receive.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/boot_recovery_receive.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/boot/boot_package_flash.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/boot/boot_upgrade_state.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/boot/boot_package_receive.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/boot/boot_recovery_receive.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../shared/upgrade_state.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../shared/upgrade_transaction.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../shared/upgrade_trust.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/boot_install.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/boot_trial.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/boot_watchdog.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/boot/boot_install.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/boot/boot_trial.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/boot/boot_watchdog.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../shared/watchdog.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/boot_recovery.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/boot_recovery_state.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/boot/boot_recovery.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/boot/boot_recovery_state.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../shared/upgrade_mailbox.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../shared/maint_frame.c
 )
@@ -74,7 +74,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined include paths
-    "${CMAKE_CURRENT_SOURCE_DIR}/../app/bsp/storage"
+    "${CMAKE_CURRENT_SOURCE_DIR}/boot"
     "${CMAKE_CURRENT_SOURCE_DIR}/../shared"
 )
 
@@ -94,7 +94,7 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
 )
 
 # 安全包认证所需的 Mbed TLS 源码，算法由 boot_mbedtls_config.h 裁剪。
-set(BOOT_MBEDTLS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/mbedtls")
+set(BOOT_MBEDTLS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/mbedtls")
 
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     "${BOOT_MBEDTLS_DIR}/library/sha256.c"

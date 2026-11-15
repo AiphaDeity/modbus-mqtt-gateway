@@ -1,218 +1,189 @@
-/*这是 SD3078 时钟芯片的 BSP 驱动底层代码，主要定义了芯片的 I2C 地址、寄存器编号，还有 BCD 码转换宏，用来给上层提供读取和设置时间的接口。
- * rtc_sd3078.c — SD3078 外部 RTC 驱动实现
- *
- * 硬件：I2C1 (PB6=SCL, PB7=SDA)，7位地址 0x32
- * 依赖：CubeMX 已生成 MX_I2C1_Init()，全局句柄 hi2c1
- *
- * SD3078 时间寄存器（BCD 编码）：
- *   0x00 秒   0x01 分   0x02 时   0x03 日
- *   0x04 周   0x05 月   0x06 年   （年 = 实际年份 - 2000）
- * 控制寄存器：
- *   0x0F 写使能控制   0x10 写保护解锁
+/*
+ * SD3078时间读写及UTC Unix秒换算；I2C互斥由调用方持有。
+ * 初始化只探测，不清除上电/停振标志；显式校时成功后才清除停振标志。
  */
-
 #include "rtc_sd3078.h"
 #include "stm32f4xx_hal_i2c.h"
 
-extern I2C_HandleTypeDef hi2c1;   // CubeMX 在 i2c.c 里定义的全局句柄
+extern I2C_HandleTypeDef hi2c1;
 
-#define SD3078_I2C_ADDR_WR  (0x32 << 1)  // 0x64  写地址
-#define SD3078_I2C_ADDR_RD  ((0x32 << 1) | 0x01)  // 0x65  读地址
+#define SD3078_I2C_ADDR  (0x32U << 1)
+#define SD3078_REG_SEC   0x00U
+#define SD3078_REG_WEEK  0x03U
+#define SD3078_REG_DAY   0x04U
+#define SD3078_REG_CTRL1 0x0FU
+#define SD3078_REG_CTRL2 0x10U
+#define SD3078_WRTC1    0x80U
+#define SD3078_WRTC2    0x04U
+#define SD3078_WRTC3    0x80U
+#define SD3078_OSF      0x40U
+#define SD3078_RTCF     0x01U
 
-#define SD3078_REG_SEC      0x00
-#define SD3078_REG_MIN      0x01
-#define SD3078_REG_HOUR     0x02
-#define SD3078_REG_DAY      0x03
-#define SD3078_REG_WEEK     0x04
-#define SD3078_REG_MONTH    0x05
-#define SD3078_REG_YEAR     0x06
-#define SD3078_REG_WRTC     0x0F   // 写使能控制寄存器
-#define SD3078_REG_WRTC2    0x10   // 写保护解锁寄存器
+#define BCD2DEC(b) (((b) >> 4) * 10U + ((b) & 0x0FU))
+#define DEC2BCD(d) ((((d) / 10U) << 4) | ((d) % 10U))
 
-#define BCD2DEC(b)  (((b) >> 4) * 10 + ((b) & 0x0F))
-#define DEC2BCD(d)  ((((d) / 10) << 4) | ((d) % 10))
+static const uint8_t s_month_days[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
 
-/* ---------- 内部工具函数 ---------- */
-
-// 向单个寄存器写 1 字节
-//&hi2c1：IIC外设句柄；SD3078_I2C_ADDR_W：芯片的8位写地址
-//reg：芯片内部的寄存器地址；I2C_MEMADD_SIZE_8BIT：地址字节大小为8位
-//val：要写入的字节值
-static HAL_StatusTypeDef sd3078_write_reg(uint8_t reg, uint8_t val)
-{
-    return HAL_I2C_Mem_Write(&hi2c1, SD3078_I2C_ADDR_WR,
-                             reg, I2C_MEMADD_SIZE_8BIT,
-                             &val, 1, 100);
-}
-
-// 从单个寄存器读 1 字节
+// 读取单个寄存器，HAL使用左移一位的7位器件地址。
 static HAL_StatusTypeDef sd3078_read_reg(uint8_t reg, uint8_t *val)
 {
-    return HAL_I2C_Mem_Read(&hi2c1, SD3078_I2C_ADDR_RD,
-                            reg, I2C_MEMADD_SIZE_8BIT,
-                            val, 1, 100);
+    return HAL_I2C_Mem_Read(&hi2c1, SD3078_I2C_ADDR, reg,
+                           I2C_MEMADD_SIZE_8BIT, val, 1, 100);
 }
 
-// 解锁写保护，允许修改时间寄存器
+// 只修改指定控制位，保留报警、电源和其他控制状态。
+static HAL_StatusTypeDef sd3078_update_bits(uint8_t reg, uint8_t clear, uint8_t set)
+{
+    uint8_t value;
+    HAL_StatusTypeDef st = sd3078_read_reg(reg, &value);
+    if (st != HAL_OK) return st;
+    value = (uint8_t)((value & ~clear) | set);
+    return HAL_I2C_Mem_Write(&hi2c1, SD3078_I2C_ADDR, reg,
+                            I2C_MEMADD_SIZE_8BIT, &value, 1, 100);
+}
+
+// 按WRTC1、WRTC2、WRTC3顺序解锁，失败由校时调用方统一重新上锁。
 static HAL_StatusTypeDef sd3078_unlock_write(void)
 {
-    // 1) 向 0x10 写 0x80 解锁写保护
-    if (sd3078_write_reg(SD3078_REG_WRTC2, 0x80) != HAL_OK)
-        return HAL_ERROR;
-    // 2) 向 0x0F 写 0x84 使能写并启动 RTC
-    return sd3078_write_reg(SD3078_REG_WRTC, 0x84);
-}
-
-// 重新上锁，恢复写保护
-static HAL_StatusTypeDef sd3078_lock_write(void)
-{
-    return sd3078_write_reg(SD3078_REG_WRTC, 0x00);
-}
-
-/* ---------- 对外 API ---------- */
-
-HAL_StatusTypeDef rtc_sd3078_init(void)
-{
-    uint8_t reg;
-    HAL_StatusTypeDef st;
-
-    // 探测：读秒寄存器，成功说明 I2C 通了
-    st = sd3078_read_reg(SD3078_REG_SEC, &reg);
-    if (st != HAL_OK)
-        return HAL_ERROR;   // 芯片不在线
-
-    // 如果 RTC 停了（STOP 标志），重启
-    if (!rtc_sd3078_is_running()) {
-        st = sd3078_unlock_write();
-        if (st != HAL_OK) return HAL_ERROR;
-        // 重新上锁
-        sd3078_lock_write();
-    }
-    return HAL_OK;
-}
-
-HAL_StatusTypeDef rtc_sd3078_get_time(rtc_datetime_t *dt)
-{
-    uint8_t buf[7];
-    HAL_StatusTypeDef st;
-
-    if (dt == NULL)
-        return HAL_ERROR;
-
-    // 连续读 0x00~0x06 共 7 个寄存器
-    st = HAL_I2C_Mem_Read(&hi2c1, SD3078_I2C_ADDR_RD,
-                          SD3078_REG_SEC, I2C_MEMADD_SIZE_8BIT,
-                          buf, 7, 100);
-    if (st != HAL_OK)
-        return HAL_ERROR;
-
-    // BCD → 十进制
-    dt->second  = BCD2DEC(buf[0] & 0x7F);
-    dt->minute  = BCD2DEC(buf[1] & 0x7F);
-    dt->hour    = BCD2DEC(buf[2] & 0x3F);
-    dt->day     = BCD2DEC(buf[3] & 0x3F);
-    dt->weekday = buf[4] & 0x07;
-    dt->month   = BCD2DEC(buf[5] & 0x1F);
-    dt->year    = 2000 + BCD2DEC(buf[6]);
-
-    return HAL_OK;
-}
-
-HAL_StatusTypeDef rtc_sd3078_set_time(const rtc_datetime_t *dt)
-{
-    uint8_t buf[7];
-    HAL_StatusTypeDef st;
-
-    if (dt == NULL)
-        return HAL_ERROR;
-
-    // 十进制 → BCD
-    buf[0] = DEC2BCD(dt->second)  & 0x7F;
-    buf[1] = DEC2BCD(dt->minute)  & 0x7F;
-    buf[2] = DEC2BCD(dt->hour)    & 0x3F;
-    buf[3] = DEC2BCD(dt->day)     & 0x3F;
-    buf[4] = dt->weekday & 0x07;
-    buf[5] = DEC2BCD(dt->month)   & 0x1F;
-    buf[6] = DEC2BCD(dt->year - 2000);
-
-    // 解锁写保护
-    st = sd3078_unlock_write();
-    if (st != HAL_OK)
-        return HAL_ERROR;
-
-    // 连续写 7 个时间寄存器
-    st = HAL_I2C_Mem_Write(&hi2c1, SD3078_I2C_ADDR_WR,
-                           SD3078_REG_SEC, I2C_MEMADD_SIZE_8BIT,
-                           buf, 7, 100);
-
-    // 无论成功失败都重新上锁
-    sd3078_lock_write();
+    HAL_StatusTypeDef st = sd3078_update_bits(SD3078_REG_CTRL2, 0, SD3078_WRTC1);
+    if (st == HAL_OK) st = sd3078_update_bits(SD3078_REG_CTRL1, 0, SD3078_WRTC2);
+    if (st == HAL_OK) st = sd3078_update_bits(SD3078_REG_CTRL1, 0, SD3078_WRTC3);
     return st;
 }
 
+// 先清WRTC2/3再清WRTC1；第一步失败也尝试关闭外层写允许。
+static HAL_StatusTypeDef sd3078_lock_write(void)
+{
+    HAL_StatusTypeDef st = sd3078_update_bits(SD3078_REG_CTRL1, SD3078_WRTC2 | SD3078_WRTC3, 0);
+    HAL_StatusTypeDef outer = sd3078_update_bits(SD3078_REG_CTRL2, SD3078_WRTC1, 0);
+    return st == HAL_OK ? outer : st;
+}
+
+// 校验RTC可表示的公历日期；2000～2099年内闰年可按4整除判断。
+static bool sd3078_valid_date(const rtc_datetime_t *dt)
+{
+    if (dt == NULL || dt->year < 2000U || dt->year > 2099U ||
+        dt->month < 1U || dt->month > 12U || dt->day < 1U ||
+        dt->hour > 23U || dt->minute > 59U || dt->second > 59U || dt->weekday > 6U)
+        return false;
+    uint8_t days = s_month_days[dt->month - 1U];
+    if (dt->month == 2U && dt->year % 4U == 0U) days++;
+    return dt->day <= days;
+}
+
+// 只探测控制寄存器；不能通过初始化写操作抹去时间失效证据。
+HAL_StatusTypeDef rtc_sd3078_init(void)
+{
+    uint8_t status;
+    return sd3078_read_reg(SD3078_REG_CTRL1, &status);
+}
+
+// 一次连续读取得到锁存时间，拒绝非法BCD/日期并正确换算12小时制。
+HAL_StatusTypeDef rtc_sd3078_get_time(rtc_datetime_t *dt)
+{
+    if (dt == NULL) return HAL_ERROR;
+    uint8_t buf[7];
+    HAL_StatusTypeDef st = HAL_I2C_Mem_Read(&hi2c1, SD3078_I2C_ADDR,
+                                          SD3078_REG_SEC, I2C_MEMADD_SIZE_8BIT,
+                                          buf, sizeof(buf), 100);
+    if (st != HAL_OK) return st;
+
+    const uint8_t mask[7] = {0x7F, 0x7F, (buf[2] & 0x80U) ? 0x3F : 0x1F, 0x07, 0x3F, 0x1F, 0xFF};
+    for (uint32_t i = 0U; i < sizeof(buf); i++) {
+        uint8_t value = buf[i] & mask[i];
+        if (i != SD3078_REG_WEEK && ((value & 0x0FU) > 9U || (value >> 4U) > 9U))
+            return HAL_ERROR;
+    }
+
+    rtc_datetime_t value = {
+        .year = (uint16_t)(2000U + BCD2DEC(buf[6])),
+        .month = (uint8_t)BCD2DEC(buf[5] & 0x1FU),
+        .day = (uint8_t)BCD2DEC(buf[SD3078_REG_DAY] & 0x3FU),
+        .hour = (uint8_t)BCD2DEC(buf[2] & mask[2]),
+        .minute = (uint8_t)BCD2DEC(buf[1] & 0x7FU),
+        .second = (uint8_t)BCD2DEC(buf[0] & 0x7FU),
+        .weekday = buf[SD3078_REG_WEEK] & 0x07U
+    };
+    if ((buf[2] & 0x80U) == 0U) {
+        if (value.hour < 1U || value.hour > 12U) return HAL_ERROR;
+        value.hour = (uint8_t)(value.hour % 12U + ((buf[2] & 0x20U) ? 12U : 0U));
+    }
+    if (!sd3078_valid_date(&value)) return HAL_ERROR;
+    *dt = value;
+    return HAL_OK;
+}
+
+// 显式写入完整7字节时间并使用24小时制，所有失败路径均尝试重新上锁。
+HAL_StatusTypeDef rtc_sd3078_set_time(const rtc_datetime_t *dt)
+{
+    if (!sd3078_valid_date(dt)) return HAL_ERROR;
+    uint8_t buf[7] = {
+        DEC2BCD(dt->second), DEC2BCD(dt->minute), DEC2BCD(dt->hour) | 0x80U,
+        dt->weekday, DEC2BCD(dt->day), DEC2BCD(dt->month), DEC2BCD(dt->year - 2000U)
+    };
+    HAL_StatusTypeDef st = sd3078_unlock_write();
+    if (st == HAL_OK)
+        st = HAL_I2C_Mem_Write(&hi2c1, SD3078_I2C_ADDR, SD3078_REG_SEC,
+                              I2C_MEMADD_SIZE_8BIT, buf, sizeof(buf), 100);
+    if (st == HAL_OK) {
+        rtc_datetime_t verify;
+        st = rtc_sd3078_get_time(&verify);
+        uint32_t expected = rtc_sd3078_to_unix(dt);
+        uint32_t actual = st == HAL_OK ? rtc_sd3078_to_unix(&verify) : 0U;
+        if (actual < expected || actual - expected > 1U) st = HAL_ERROR;
+    }
+    if (st == HAL_OK)
+        st = sd3078_update_bits(SD3078_REG_CTRL1, SD3078_OSF, 0);
+    HAL_StatusTypeDef locked = sd3078_lock_write();
+    return st == HAL_OK ? locked : st;
+}
+
+// 无上电/历史停振标志才可采用RTC值；不把秒寄存器的保留位当作运行标志。
 bool rtc_sd3078_is_running(void)
 {
-    uint8_t sec;
-    if (sd3078_read_reg(SD3078_REG_SEC, &sec) != HAL_OK)
-        return false;
-    // bit7 (ST 标志) = 1 表示停止
-    return (sec & 0x80) == 0;
+    uint8_t status;
+    return sd3078_read_reg(SD3078_REG_CTRL1, &status) == HAL_OK &&
+           (status & (SD3078_OSF | SD3078_RTCF)) == 0U;
 }
 
-/* ---------- Unix 时间转换（纯数学，不碰硬件） ---------- */
-
+// 将2000～2099公历时间转为从1970年起的UTC Unix秒；非法日期返回0。
 uint32_t rtc_sd3078_to_unix(const rtc_datetime_t *dt)
 {
-    int days = 0;
-    int y;
-
-    // 从 2000-01-01 算起的天数
-    for (y = 2000; y < dt->year; y++) {
-        days += ((y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)) ? 366 : 365;
-    }
-    // 本年累计天数。闰年 2 月要按 29 天算，否则 3 月起会少算 1 天
-    const int mdays[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
-    int leap_day = ((dt->year % 4 == 0 && dt->year % 100 != 0) ||
-                    (dt->year % 400 == 0)) ? 1 : 0;
-    for (int m = 0; m < dt->month - 1; m++)
-        days += mdays[m] + ((m == 1) ? leap_day : 0);
-    days += (dt->day - 1);
-
-    return (uint32_t)days * 86400U
-         + (uint32_t)dt->hour * 3600U
-         + (uint32_t)dt->minute * 60U
-         + (uint32_t)dt->second;
+    if (!sd3078_valid_date(dt)) return 0U;
+    uint32_t days = 0U;
+    for (uint32_t year = 2000U; year < dt->year; year++)
+        days += year % 4U == 0U ? 366U : 365U;
+    for (uint32_t month = 1U; month < dt->month; month++)
+        days += s_month_days[month - 1U] + (month == 2U && dt->year % 4U == 0U ? 1U : 0U);
+    days += dt->day - 1U;
+    return RTC_SD3078_UNIX_MIN + days * 86400U +
+           dt->hour * 3600U + dt->minute * 60U + dt->second;
 }
 
+// 将UTC Unix秒转为RTC日期；超出芯片范围时清零输出，weekday按周日为0计算。
 void rtc_sd3078_from_unix(uint32_t unix_s, rtc_datetime_t *dt)
 {
     if (dt == NULL) return;
-
-    const int mdays[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
-    uint32_t days = unix_s / 86400U;
-    uint32_t rem  = unix_s % 86400U;
-
-    dt->hour    = (uint8_t)(rem / 3600U);
-    rem        %= 3600U;
-    dt->minute  = (uint8_t)(rem / 60U);
-    dt->second  = (uint8_t)(rem % 60U);
-
-    int y = 2000;
-    while (1) {
-        int leap = ((y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)) ? 366 : 365;
-        if (days < (uint32_t)leap) break;
-        days -= leap;
-        y++;
+    *dt = (rtc_datetime_t){0};
+    if (unix_s < RTC_SD3078_UNIX_MIN || unix_s > RTC_SD3078_UNIX_MAX) return;
+    uint32_t seconds = unix_s - RTC_SD3078_UNIX_MIN;
+    uint32_t days = seconds / 86400U;
+    uint32_t remainder = seconds % 86400U;
+    dt->hour = (uint8_t)(remainder / 3600U);
+    dt->minute = (uint8_t)(remainder % 3600U / 60U);
+    dt->second = (uint8_t)(remainder % 60U);
+    dt->weekday = (uint8_t)((unix_s / 86400U + 4U) % 7U);
+    uint16_t year = 2000U;
+    while (days >= (year % 4U == 0U ? 366U : 365U)) {
+        days -= year % 4U == 0U ? 366U : 365U;
+        year++;
     }
-    dt->year = (uint16_t)y;
-
-    int leap_day = ((y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)) ? 1 : 0;
-    int m = 0;
-    while (m < 11 && days >= (uint32_t)(mdays[m] + (m == 1 ? leap_day : 0))) {
-        days -= (uint32_t)(mdays[m] + (m == 1 ? leap_day : 0));
-        m++;
+    dt->year = year;
+    uint32_t month = 1U;
+    while (days >= s_month_days[month - 1U] + (month == 2U && year % 4U == 0U ? 1U : 0U)) {
+        days -= s_month_days[month - 1U] + (month == 2U && year % 4U == 0U ? 1U : 0U);
+        month++;
     }
-    dt->month = (uint8_t)(m + 1);
-    dt->day   = (uint8_t)(days + 1);
-    dt->weekday = 0; // 暂不计算星期
+    dt->month = (uint8_t)month;
+    dt->day = (uint8_t)(days + 1U);
 }

@@ -23,8 +23,8 @@
  *   偏移 32+len  crc32(4)       覆盖 header+payload
  *   偏移 508  commit(4)         提交尾标（最后写入）
  *
- * 双区策略：当前区写满后回收另一区（整区 64KB 块擦除），再切换过去继续写。
- * 回收期间 append 返回 HAL_BUSY。
+ * 当前区写满后只允许擦除无已提交记录的另一区；两区都有保留记录时返回BUSY。
+ * 有效控制记录的过期、输出确认及压缩尚未接入，不能靠整区覆盖实现回收。
  */
 
 #define CTRLLOG_FORMAT_VERSION   1U
@@ -50,19 +50,20 @@ typedef struct {
 
 typedef void (*ctrllog_visit_fn)(const ctrllog_record_t *rec, void *user);
 
-// 初始化：扫描双区，恢复上次写入位置与最近去重键
+// 初始化：扫描双区，恢复上次写入位置和最大序列号。
 HAL_StatusTypeDef storage_ctrllog_init(void);
 
 /*
  * 追加一条记录。
- * dedup_key != 0 且最近 128 条内已存在相同 (stream,dedup_key) 时跳过写入，
- * 并通过 is_duplicate 告知调用方（可为 NULL）。
+ * Storage_Task同步调用，payload在返回前保持可读且不变，不保留指针。
+ * 非零键扫描两区：同(stream,key)且内容一致跳过写入并置is_duplicate，可为NULL；
+ * 同键异内容、读取或已提交槽校验失败返回ERROR，空间满或正在擦空区返回BUSY。
  */
 HAL_StatusTypeDef storage_ctrllog_append(uint16_t stream, uint64_t dedup_key,
                                          const void *payload, uint16_t len,
                                          bool *is_duplicate);
 
-// 按写入顺序（旧→新）遍历有效记录
+// Storage_Task按旧→新遍历；payload仅在回调内有效，回调不能重入日志操作；I/O/已提交槽损坏返回ERROR。
 HAL_StatusTypeDef storage_ctrllog_foreach(ctrllog_visit_fn fn, void *user);
 
 // 推进整区回收（在 M3 任务循环中周期性调用）

@@ -1,16 +1,46 @@
 #include <reent.h>
 #include <stdint.h>
+#include <stddef.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "FreeRTOS.h"
 #include "task.h"
 #include "main.h"
+#include "app_modules.h"
 
 extern uint8_t _siccmram[];
 extern uint8_t _sccmram[];
 extern uint8_t _eccmram[];
 extern uint8_t _sccmram_bss[];
 extern uint8_t _eccmram_bss[];
+extern uint8_t _end[];
+extern uint8_t _sstack[];
+static size_t c_heap_peak;
+
+void *__real__sbrk(ptrdiff_t increment);
+
+// 复用原newlib堆边界实现，仅记录实际扩展峰值，不另建分配器。
+void *__wrap__sbrk(ptrdiff_t increment)
+{
+  void *result = __real__sbrk(increment);
+  if (result != (void *)-1 && increment > 0)
+  {
+    size_t used = (uintptr_t)result + (size_t)increment - (uintptr_t)_end;
+    if (used > c_heap_peak) c_heap_peak = used;
+  }
+  return result;
+}
+
+// 只在阶段边界打印一次；C堆值为分配器地址扩展峰值，不冒充活跃对象字节数。
+void AppMemory_Report(const char *phase)
+{
+  printf("MEM phase=%s c_arena_peak=%lu c_capacity=%lu rtos_min_free=%lu stack_min_free=%lu B\r\n",
+         phase, (unsigned long)c_heap_peak,
+         (unsigned long)((uintptr_t)_sstack - (uintptr_t)_end),
+         (unsigned long)xPortGetMinimumEverFreeHeapSize(),
+         (unsigned long)(uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t)));
+}
 
 // 在构造函数和 main 前建立 CCM 初值；仅由 preinit 在每次启动时调用一次。
 static void AppMemory_InitCcm(void)

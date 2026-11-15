@@ -3,6 +3,9 @@
 #include "app_upgrade.h"
 #include "app_monitor.h"
 #include "main.h"
+#include "app_config.h"
+#include "storage_runtime.h"
+#include "storage_upgrade_tf.h"
 
 #include "cmsis_os2.h"
 #include "FreeRTOS.h"
@@ -69,10 +72,9 @@ static bool ButtonReleased(TfButton *button, bool pressed, uint32_t now_ms)
   return released;
 }
 
-// 只授权升级任务由本次实体按键触发的TF操作，网络来源保持未开放。
-static bool AuthorizeButton(void *context, const UpgradeEntryPeer *peer)
+// 只授权升级任务由本次实体按键触发的TF操作。
+bool UpgradeTf_Authorize(const UpgradeEntryPeer *peer)
 {
-  (void)context;
   if ((peer == NULL) || (peer->source != UPGRADE_STAGE_SOURCE_TF)
       || !App_IsCurrentModuleTask(APP_MODULE_UPGRADE))
   {
@@ -84,18 +86,10 @@ static bool AuthorizeButton(void *context, const UpgradeEntryPeer *peer)
   return allowed;
 }
 
-// 在统一模块装配中绑定实体按键授权，不创建任务或访问介质。
+// 标记按键模块已初始化，不创建任务或访问介质。
 AppModuleInitResult UpgradeTf_Init(void)
 {
-  if (!initialized)
-  {
-    const UpgradeEntryPolicy policy = {AuthorizeButton, NULL};
-    if (UpgradeEntry_BindPolicy(&policy) != UPGRADE_STAGE_OK)
-    {
-      return APP_MODULE_INIT_FAILED;
-    }
-    initialized = true;
-  }
+  initialized = true;
   return APP_MODULE_INIT_OK;
 }
 
@@ -449,6 +443,27 @@ static void ImportFromButton(void)
   taskENTER_CRITICAL();
   bool file_service_ready = bound;
   taskEXIT_CRITICAL();
+  storage_config_message_t files = {.action = STORAGE_CONFIG_TF_PROBE};
+  if (!Monitor_UpgradeWait(2000U))
+  {
+    return;
+  }
+  HAL_StatusTypeDef probe = storage_runtime_config(&files, 2000U);
+  if (!Monitor_UpgradeProgress())
+  {
+    return;
+  }
+  if (probe != HAL_OK || files.total_len == 0U
+      || files.total_len == (STORAGE_TF_CONFIG_FILE | STORAGE_TF_FIRMWARE_FILE))
+  {
+    printf("TF import rejected: probe=%u files=%lu\r\n", (unsigned)probe, (unsigned long)files.total_len);
+    return;
+  }
+  if (files.total_len == STORAGE_TF_CONFIG_FILE)
+  {
+    printf("TF config request: accepted=%u\r\n", AppConfig_RequestTfImport() ? 1U : 0U);
+    return;
+  }
   if (!status.backend_ready || !file_service_ready || !UpgradeQuiesce_IsReady())
   {
     printf("TF upgrade rejected: storage, trust or module callbacks not ready\r\n");
@@ -474,6 +489,7 @@ static void ImportFromButton(void)
   UpgradeTfResult output;
   printf("TF upgrade begin: epoch=%lu\r\n", (unsigned long)peer.epoch);
   (void)UpgradeTf_Import(&peer, UPGRADE_TF_PATH, &output);
+  AppMemory_Report("tf-finish");
   if (output.result != UPGRADE_STAGE_OK)
   {
     (void)CleanupButtonImport(&output);

@@ -32,7 +32,6 @@
 #include "m3_flash_probe.h"
 #endif
 
-#define SELF_JEDEC_ID   0xEF4018U   /* W25Q128：厂家 0xEF + 容量 0x18 */
 #define SELF_MIN_YEAR   2024U       /* 低于此年视为 RTC 未校时 */
 
 /*
@@ -92,14 +91,12 @@ void m3_selftest_run(void)
     m3_flash_probe_run();
 #endif
 
-    /* 1. SPI Flash：JEDEC ID 必须是 0xEF4018
-     *    0xEF=Winbond、0x40=SPI NOR、0x18=24 位地址即 16MB。
-     *    这是整条 SPI 链路最简单的验证：不需要地址、不需要擦写。 */
+    /* 1. SPI Flash：只读核对W25Q64的JEDEC ID，不代表擦写通路通过。 */
     {
         uint32_t id = spi_flash_w25q128_read_id();
 
         snprintf(detail, sizeof(detail), "jedec=%06lX", (unsigned long)id);
-        judge(id == SELF_JEDEC_ID ? SELF_PASS : SELF_FAIL, "SPI Flash", detail);
+        judge(id == FLASH_JEDEC_ID ? SELF_PASS : SELF_FAIL, "SPI Flash", detail);
     }
 
     /* 2. RTC：能读到时间 + 年份合理；未校时只报警告，不算故障 */

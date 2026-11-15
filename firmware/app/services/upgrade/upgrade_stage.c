@@ -40,14 +40,22 @@ static bool TaskContext(void)
   return (__get_IPSR() == 0U) && (osKernelGetState() == osKernelRunning);
 }
 
-// 排除业务和监督任务，并检查当前任务的历史最小空闲栈。
+// 排除业务和监督任务，按当前栈指针检查本次调用可用的栈空间。
 bool UpgradeStage_ExecutorAllowed(void)
 {
-  return TaskContext() && !App_IsCurrentModuleTask(APP_MODULE_STORAGE)
-      && !App_IsCurrentModuleTask(APP_MODULE_MQTT) && !App_IsCurrentModuleTask(APP_MODULE_MODBUS)
-      && !App_IsCurrentModuleTask(APP_MODULE_MONITOR)
-      && ((uint32_t)uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t)
-          >= UPGRADE_EXECUTOR_MIN_FREE_STACK_BYTES);
+  if (!TaskContext() || App_IsCurrentModuleTask(APP_MODULE_STORAGE)
+      || App_IsCurrentModuleTask(APP_MODULE_MQTT) || App_IsCurrentModuleTask(APP_MODULE_MODBUS)
+      || App_IsCurrentModuleTask(APP_MODULE_MONITOR))
+  {
+    return false;
+  }
+  TaskStatus_t task_status;
+  vTaskGetInfo(NULL, &task_status, pdFALSE, eRunning);
+  uintptr_t stack_base = (uintptr_t)task_status.pxStackBase;
+  uintptr_t stack_pointer = (uintptr_t)__get_PSP();
+  // Cortex-M4栈向低地址增长；历史最低余量仍由监督任务检查。
+  return (stack_pointer >= stack_base)
+      && ((stack_pointer - stack_base) >= UPGRADE_EXECUTOR_MIN_FREE_STACK_BYTES);
 }
 
 // 长操作期间不关闭中断；其他修改请求返回BUSY，查询仍可读取上次完整快照。

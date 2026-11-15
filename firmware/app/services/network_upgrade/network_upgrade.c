@@ -16,7 +16,6 @@
 
 #include <stdio.h>
 #include <string.h>
-#include <stdlib.h>
 
 #include "cmsis_os2.h"
 #include "FreeRTOS.h"
@@ -28,6 +27,7 @@
 #include "upgrade_quiesce.h"
 #include "app_upgrade.h"
 #include "app_modules.h"
+#include "app_monitor.h"
 #include "mqtt_client.h"
 #include "telemetry_task.h"
 
@@ -37,7 +37,7 @@ typedef struct
     char     task_id[NW_UPG_TASK_ID_MAX];
     char     version[NW_UPG_VERSION_MAX];
     uint32_t size;
-    char     sha256_hex[NW_UPG_SHA256_HEX_LEN + 1];
+    uint8_t  sha256[UPGRADE_STAGE_SHA256_SIZE];
     char     url[NW_UPG_URL_MAX];
     char     token[NW_UPG_TOKEN_MAX];
     bool     valid;
@@ -53,12 +53,16 @@ typedef struct
 } nw_download_ctx_t;
 
 /* ===== 前向声明（内部函数） ===== */
-static void NetworkUpgrade_Task(void *argument);
 static void report_boot_result(void);
 
 /* ===== 模块状态 ===== */
 static volatile bool s_initialized = false;
 static volatile bool s_task_started = false;
+static osThreadId_t s_upgrade_thread;
+static NetworkUpgradeAuthorization s_authorization;
+static bool s_authorization_bound;
+static bool s_authorized;
+static bool s_cleanup_pending; // 仅执行任务读写，区别于Notify尚未发布的请求。
 
 /* 升级执行任务同步：Notify 设 request + 释放信号量，Task 获取后执行 */
 static osSemaphoreId_t s_notify_sem = NULL;
@@ -72,38 +76,33 @@ static bool s_boot_result_done;
 /* epoch 分配计数器（每次下载尝试唯一，本次启动不复用） */
 static volatile uint32_t s_epoch_counter = 0;
 
-/* ota_status topic（Init 时拼好，百度云模式 $iot/{dk}/user/ota_status） */
-static char s_ota_status_topic[96] __attribute__((section(".bss.ccmram"))) = {0};
-
-/* ===== 升级执行任务静态资源（6KiB，放 CCMRAM 不挤占 SRAM） ===== */
-_Alignas(8) static StackType_t s_upgrade_stack[NETWORK_UPGRADE_TASK_STACK_BYTES / sizeof(StackType_t)] __attribute__((section(".bss.ccmram")));
-static StaticTask_t s_upgrade_control_block __attribute__((section(".bss.ccmram")));
-static const osThreadAttr_t s_upgrade_attributes =
-{
-    .name = "nw_upgrade",
-    .cb_mem = &s_upgrade_control_block,
-    .cb_size = sizeof(s_upgrade_control_block),
-    .stack_mem = s_upgrade_stack,
-    .stack_size = sizeof(s_upgrade_stack),
-    .priority = NETWORK_UPGRADE_TASK_PRIORITY,
-};
-
-/* ===== JSON 手写解析（找 "key":"value" 或 "key":number） ===== */
-static void json_extract_string(const char *json, const char *key, char *out, int out_max)
+// 有界读取通知字符串；缺省字段留空，转义、控制字符或截断均拒绝。
+static bool json_extract_string(const char *json, const char *key, char *out, int out_max)
 {
     char needle[64];
     snprintf(needle, sizeof(needle), "\"%s\"", key);
     const char *p = strstr(json, needle);
-    if (!p) { out[0] = '\0'; return; }
+    out[0] = '\0';
+    if (!p) return true;
     p += strlen(needle);
-    while (*p == ' ' || *p == ':' || *p == '\t') p++;
-    if (*p != '"') { out[0] = '\0'; return; }
+    p += strspn(p, " \t\r\n");
+    if (*p++ != ':') return false;
+    p += strspn(p, " \t\r\n");
+    if (*p != '"') return false;
     p++;
     int i = 0;
-    while (*p && *p != '"' && i < out_max - 1) { out[i++] = *p++; }
+    while (*p && *p != '"')
+    {
+        if ((unsigned char)*p < 0x20U || *p == '\\' || i >= out_max - 1) return false;
+        out[i++] = *p++;
+    }
     out[i] = '\0';
+    if (*p++ != '"') return false;
+    p += strspn(p, " \t\r\n");
+    return *p == ',' || *p == '}';
 }
 
+// 包长只接受十进制整数；在累加前检查槽容量，拒绝溢出及非法尾部。
 static int32_t json_extract_int(const char *json, const char *key)
 {
     char needle[64];
@@ -111,9 +110,19 @@ static int32_t json_extract_int(const char *json, const char *key)
     const char *p = strstr(json, needle);
     if (!p) return -1;
     p += strlen(needle);
-    while (*p == ' ' || *p == ':' || *p == '\t') p++;
-    if (*p == '-' || (*p >= '0' && *p <= '9')) return atoi(p);
-    return -1;
+    p += strspn(p, " \t\r\n");
+    if (*p++ != ':') return -1;
+    p += strspn(p, " \t\r\n");
+    if (*p < '0' || *p > '9' || (*p == '0' && p[1] >= '0' && p[1] <= '9')) return -1;
+    uint32_t value = 0U;
+    while (*p >= '0' && *p <= '9')
+    {
+        uint32_t digit = (uint32_t)(*p++ - '0');
+        if (value > (UPGRADE_STAGE_MAX_PACKAGE_SIZE - digit) / 10U) return -1;
+        value = value * 10U + digit;
+    }
+    p += strspn(p, " \t\r\n");
+    return (*p == ',' || *p == '}') ? (int32_t)value : -1;
 }
 
 /* hex 字符串转字节数组（sha256: 64 hex char → 32B） */
@@ -135,7 +144,8 @@ static int hex_to_bytes(const char *hex, uint8_t *out, int out_max)
 /* ===== 状态上报：PUBLISH ota_status ===== */
 static void report_status(const char *task_id, const char *phase, const char *detail)
 {
-    if (s_ota_status_topic[0] == '\0') return;
+    const char *topic = MqttClient_TopicOtaStatus();
+    if (!topic || topic[0] == '\0') return;
     char buf[256];
     int len;
     if (detail && detail[0])
@@ -148,17 +158,18 @@ static void report_status(const char *task_id, const char *phase, const char *de
         len = snprintf(buf, sizeof(buf),
             "{\"task_id\":\"%s\",\"phase\":\"%s\"}", task_id, phase);
     }
-    MqttClient_PublishQos1(s_ota_status_topic, (const uint8_t *)buf, (size_t)len);
+    MqttClient_PublishQos1(topic, (const uint8_t *)buf, (size_t)len);
 }
 
 static void report_progress(const char *task_id, uint32_t offset, uint32_t total)
 {
-    if (s_ota_status_topic[0] == '\0') return;
+    const char *topic = MqttClient_TopicOtaStatus();
+    if (!topic || topic[0] == '\0') return;
     char buf[256];
     int len = snprintf(buf, sizeof(buf),
         "{\"task_id\":\"%s\",\"phase\":\"downloading\",\"offset\":%u,\"total\":%u}",
         task_id, (unsigned)offset, (unsigned)total);
-    MqttClient_PublishQos1(s_ota_status_topic, (const uint8_t *)buf, (size_t)len);
+    MqttClient_PublishQos1(topic, (const uint8_t *)buf, (size_t)len);
 }
 
 static const char *phase_to_string(int phase)
@@ -183,23 +194,77 @@ const char *NetworkUpgrade_GetPhaseString(void)
     return phase_to_string(s_phase);
 }
 
-/* ===== 授权回调（UpgradeEntryPolicy.authorize） =====
- * 只读、快速、可并发查询。不从请求 JSON 读布尔量当授权。
- * 当前实现：执行任务发起的下载总是授权（M2 已校验云端任务）。
- */
-static bool authorize_callback(void *context, const UpgradeEntryPeer *peer)
+// 在初始化前绑定完整通知的核验回调，不将格式正确当作授权。
+UpgradeStageResult NetworkUpgrade_BindAuthorization(const NetworkUpgradeAuthorization *authorization)
 {
-    (void)context;
-    (void)peer;
-    /* M2 在 Notify 时已校验 JSON 格式和来源，执行任务的 peer 由 M2 分配，总是授权 */
-    return true;
+    if (!authorization || !authorization->verify) return UPGRADE_STAGE_INVALID;
+    if ((__get_IPSR() != 0U) || (osKernelGetState() != osKernelRunning)) return UPGRADE_STAGE_MODE;
+    taskENTER_CRITICAL();
+    if (s_authorization_bound || s_initialized)
+    {
+        taskEXIT_CRITICAL();
+        return UPGRADE_STAGE_BUSY;
+    }
+    s_authorization = *authorization;
+    s_authorization_bound = true;
+    taskEXIT_CRITICAL();
+    return UPGRADE_STAGE_OK;
 }
 
-static const UpgradeEntryPolicy s_policy =
+// 只允许网络执行任务使用当前已核验通知对应的epoch及尚未撤销的许可。
+bool NetworkUpgrade_Authorize(const UpgradeEntryPeer *peer)
 {
-    .authorize = authorize_callback,
-    .context = NULL,
-};
+    if (!peer || (peer->source != UPGRADE_STAGE_SOURCE_NETWORK) || (peer->epoch == 0U)
+        || (__get_IPSR() != 0U) || (osKernelGetState() != osKernelRunning)
+        || (osThreadGetId() != s_upgrade_thread)) return false;
+    taskENTER_CRITICAL();
+    bool allowed = s_initialized && s_task_started && s_authorization_bound
+                && s_upgrade_in_progress && s_authorized && (peer->epoch == s_epoch_counter);
+    taskEXIT_CRITICAL();
+    return allowed;
+}
+
+// MQTT任务撤销当前通知许可；即使认证正在执行，也用原epoch请求Stage取消。
+UpgradeStageResult NetworkUpgrade_Revoke(void)
+{
+    if ((__get_IPSR() != 0U) || (osKernelGetState() != osKernelRunning)
+        || !App_IsCurrentModuleTask(APP_MODULE_MQTT)) return UPGRADE_STAGE_MODE;
+    taskENTER_CRITICAL();
+    bool active = s_upgrade_in_progress;
+    UpgradeEntryPeer peer = {UPGRADE_STAGE_SOURCE_NETWORK, s_epoch_counter};
+    s_authorized = false;
+    taskEXIT_CRITICAL();
+    return active ? UpgradeEntry_Disconnect(&peer) : UPGRADE_STAGE_MODE;
+}
+
+// 取消并结算原会话；失败或提交结果不明时保留占用，由执行任务空闲轮询重试。
+static void cleanup_attempt(const UpgradeEntryPeer *peer)
+{
+    taskENTER_CRITICAL();
+    s_authorized = false;
+    taskEXIT_CRITICAL();
+    UpgradeStageResult result = UpgradeEntry_Disconnect(peer);
+    UpgradeStageStatus status;
+    bool closed = result == UPGRADE_STAGE_OK;
+    if (result == UPGRADE_STAGE_MODE)
+    {
+        closed = (UpgradeStage_GetStatus(&status) == UPGRADE_STAGE_OK)
+              && !status.busy && !status.cleanup_pending && (status.resume_error == UPGRADE_STAGE_OK)
+              && ((status.phase == UPGRADE_STAGE_IDLE) || (status.phase == UPGRADE_STAGE_ERROR));
+    }
+    if (closed)
+    {
+        taskENTER_CRITICAL();
+        s_upgrade_in_progress = false;
+        taskEXIT_CRITICAL();
+    }
+    else if (!s_cleanup_pending)
+    {
+        printf("[NWUPG] cleanup pending: epoch=%u result=%s\r\n",
+               (unsigned)peer->epoch, UpgradeEntry_ErrorName(result));
+    }
+    s_cleanup_pending = !closed;
+}
 
 /* ===== 下载回调：调 UpgradeEntry_Write ===== */
 static nw_dl_status_t download_chunk_callback(void *ctx_, uint32_t offset,
@@ -303,38 +368,25 @@ static const UpgradeQuiesceParticipant s_quiesce_participant =
 };
 
 /* ===== 初始化 ===== */
-void NetworkUpgrade_Init(void)
+AppModuleInitResult NetworkUpgrade_Init(void)
 {
-    if (s_initialized) return;
+    if (s_initialized) return APP_MODULE_INIT_OK;
 
     /* 信号量：Notify 释放，Task 获取（初始 0，每次 Notify 释放 1） */
-    s_notify_sem = osSemaphoreNew(1, 0, NULL);
+    if (!s_notify_sem) s_notify_sem = osSemaphoreNew(1, 0, NULL);
     if (!s_notify_sem)
     {
         printf("[NWUPG] sem create fail, upgrade unavailable\r\n");
-        return;
-    }
-
-    /* ota_status topic：从 MqttClient 获取（百度云模式 $iot/{dk}/user/ota_status） */
-    const char *ota_topic = MqttClient_TopicOtaStatus();
-    if (ota_topic && ota_topic[0])
-    {
-        strncpy(s_ota_status_topic, ota_topic, sizeof(s_ota_status_topic) - 1);
-    }
-
-    /* 绑定权限策略 */
-    UpgradeStageResult ret = UpgradeEntry_BindPolicy(&s_policy);
-    if (ret != UPGRADE_STAGE_OK)
-    {
-        printf("[NWUPG] BindPolicy fail: %s\r\n", UpgradeEntry_ErrorName(ret));
-        /* 不阻断启动，升级不可用而已 */
+        return APP_MODULE_INIT_FAILED;
     }
 
     /* 绑定网络门控 */
-    ret = UpgradeQuiesce_Bind(UPGRADE_QUIESCE_NETWORK, &s_quiesce_participant);
+    UpgradeStageResult ret = UpgradeQuiesce_Bind(UPGRADE_QUIESCE_NETWORK, &s_quiesce_participant);
     if (ret != UPGRADE_STAGE_OK)
     {
         printf("[NWUPG] QuiesceBind(NETWORK) fail: %s\r\n", UpgradeEntry_ErrorName(ret));
+        if (osSemaphoreDelete(s_notify_sem) == osOK) s_notify_sem = NULL;
+        return APP_MODULE_INIT_FAILED;
     }
 
     /* 初始化 TLS 模块（熵源 + CTR_DRBG + 时间函数注册） */
@@ -346,87 +398,131 @@ void NetworkUpgrade_Init(void)
     }
 
     s_initialized = true;
-    printf("[NWUPG] Init OK: policy+quiesce bound\r\n");
-}
-
-/* ===== 创建执行任务 ===== */
-void NetworkUpgrade_StartTask(void)
-{
-    if (!s_initialized || s_task_started) return;
-
-    osThreadId_t tid = osThreadNew((osThreadFunc_t)NetworkUpgrade_Task,
-                                   NULL, &s_upgrade_attributes);
-    if (tid)
-    {
-        s_task_started = true;
-        printf("[NWUPG] task started (stack=%d)\r\n", NETWORK_UPGRADE_TASK_STACK_BYTES);
-    }
-    else
-    {
-        printf("[NWUPG] task create fail\r\n");
-    }
+    printf("[NWUPG] resources ready; task authorization %s\r\n",
+           s_authorization_bound ? "bound" : "NOT_READY");
+    return tls_ret == HTTPS_TLS_OK ? APP_MODULE_INIT_OK : APP_MODULE_INIT_NOT_READY;
 }
 
 /* ===== MQTT 回调收到升级通知 ===== */
 int NetworkUpgrade_Notify(const char *json)
 {
-    if (!s_initialized || !s_task_started) return -3;
-    if (s_upgrade_in_progress) return -2;
+    if (!json) return -1;
+    if ((__get_IPSR() != 0U) || (osKernelGetState() != osKernelRunning)
+        || !App_IsCurrentModuleTask(APP_MODULE_MQTT)) return -3;
+    taskENTER_CRITICAL();
+    if (!s_initialized || !s_task_started || !s_authorization_bound || (s_epoch_counter == UINT32_MAX))
+    {
+        taskEXIT_CRITICAL();
+        return -3;
+    }
+    if (s_upgrade_in_progress)
+    {
+        taskEXIT_CRITICAL();
+        return -2;
+    }
+    // 发布请求前占用原单槽，防止执行任务取走前被下一条通知覆盖。
+    s_upgrade_in_progress = true;
+    s_authorized = false;
+    ++s_epoch_counter;
+    taskEXIT_CRITICAL();
+    int result = -1;
 
     /* 解析 JSON 到 s_pending_req */
     memset(&s_pending_req, 0, sizeof(s_pending_req));
-    json_extract_string(json, "task_id", s_pending_req.task_id, sizeof(s_pending_req.task_id));
-    json_extract_string(json, "version", s_pending_req.version, sizeof(s_pending_req.version));
-    json_extract_string(json, "sha256", s_pending_req.sha256_hex, sizeof(s_pending_req.sha256_hex));
-    json_extract_string(json, "url", s_pending_req.url, sizeof(s_pending_req.url));
-    json_extract_string(json, "token", s_pending_req.token, sizeof(s_pending_req.token));
-    s_pending_req.size = (uint32_t)json_extract_int(json, "size");
+    char sha256_hex[NW_UPG_SHA256_HEX_LEN + 1];
+    if (!json_extract_string(json, "task_id", s_pending_req.task_id, sizeof(s_pending_req.task_id)) ||
+        !json_extract_string(json, "version", s_pending_req.version, sizeof(s_pending_req.version)) ||
+        !json_extract_string(json, "sha256", sha256_hex, sizeof(sha256_hex)) ||
+        !json_extract_string(json, "url", s_pending_req.url, sizeof(s_pending_req.url)) ||
+        !json_extract_string(json, "token", s_pending_req.token, sizeof(s_pending_req.token))) goto rejected;
+    int32_t size = json_extract_int(json, "size");
+    s_pending_req.size = size > 0 ? (uint32_t)size : 0U;
 
     /* 校验必填字段 */
-    if (s_pending_req.url[0] == '\0' || s_pending_req.size == 0 ||
-        s_pending_req.sha256_hex[0] == '\0')
+    if (s_pending_req.task_id[0] == '\0' || s_pending_req.version[0] == '\0' ||
+        s_pending_req.url[0] == '\0' || s_pending_req.size < UPGRADE_STAGE_MIN_PACKAGE_SIZE ||
+        hex_to_bytes(sha256_hex, s_pending_req.sha256, sizeof(s_pending_req.sha256)) != 0)
     {
-        printf("[NWUPG] Notify: missing required fields\r\n");
-        return -1;
+        printf("[NWUPG] Notify: invalid required fields\r\n");
+        goto rejected;
     }
 
+    // 核验这条完整通知后才发布本次epoch的许可，不能复用上一条通知的核验结果。
+    result = -3;
+    if (!s_authorization.verify(s_authorization.context, json)) goto rejected;
+    s_authorized = true;
     s_pending_req.valid = true;
-    printf("[NWUPG] Notify: task=%s ver=%s size=%u url=%s\r\n",
+    printf("[NWUPG] Notify: task=%s ver=%s size=%u\r\n",
            s_pending_req.task_id, s_pending_req.version,
-           (unsigned)s_pending_req.size, s_pending_req.url);
+           (unsigned)s_pending_req.size);
 
     /* 唤醒执行任务 */
-    osSemaphoreRelease(s_notify_sem);
+    if (osSemaphoreRelease(s_notify_sem) != osOK) goto rejected;
     return 0;
+
+rejected:
+    taskENTER_CRITICAL();
+    s_pending_req.valid = false;
+    s_authorized = false;
+    s_upgrade_in_progress = false;
+    taskEXIT_CRITICAL();
+    return result;
 }
 
-/* ===== 升级执行任务 ===== */
-static void NetworkUpgrade_Task(void *argument)
+/* 在原网络升级任务中登记监督，串行执行下载、认证与启动结果上报。 */
+void NetworkUpgrade_Task(void *argument)
 {
     (void)argument;
+
+    if (!s_initialized ||
+        !Monitor_RegisterHealth(APP_MODULE_NETWORK_UPGRADE, 3000U,
+                                UPGRADE_STAGE_PREPARE_TIMEOUT_MS + 1000U))
+    {
+        Monitor_ReportFatal(APP_MODULE_NETWORK_UPGRADE);
+        return;
+    }
+    taskENTER_CRITICAL();
+    s_upgrade_thread = osThreadGetId();
+    s_task_started = true;
+    taskEXIT_CRITICAL();
 
     printf("[NWUPG] task running, waiting for notify...\r\n");
 
     for (;;)
     {
+        if (!Monitor_UpgradeProgress() || !Monitor_UpgradeWait(1000U))
+        {
+            Monitor_ReportFatal(APP_MODULE_NETWORK_UPGRADE);
+            return;
+        }
         /* 空闲时每秒尝试交接启动结果；收到下载通知后立即消费，不在此处等待上报。 */
         osStatus_t wait = osSemaphoreAcquire(s_notify_sem, osKernelGetTickFreq());
+        if (!Monitor_UpgradeProgress())
+        {
+            Monitor_ReportFatal(APP_MODULE_NETWORK_UPGRADE);
+            return;
+        }
         if (wait != osOK)
         {
+            if (s_cleanup_pending)
+            {
+                UpgradeEntryPeer previous = {UPGRADE_STAGE_SOURCE_NETWORK, s_epoch_counter};
+                cleanup_attempt(&previous);
+            }
             report_boot_result();
             continue;
         }
         if (!s_pending_req.valid) continue;
 
-        s_upgrade_in_progress = true;
         nw_upgrade_request_t req;
         memcpy(&req, &s_pending_req, sizeof(req));
         s_pending_req.valid = false;
 
         printf("[NWUPG] === upgrade start: task=%s ===\r\n", req.task_id);
+        AppMemory_Report("network-begin");
 
-        /* 分配 epoch（每次下载尝试唯一） */
-        uint32_t epoch = ++s_epoch_counter;
+        /* 使用Notify准入时分配的epoch，取消结算前不允许下一条通知替换。 */
+        uint32_t epoch = s_epoch_counter;
 
         UpgradeEntryPeer peer =
         {
@@ -434,30 +530,19 @@ static void NetworkUpgrade_Task(void *argument)
             .epoch = epoch,
         };
 
-        /* sha256 hex → 32B */
-        uint8_t sha256_bytes[UPGRADE_STAGE_SHA256_SIZE];
-        if (hex_to_bytes(req.sha256_hex, sha256_bytes, sizeof(sha256_bytes)) != 0)
-        {
-            printf("[NWUPG] sha256 hex parse fail: %s\r\n", req.sha256_hex);
-            report_status(req.task_id, "failed", "E_SHA256_FORMAT");
-            s_phase = 6;
-            s_upgrade_in_progress = false;
-            continue;
-        }
-
         /* ① Begin */
         uint32_t session_id = 0;
         s_phase = 1;
         report_status(req.task_id, "downloading", NULL);
 
         UpgradeStageResult ret = UpgradeEntry_Begin(&peer, NULL, req.size,
-                                                    sha256_bytes, &session_id);
+                                                    req.sha256, &session_id);
         if (ret != UPGRADE_STAGE_OK)
         {
             printf("[NWUPG] Begin fail: %s\r\n", UpgradeEntry_ErrorName(ret));
             report_status(req.task_id, "failed", UpgradeEntry_ErrorName(ret));
             s_phase = 6;
-            s_upgrade_in_progress = false;
+            cleanup_attempt(&peer);
             continue;
         }
         printf("[NWUPG] Begin OK: session=%u epoch=%u\r\n", (unsigned)session_id, (unsigned)epoch);
@@ -483,15 +568,14 @@ static void NetworkUpgrade_Task(void *argument)
         };
 
         nw_dl_status_t dl_ret = NetworkDownloader_Fetch(&dl_params);
+        AppMemory_Report("network-download");
         if (dl_ret != NW_DL_OK)
         {
             printf("[NWUPG] download fail: %s\r\n", NetworkDownloader_ErrorString(dl_ret));
             report_status(req.task_id, "failed", NetworkDownloader_ErrorString(dl_ret));
             /* 取消会话 */
-            UpgradeEntry_Abort(&peer, session_id);
-            UpgradeEntry_Disconnect(&peer);
             s_phase = 6;
-            s_upgrade_in_progress = false;
+            cleanup_attempt(&peer);
             continue;
         }
 
@@ -500,13 +584,13 @@ static void NetworkUpgrade_Task(void *argument)
         report_status(req.task_id, "verifying", NULL);
 
         ret = UpgradeEntry_Finish(&peer, session_id);
+        AppMemory_Report("network-finish");
         if (ret != UPGRADE_STAGE_OK)
         {
             printf("[NWUPG] Finish fail: %s\r\n", UpgradeEntry_ErrorName(ret));
             report_status(req.task_id, "failed", UpgradeEntry_ErrorName(ret));
-            UpgradeEntry_Disconnect(&peer);
             s_phase = 6;
-            s_upgrade_in_progress = false;
+            cleanup_attempt(&peer);
             continue;
         }
 
@@ -524,8 +608,7 @@ static void NetworkUpgrade_Task(void *argument)
                UpgradeEntry_ErrorName(ret));
         report_status(req.task_id, "failed", "E_REBOOT");
 
-        s_upgrade_in_progress = false;
-        /* 不 continue，任务结束（重启后不会到这） */
+        cleanup_attempt(&peer);
     }
 }
 

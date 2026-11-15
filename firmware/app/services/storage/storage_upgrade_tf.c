@@ -22,7 +22,7 @@
 
 #define UPG_TF_CHUNK 256U
 _Static_assert(_FS_LOCK >= 2, "Upgrade lease needs record and firmware file locks");
-enum { TF_OPEN = 1, TF_READ, TF_CLOSE };
+enum { TF_OPEN = 1, TF_READ, TF_CLOSE, TF_PROBE };
 
 typedef struct {
     uint32_t req_id;
@@ -31,6 +31,7 @@ typedef struct {
     uint32_t offset;
     uint16_t len;
     uint8_t type;
+    uint8_t config_file;
 } tf_req_t;
 
 typedef struct {
@@ -62,6 +63,7 @@ static bool s_open;
 static bool s_failed;
 static uint32_t s_lease;
 static uint32_t s_size;
+static uint8_t s_config_file;
 static uint32_t s_deadline;
 _Alignas(8) static uint8_t s_sector[SDCARD_BLOCK_SIZE];
 extern Disk_drvTypeDef disk;
@@ -109,7 +111,7 @@ static DRESULT tf_disk_write(BYTE lun, const BYTE *buf, DWORD sector, UINT count
 }
 
 /* 在单一存储所有者内临时替换磁盘读回调；返回前恢复生成驱动，不改生成代码。 */
-static FRESULT tf_file_io(const tf_req_t *req, uint8_t *data, UINT *actual)
+static FRESULT tf_file_io(const tf_req_t *req, uint8_t *data, UINT *actual, uint32_t *files)
 {
     if (disk.drv[0] == NULL || disk.is_initialized[0] == 0U) return FR_NOT_READY;
     const Diskio_drvTypeDef *original = disk.drv[0];
@@ -123,8 +125,20 @@ static FRESULT tf_file_io(const tf_req_t *req, uint8_t *data, UINT *actual)
     disk.drv[0] = &bounded;
 
     FRESULT fr;
-    if (req->type == TF_OPEN) {
-        fr = f_open(&s_file, UPGRADE_TF_PATH, FA_READ);
+    if (req->type == TF_PROBE) {
+        *files = 0U;
+        FILINFO info;
+        fr = FR_OK;
+        const char *paths[2] = {STORAGE_TF_CONFIG_PATH, UPGRADE_TF_PATH};
+        for (uint32_t i = 0U; i < 2U; i++) {
+            FRESULT found = f_stat(paths[i], &info);
+            if (found == FR_NO_FILE || found == FR_NO_PATH) continue;
+            if (found != FR_OK) { fr = found; break; }
+            if ((info.fattrib & AM_DIR) != 0U) { fr = FR_INVALID_OBJECT; break; }
+            *files |= 1UL << i;
+        }
+    } else if (req->type == TF_OPEN) {
+        fr = f_open(&s_file, req->config_file ? STORAGE_TF_CONFIG_PATH : UPGRADE_TF_PATH, FA_READ);
     } else if (req->type == TF_CLOSE) {
         fr = f_close(&s_file);
     } else {
@@ -145,10 +159,19 @@ static void tf_handle(const tf_req_t *req, tf_rsp_t *rsp)
     rsp->type = req->type;
     rsp->result = UPGRADE_STAGE_INVALID;
     s_deadline = req->deadline_ms;
-    if (req->lease == 0U || req->req_id == 0U ||
-        req->type < TF_OPEN || req->type > TF_CLOSE) return;
+    if ((req->lease == 0U && req->type != TF_PROBE) || req->req_id == 0U ||
+        req->type < TF_OPEN || req->type > TF_PROBE || req->config_file > 1U) return;
     if (tf_remaining(s_deadline) == 0U) {
         rsp->result = UPGRADE_STAGE_TIMEOUT;
+        return;
+    }
+    if (req->type == TF_PROBE) {
+        if (s_open || !storage_mutation_allowed()) { rsp->result = UPGRADE_STAGE_BUSY; return; }
+        UINT unused = 0U;
+        FRESULT fr = tf_file_io(req, NULL, &unused, &rsp->size);
+        rsp->detail = (uint32_t)fr;
+        rsp->result = tf_remaining(s_deadline) == 0U ? UPGRADE_STAGE_TIMEOUT :
+                      fr == FR_OK ? UPGRADE_STAGE_OK : UPGRADE_STAGE_STORAGE;
         return;
     }
     if (req->type == TF_CLOSE && !s_open) {
@@ -168,7 +191,7 @@ static void tf_handle(const tf_req_t *req, tf_rsp_t *rsp)
             rsp->result = UPGRADE_STAGE_NOT_READY;
             return;
         }
-    } else if (!s_open || req->lease != s_lease) {
+    } else if (!s_open || req->lease != s_lease || req->config_file != s_config_file) {
         rsp->result = UPGRADE_STAGE_MODE;
         return;
     } else if (req->type == TF_READ &&
@@ -180,12 +203,13 @@ static void tf_handle(const tf_req_t *req, tf_rsp_t *rsp)
     }
 
     UINT actual = 0U;
-    FRESULT fr = tf_file_io(req, rsp->data, &actual);
+    FRESULT fr = tf_file_io(req, rsp->data, &actual, &rsp->size);
     rsp->detail = (uint32_t)fr;
     if (req->type == TF_OPEN && fr == FR_OK) {
         s_open = true;
         s_failed = false;
         s_lease = req->lease;
+        s_config_file = req->config_file;
         s_size = (uint32_t)f_size(&s_file);
         rsp->size = s_size;
     } else if (req->type == TF_CLOSE && fr == FR_OK) {
@@ -207,6 +231,31 @@ static void tf_handle(const tf_req_t *req, tf_rsp_t *rsp)
         rsp->actual_len = (uint16_t)actual;
         rsp->result = UPGRADE_STAGE_OK;
     }
+}
+
+/* Config复用原运行RPC，配置和固件租约即使同号也不能互相读取或关闭。 */
+HAL_StatusTypeDef storage_config_tf(storage_config_message_t *message, uint32_t deadline_ms)
+{
+    if (!storage_runtime_is_owner() || message == NULL || message->len > UPG_TF_CHUNK)
+        return HAL_ERROR;
+    uint8_t type = message->action == STORAGE_CONFIG_TF_OPEN ? TF_OPEN :
+                   message->action == STORAGE_CONFIG_TF_READ ? TF_READ :
+                   message->action == STORAGE_CONFIG_TF_CLOSE ? TF_CLOSE :
+                   message->action == STORAGE_CONFIG_TF_PROBE ? TF_PROBE : 0U;
+    if (type == 0U) return HAL_ERROR;
+    tf_req_t req = {.req_id = 1U, .lease = message->session_id, .deadline_ms = deadline_ms,
+                    .offset = message->offset, .len = (uint16_t)message->len, .type = type, .config_file = 1U};
+    tf_rsp_t rsp;
+    tf_handle(&req, &rsp);
+    if (rsp.result != UPGRADE_STAGE_OK)
+        return rsp.result == UPGRADE_STAGE_TIMEOUT ? HAL_TIMEOUT :
+               rsp.result == UPGRADE_STAGE_BUSY || rsp.result == UPGRADE_STAGE_MODE ? HAL_BUSY : HAL_ERROR;
+    if (type == TF_OPEN || type == TF_PROBE) message->total_len = rsp.size;
+    if (type == TF_READ) {
+        if (rsp.actual_len != message->len) return HAL_ERROR;
+        memcpy(message->data, rsp.data, rsp.actual_len);
+    }
+    return HAL_OK;
 }
 
 /* 同步等待对应应答，迟到消息丢弃；队列中始终没有客户端指针。 */

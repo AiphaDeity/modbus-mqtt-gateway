@@ -1,16 +1,12 @@
 #include "upgrade_trust.h"
 
-#include "stm32f4xx.h"
 #include "mbedtls/ecp.h"
 
 #include <stddef.h>
 #include <string.h>
 
-// F407的OTP块12～15保存一份128 B记录，对应的四个锁字节须均为0。
-#define TRUST_OTP_FIRST_BLOCK 12U
-#define TRUST_OTP_BLOCK_COUNT 4U
-#define TRUST_OTP_BLOCK_SIZE 32U
-#define TRUST_OTP_LOCK_OFFSET 512U
+// Boot链接脚本保留末尾128 B，普通App安装不会擦写此区域。
+#define TRUST_FLASH_ADDRESS 0x0800FF80U
 #define TRUST_RECORD_SIZE 128U
 #define TRUST_PUBLIC_KEY_OFFSET 20U
 #define TRUST_AES_KEY_OFFSET 85U
@@ -19,11 +15,8 @@
 
 static const uint8_t trust_magic[8] = {'G', 'W', 'T', 'R', 'U', 'S', 'T', 0U};
 
-_Static_assert(TRUST_OTP_BLOCK_COUNT * TRUST_OTP_BLOCK_SIZE == TRUST_RECORD_SIZE,
-               "Trust record must occupy four OTP blocks");
-_Static_assert(FLASH_OTP_BASE + TRUST_OTP_LOCK_OFFSET + TRUST_OTP_FIRST_BLOCK
-                 + TRUST_OTP_BLOCK_COUNT - 1U <= FLASH_OTP_END,
-               "Trust locks outside OTP");
+_Static_assert(TRUST_FLASH_ADDRESS + TRUST_RECORD_SIZE == 0x08010000U,
+               "Trust record must end at the App boundary");
 
 // 记录整数采用小端编码，不依赖结构体布局或指针对齐。
 static uint32_t Read32(const uint8_t *data)
@@ -79,7 +72,7 @@ static bool PublicKeyValid(const uint8_t *public_key)
   return valid;
 }
 
-// 启动时只读已锁定的OTP记录；失败清零输出，成功指针直接指向不可变OTP。
+// 启动时校验Boot预留记录；失败清零输出，成功返回运行期间有效的只读指针。
 bool UpgradeTrust_ReadPlatform(UpgradeTrustKeys *keys)
 {
   if (keys == NULL)
@@ -87,17 +80,7 @@ bool UpgradeTrust_ReadPlatform(UpgradeTrustKeys *keys)
     return false;
   }
   memset(keys, 0, sizeof(*keys));
-  const volatile uint8_t *locks = (const volatile uint8_t *)(FLASH_OTP_BASE
-                               + TRUST_OTP_LOCK_OFFSET + TRUST_OTP_FIRST_BLOCK);
-  for (uint32_t i = 0U; i < TRUST_OTP_BLOCK_COUNT; i++)
-  {
-    if (locks[i] != 0U)
-    {
-      return false;
-    }
-  }
-  const uint8_t *record = (const uint8_t *)(FLASH_OTP_BASE
-                       + TRUST_OTP_FIRST_BLOCK * TRUST_OTP_BLOCK_SIZE);
+  const uint8_t *record = (const uint8_t *)TRUST_FLASH_ADDRESS;
   if ((memcmp(record, trust_magic, sizeof(trust_magic)) != 0)
       || (Read32(record + 8U) != TRUST_RECORD_SIZE)
       || (Read32(record + 12U) != 1U) || (Read32(record + 16U) != 1U)

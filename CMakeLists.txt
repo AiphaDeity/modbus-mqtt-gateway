@@ -27,11 +27,11 @@ else()
     message(FATAL_ERROR "GATEWAY_FIRMWARE must be either 'app' or 'bootloader'")
 endif()
 
-# 普通构建默认只读F407 OTP；可指定其他保护区实现，源码不得嵌入生产密钥。
+# 普通构建只读Boot预留信任记录；可指定其他保护区实现，源码不嵌入密钥。
 set(GATEWAY_UPGRADE_TRUST_SOURCE "" CACHE FILEPATH "Protected-storage upgrade trust provider")
 set(upgrade_trust_source "${GATEWAY_UPGRADE_TRUST_SOURCE}")
 if(NOT upgrade_trust_source AND NOT BOOT_PACKAGE_RECEIVE_TEST)
-    set(upgrade_trust_source "${CMAKE_CURRENT_SOURCE_DIR}/firmware/shared/upgrade_trust_otp.c")
+    set(upgrade_trust_source "${CMAKE_CURRENT_SOURCE_DIR}/firmware/shared/upgrade_trust_flash.c")
 endif()
 if(upgrade_trust_source)
     if(BOOT_PACKAGE_RECEIVE_TEST)

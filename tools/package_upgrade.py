@@ -1,4 +1,4 @@
-"""制作V2/IWDG_HANDOFF加密包；读取外部可信密钥，nonce账本防止同一AES密钥重复使用nonce。"""
+"""制作V2加密包或Boot预留区信任记录；加密包使用持久nonce账本防止重复。"""
 
 import argparse
 from contextlib import contextmanager
@@ -8,10 +8,32 @@ from pathlib import Path
 import secrets
 import sqlite3
 import struct
+import zlib
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, utils
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+
+# 与设备信任记录保持一致，拒绝长度错误及全00/FF的设备AES密钥。
+def validate_aes_key(aes_key):
+    if len(aes_key) != 32 or aes_key in (bytes(32), b"\xff" * 32):
+        raise ValueError("设备AES密钥须为32 B，且不能全为00或FF")
+
+
+# 按Boot/App共用的128 B布局制作记录，不连接设备或写入保护区。
+def make_trust_record(public_key, aes_key):
+    validate_aes_key(aes_key)
+    if not isinstance(public_key, ec.EllipticCurvePublicKey) or public_key.curve.name != "secp256r1":
+        raise ValueError("验签公钥必须为ECDSA P-256")
+    record = bytearray(128)
+    record[:8] = b"GWTRUST\x00"
+    struct.pack_into("<III", record, 8, 128, 1, 1)
+    record[20:85] = public_key.public_bytes(serialization.Encoding.X962,
+                                           serialization.PublicFormat.UncompressedPoint)
+    record[85:117] = aes_key
+    struct.pack_into("<I", record, 124, zlib.crc32(record[:124]))
+    return bytes(record)
 
 
 @contextmanager
@@ -31,6 +53,7 @@ def open_ledger(path, initialize=False):
 
 # 为首次使用的 AES 密钥登记随机前缀和计数器，拒绝覆盖已有记录。
 def initialize_ledger(path, aes_key):
+    validate_aes_key(aes_key)
     fingerprint = hashlib.sha256(aes_key).digest()
     with open_ledger(path, initialize=True) as database:
         database.execute("PRAGMA synchronous=FULL")
@@ -46,6 +69,7 @@ def initialize_ledger(path, aes_key):
 
 # 先持久递增密钥计数器，再返回 12 B nonce，失败不回收已消耗编号。
 def reserve_nonce(path, aes_key):
+    validate_aes_key(aes_key)
     fingerprint = hashlib.sha256(aes_key).digest()
     with open_ledger(path) as database:
         database.execute("PRAGMA synchronous=FULL")
@@ -74,8 +98,9 @@ def make_package(firmware, signing_key, aes_key, nonce, *, firmware_version, per
         raise ValueError("App向量或链接地址不合法；必须为0x08010000偏移App")
     if not isinstance(signing_key, ec.EllipticCurvePrivateKey) or signing_key.curve.name != "secp256r1":
         raise ValueError("签名私钥必须为ECDSA P-256")
-    if len(aes_key) != 32 or len(nonce) != 12:
-        raise ValueError("AES密钥须32 B、nonce须12 B")
+    validate_aes_key(aes_key)
+    if len(nonce) != 12:
+        raise ValueError("nonce须12 B")
     manifest = bytearray(128)
     manifest[:8] = b"GWUPD001"
     struct.pack_into("<HH", manifest, 8, 2, 128)
@@ -101,7 +126,9 @@ def make_package(firmware, signing_key, aes_key, nonce, *, firmware_version, per
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--aes-key", type=Path, required=True, help="受控的32 B设备AES密钥文件")
-    parser.add_argument("--nonce-ledger", type=Path, required=True, help="此AES密钥持续使用并备份的SQLite账本")
+    parser.add_argument("--nonce-ledger", type=Path, help="此AES密钥持续使用并备份的SQLite账本")
+    parser.add_argument("--trust-record", type=Path, help="仅生成含设备AES密钥的128 B Boot信任记录；目标必须位于Git外")
+    parser.add_argument("--public-key", type=Path, help="生成信任记录使用的P-256 PEM验签公钥")
     parser.add_argument("--initialize-ledger", action="store_true", help="仅密钥首次使用时登记；已有记录禁止重置")
     parser.add_argument("--input", type=Path, help="受控的偏移App bin")
     parser.add_argument("--signing-key", type=Path, help="受控的P-256 PEM私钥")
@@ -111,20 +138,39 @@ def main():
     parser.add_argument("--firmware-version", type=int)
     parser.add_argument("--iwdg-handoff", action="store_true", help="确认实际App已实现看门狗接管")
     args = parser.parse_args()
-    if args.initialize_ledger:
+    if args.trust_record:
+        if not args.public_key or any((args.initialize_ledger, args.nonce_ledger, args.input,
+                args.signing_key, args.signing_password_env, args.output, args.firmware_version, args.iwdg_handoff)):
+            parser.error("信任记录只接受--aes-key、--public-key和--trust-record")
+        if any((parent / ".git").exists() for parent in args.trust_record.resolve().parents):
+            parser.error("信任记录包含设备密钥，禁止写入任何Git工作目录")
+    elif args.public_key:
+        parser.error("--public-key仅用于--trust-record")
+    elif args.initialize_ledger:
+        if not args.nonce_ledger:
+            parser.error("初始化须指定--nonce-ledger")
         if any((args.input, args.signing_key, args.signing_password_env, args.output,
                 args.firmware_version, args.iwdg_handoff)):
             parser.error("初始化账本不能同时制作包")
-    elif not all((args.input, args.signing_key, args.output, args.persistence_version,
+    elif not all((args.nonce_ledger, args.input, args.signing_key, args.output, args.persistence_version,
                   args.firmware_version, args.iwdg_handoff)):
         parser.error("制作包须明确输入/签名私钥/输出/固件版本和--iwdg-handoff")
-    paths = [args.aes_key, args.nonce_ledger, args.input, args.signing_key, args.output]
+    paths = [args.aes_key, args.nonce_ledger, args.input, args.signing_key, args.output,
+             args.public_key, args.trust_record]
     resolved = [path.resolve() for path in paths if path is not None]
     if len(resolved) != len(set(resolved)):
         parser.error("密钥、账本、输入和输出路径必须不同")
     aes_key = args.aes_key.read_bytes()
-    if len(aes_key) != 32:
-        raise ValueError("设备AES密钥文件长度不是32 B")
+    validate_aes_key(aes_key)
+    if args.trust_record:
+        public_key = serialization.load_pem_public_key(args.public_key.read_bytes())
+        record = make_trust_record(public_key, aes_key)
+        with args.trust_record.open("xb") as target:
+            target.write(record)
+            target.flush()
+            os.fsync(target.fileno())
+        print("已生成128 B受控信任记录；包含设备密钥，不随固件发布。未写入设备。")
+        return
     if args.initialize_ledger:
         initialize_ledger(args.nonce_ledger, aes_key)
         print("nonce账本首次登记完成；不得删除或回滚后继续使用同一AES密钥")

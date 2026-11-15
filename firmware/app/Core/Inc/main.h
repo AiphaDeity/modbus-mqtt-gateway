@@ -61,10 +61,6 @@ void Error_Handler(void);
 #define SPI_FLASH_CS_GPIO_Port GPIOE
 #define ETH_MDC_Pin GPIO_PIN_1
 #define ETH_MDC_GPIO_Port GPIOC
-#define SPI2_MISO_Pin GPIO_PIN_2
-#define SPI2_MISO_GPIO_Port GPIOC
-#define SPI2_MOSI_Pin GPIO_PIN_3
-#define SPI2_MOSI_GPIO_Port GPIOC
 #define TF_UPGRADE_KEY_Pin GPIO_PIN_0
 #define TF_UPGRADE_KEY_GPIO_Port GPIOA
 #define ETH_REF_CLK_Pin GPIO_PIN_1
@@ -81,8 +77,6 @@ void Error_Handler(void);
 #define SPI_IMU_CS_GPIO_Port GPIOE
 #define ETH_NRST_Pin GPIO_PIN_12
 #define ETH_NRST_GPIO_Port GPIOE
-#define SPI2_SCK_Pin GPIO_PIN_10
-#define SPI2_SCK_GPIO_Port GPIOB
 #define ETH_TX_EN_Pin GPIO_PIN_11
 #define ETH_TX_EN_GPIO_Port GPIOB
 #define ETH_TXD0_Pin GPIO_PIN_12
@@ -93,6 +87,8 @@ void Error_Handler(void);
 #define RS485_TX_GPIO_Port GPIOD
 #define RS485_RX_Pin GPIO_PIN_9
 #define RS485_RX_GPIO_Port GPIOD
+#define EXT_SPI_FLASH_CS_Pin GPIO_PIN_11
+#define EXT_SPI_FLASH_CS_GPIO_Port GPIOD
 #define RS485_DIR_Pin GPIO_PIN_15
 #define RS485_DIR_GPIO_Port GPIOD
 #define SDIO_D0_Pin GPIO_PIN_8
@@ -121,6 +117,13 @@ void Error_Handler(void);
 #define I2C1_SCL_GPIO_Port GPIOB
 #define I2C1_SDA_Pin GPIO_PIN_7
 #define I2C1_SDA_GPIO_Port GPIOB
+
+#define SPI3_SCK_Pin GPIO_PIN_3
+#define SPI3_SCK_GPIO_Port GPIOB
+#define SPI3_MISO_Pin GPIO_PIN_4
+#define SPI3_MISO_GPIO_Port GPIOB
+#define SPI3_MOSI_Pin GPIO_PIN_5
+#define SPI3_MOSI_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
 
