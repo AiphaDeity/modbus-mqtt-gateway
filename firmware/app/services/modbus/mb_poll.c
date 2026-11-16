@@ -33,7 +33,6 @@ extern void test_add_three_slaves(void);
 extern void test_read_snapshot(void);
 extern void test_parse_points(void);
 extern void test_write_operations(void);
-extern void mb_simulate_inject(void);
 /* ========= 内部静态函数 ========= */
 
 /**
@@ -326,11 +325,11 @@ void Modbus_Init(void)
 /**
  * @brief Modbus Poll 任务入口（在 app_modules.c 里注册）
  *
- *  MB_SIMULATE_DATA=1 时跳过 RS485 真实轮询，周期注入模拟数据，
- *  用于无传感器环境下验证遥测上行链路（采集→上报→云端收到）。
- *  接真实传感器时改为 0 即可恢复正常轮询。
+ *  MB_TEST_MODE=1：配置 3 个读从站，正常运行真实 RS485 轮询状态机，
+ *  启动 10 秒后再投递 4 号 FC05、5 号 FC06 两个写请求。
+ *  MB_TEST_MODE=0：不加载测试配置，只运行正常轮询。
  */
-#define MB_SIMULATE_DATA  0   /* 1=模拟数据(无传感器); 0=真实RS485轮询 */
+#define MB_TEST_MODE  1
 
 void vModbusPollTask(void *argument)
 {
@@ -340,35 +339,27 @@ void vModbusPollTask(void *argument)
         Monitor_ReportFatal(APP_MODULE_MODBUS);
         return;
     }
-#if MB_SIMULATE_DATA
-    test_add_three_slaves();   /* 添加 3 个测试从站配置(含点位表) */
-    MB_LOGI("=== Modbus SIMULATE mode: no real sensors, injecting fake data ===");
-    for (;;)
-    {
-        if (mb_runtime_poll_begin())
-        {
-            mb_simulate_inject();
-            mb_runtime_poll_end();
-        }
-        mb_runtime_report();
-        osDelay(2000);   /* 2 秒一轮，和遥测周期匹配 */
-    }
-#else
+
+#if MB_TEST_MODE
+    test_add_three_slaves();
+    MB_LOGI("=== Modbus TEST: 3 read slaves, FC05/FC06 writes after 10s ===");
+#endif
+
     for (;;)
     {
         mb_poll_slave();
         if (mb_handle->state == MB_STATE_IDLE) mb_runtime_poll_end();
         mb_runtime_report();
+
+#if MB_TEST_MODE
+        test_write_operations();   /* 内部保证只注入一次 */
+#endif
+
         if (mb_handle->idle_no_work)
         {
             osDelay(1);
         }
-
-        //test_read_snapshot();
-        //test_parse_points();
-        //test_write_operations();
     }
-#endif
 }
 
 /**

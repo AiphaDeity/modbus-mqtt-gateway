@@ -5,6 +5,7 @@
 
 # Build output and local credentials
 /build/
+/.vscode/
 /out/
 /artifacts/
 /secrets/
