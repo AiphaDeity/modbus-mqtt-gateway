@@ -15,6 +15,10 @@
 #include "cmsis_os2.h"
 #include "stm32f4xx_hal.h"
 #include "mb_api.h"
+#include "mb_pointmap.h"            /* mb_point_t / mb_data_type_t 点位表结构 */
+#include "modbus.h"                 /* modbus_t 从站协议结构体 */
+#include "mini_json.h"              /* 精简JSON解析器（配置变更命令解析用） */
+#include "config_task.h"            /* Config_HandleMessage 对外声明 */
 
 #include <stddef.h>
 #include <string.h>
@@ -793,4 +797,168 @@ void Config_Task(void *argument)
 failed:
     Monitor_ReportFatal(APP_MODULE_CONFIG);
     osThreadExit();
+}
+
+/* ===== MQTT 下发配置变更命令处理（运行时即时新增/删除/修改从站）===== */
+
+/* 字符串转数据类型枚举 */
+static mb_data_type_t parse_data_type(const char *type_str)
+{
+    if (!type_str) return MB_DT_UINT16;
+    if (strcmp(type_str, "uint16")  == 0) return MB_DT_UINT16;
+    if (strcmp(type_str, "int16")   == 0) return MB_DT_INT16;
+    if (strcmp(type_str, "uint32")  == 0) return MB_DT_UINT32;
+    if (strcmp(type_str, "int32")   == 0) return MB_DT_INT32;
+    if (strcmp(type_str, "float32") == 0) return MB_DT_FLOAT32;
+    if (strcmp(type_str, "bit")     == 0) return MB_DT_BIT;
+    printf("[CFG] unknown type '%s', default uint16\r\n", type_str);
+    return MB_DT_UINT16;
+}
+
+/* 从 JSON 节点解析一个点位到 mb_point_t */
+static bool parse_one_point(const mini_json_t *slave_pts, mb_point_t *out_point)
+{
+    memset(out_point, 0, sizeof(mb_point_t));
+    out_point->reg_index = (uint16_t)MiniJson_GetInt(slave_pts, "reg_index", 0);
+    const char *type_str = MiniJson_GetString(slave_pts, "type", "uint16");
+    out_point->data_type = parse_data_type(type_str);
+    out_point->scale  = (float)MiniJson_GetFloat(slave_pts, "scale", 1.0);
+    out_point->offset = (float)MiniJson_GetFloat(slave_pts, "offset", 0.0);
+    const char *name = MiniJson_GetString(slave_pts, "name", "");
+    strncpy(out_point->name, name, MB_POINT_NAME_MAX - 1);
+    out_point->name[MB_POINT_NAME_MAX - 1] = '\0';
+    const char *unit = MiniJson_GetString(slave_pts, "unit", "");
+    strncpy(out_point->unit, unit, MB_POINT_UNIT_MAX - 1);
+    out_point->unit[MB_POINT_UNIT_MAX - 1] = '\0';
+    out_point->bit_index = (uint8_t)MiniJson_GetInt(slave_pts, "bit_index", 0);
+    out_point->valid = 1;
+    return true;
+}
+
+/* 从 JSON 节点解析一个从站并调 mb_apply_slave_config（UPSERT） */
+static int apply_one_slave(const mini_json_t *slave_node)
+{
+    if (!slave_node) return -1;
+    int id = MiniJson_GetInt(slave_node, "id", 0);
+    if (id < 1 || id > 247) { printf("[CFG] invalid slave id %d\r\n", id); return -1; }
+    int fc = MiniJson_GetInt(slave_node, "fc", 3);
+    if (fc < 1 || fc > 4) { printf("[CFG] invalid fc %d, default 3\r\n", fc); fc = 3; }
+    int reg = MiniJson_GetInt(slave_node, "reg", 0);
+    int count = MiniJson_GetInt(slave_node, "count", 1);
+    if (count < 1 || count > 32) { printf("[CFG] invalid count %d, clamp to 1\r\n", count); count = 1; }
+    int interval = MiniJson_GetInt(slave_node, "interval", 2000);
+    bool enable = MiniJson_GetBool(slave_node, "enable", true);
+    int retry = MiniJson_GetInt(slave_node, "retry", 1);
+
+    modbus_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.u8id               = (uint8_t)id;
+    cfg.u8fct              = (mb_functioncode_t)fc;
+    cfg.u16RegAdd          = (uint16_t)reg;
+    cfg.u16CoilsNo         = (uint16_t)count;
+    cfg.u16reg             = NULL;
+    cfg.u32CurrentTask     = NULL;
+    cfg.collect_interval_ms = (uint32_t)interval;
+    cfg.enable             = enable ? 1 : 0;
+    cfg.retry_cnt          = (uint8_t)retry;
+
+    mb_point_t points[MB_POINTS_PER_SLAVE];
+    memset(points, 0, sizeof(points));
+    mini_json_t *pts_arr = MiniJson_ObjectGet(slave_node, "points");
+    int pts_count = 0;
+    if (pts_arr && pts_arr->type == MJ_TYPE_ARRAY)
+    {
+        int arr_size = MiniJson_ArraySize(pts_arr);
+        for (int i = 0; i < arr_size && i < MB_POINTS_PER_SLAVE; i++)
+        {
+            mini_json_t *pt_node = MiniJson_ArrayGet(pts_arr, i);
+            if (pt_node) { parse_one_point(pt_node, &points[i]); pts_count++; }
+        }
+    }
+
+    printf("[CFG] apply slave id=%d fc=%d reg=%d count=%d pts=%d\r\n",
+           id, fc, reg, count, pts_count);
+
+    mb_status_e st = mb_apply_slave_config(MB_CFG_OP_UPSERT, (uint8_t)id, &cfg, points);
+    if (st != MB_STATUS_OK)
+    {
+        printf("[CFG] mb_apply_slave_config failed slave=%d st=%d\r\n", id, (int)st);
+        return -2;
+    }
+    return 0;
+}
+
+/* 从 JSON 节点删除一个从站（DELETE） */
+static int delete_one_slave(const mini_json_t *slave_node)
+{
+    if (!slave_node) return -1;
+    int id = MiniJson_GetInt(slave_node, "id", 0);
+    if (id < 1 || id > 247) { printf("[CFG] delete: invalid slave id %d\r\n", id); return -1; }
+    printf("[CFG] delete slave id=%d\r\n", id);
+    mb_status_e st = mb_apply_slave_config(MB_CFG_OP_DELETE, (uint8_t)id, NULL, NULL);
+    if (st != MB_STATUS_OK)
+    {
+        printf("[CFG] delete failed slave=%d st=%d\r\n", id, (int)st);
+        return -2;
+    }
+    return 0;
+}
+
+/* 解析完整配置变更 JSON 并应用到 M1
+ * 返回 0=成功  -1=JSON解析失败  -2=升级静默期拒绝  -3=部分从站应用失败 */
+static int config_apply_json(const char *json_str)
+{
+    if (!json_str || !*json_str) return -1;
+    if (!UpgradeQuiesce_AllowsMutation())
+    {
+        printf("[CFG] rejected: upgrade quiesce\r\n");
+        return -2;
+    }
+    mini_json_t *root = MiniJson_Parse(json_str);
+    if (!root) { printf("[CFG] json parse failed\r\n"); return -1; }
+
+    const char *op = MiniJson_GetString(root, "op", "upsert");
+    mini_json_t *slaves = MiniJson_ObjectGet(root, "slaves");
+    if (!slaves || slaves->type != MJ_TYPE_ARRAY)
+    {
+        printf("[CFG] no slaves array\r\n");
+        MiniJson_Free(root);
+        return -1;
+    }
+
+    int arr_size = MiniJson_ArraySize(slaves);
+    int ok_count = 0, fail_count = 0;
+    mb_config_batch_begin();
+
+    if (strcmp(op, "delete") == 0)
+    {
+        for (int i = 0; i < arr_size; i++)
+        {
+            mini_json_t *s = MiniJson_ArrayGet(slaves, i);
+            int r = delete_one_slave(s);
+            if (r == 0) ok_count++; else fail_count++;
+        }
+    }
+    else
+    {
+        for (int i = 0; i < arr_size; i++)
+        {
+            mini_json_t *s = MiniJson_ArrayGet(slaves, i);
+            int r = apply_one_slave(s);
+            if (r == 0) ok_count++; else fail_count++;
+        }
+    }
+
+    mb_config_batch_end();
+    printf("[CFG] done: op=%s ok=%d fail=%d\r\n", op, ok_count, fail_count);
+    MiniJson_Free(root);
+
+    if (fail_count > 0) return -3;
+    return 0;
+}
+
+/* 对外接口：处理 MQTT 下发的配置变更 JSON */
+int Config_HandleMessage(const char *json_buf)
+{
+    return config_apply_json(json_buf);
 }
