@@ -864,6 +864,113 @@ body {
 }
 .cmd-result.ok { display: block; color: var(--green); background: rgba(63,185,80,0.1); }
 .cmd-result.err { display: block; color: var(--red); background: rgba(248,81,73,0.1); }
+
+/* 配置变更生成器 */
+.cfg-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--blue);
+  cursor: pointer;
+  margin-bottom: 8px;
+  user-select: none;
+}
+.cfg-toggle .arrow { transition: transform 0.2s; display: inline-block; }
+.cfg-toggle.open .arrow { transform: rotate(90deg); }
+.cfg-panel {
+  display: none;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  margin-bottom: 10px;
+}
+.cfg-panel.open { display: block; }
+.cfg-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+.cfg-field {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.cfg-field label {
+  font-size: 10px;
+  color: var(--dim);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.cfg-field input, .cfg-field select {
+  padding: 4px 8px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font-size: 12px;
+  width: 110px;
+  outline: none;
+}
+.cfg-field input:focus, .cfg-field select:focus { border-color: var(--accent); }
+.cfg-field input[type="checkbox"] { width: auto; }
+.cfg-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text);
+  margin-top: 18px;
+}
+.cfg-points {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px;
+  margin-bottom: 8px;
+}
+.cfg-point-item {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px;
+  margin-bottom: 6px;
+}
+.cfg-point-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 6px;
+  font-size: 11px;
+  color: var(--dim);
+}
+.cfg-point-del {
+  color: var(--red);
+  cursor: pointer;
+  background: none;
+  border: none;
+  font-size: 11px;
+  padding: 0;
+}
+.cfg-btn-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+.cfg-btn {
+  padding: 6px 14px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.cfg-btn:hover { border-color: var(--accent); color: var(--accent); }
+.cfg-btn.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+.cfg-btn.primary:hover { background: #388bfd; }
 /* 滚动条 */
 ::-webkit-scrollbar { width: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
@@ -913,6 +1020,80 @@ body {
     <div class="cmd-panel">
       <h2>下发命令</h2>
       <div class="preset-row" id="preset-row"></div>
+
+      <!-- 配置变更生成器（可展开/收起） -->
+      <div class="cfg-toggle" id="cfg-toggle" onclick="toggleCfgPanel()">
+        <span class="arrow">▶</span>
+        <span>配置变更生成器（新增/删除/修改从站）</span>
+      </div>
+      <div class="cfg-panel" id="cfg-panel">
+
+        <!-- 操作类型 -->
+        <div class="cfg-row">
+          <div class="cfg-field">
+            <label>操作</label>
+            <select id="cfg-op">
+              <option value="upsert">upsert（新增/更新）</option>
+              <option value="delete">delete（删除）</option>
+            </select>
+          </div>
+        </div>
+
+        <!-- 从站参数（upsert 时显示） -->
+        <div id="cfg-slave-fields">
+          <div class="cfg-row">
+            <div class="cfg-field">
+              <label>从站地址</label>
+              <input type="number" id="cfg-id" value="5" min="1" max="247">
+            </div>
+            <div class="cfg-field">
+              <label>功能码</label>
+              <select id="cfg-fc">
+                <option value="1">FC01 读线圈</option>
+                <option value="2">FC02 读离散</option>
+                <option value="3" selected>FC03 读保持寄存器</option>
+                <option value="4">FC04 读输入寄存器</option>
+              </select>
+            </div>
+            <div class="cfg-field">
+              <label>起始地址</label>
+              <input type="number" id="cfg-reg" value="0" min="0">
+            </div>
+            <div class="cfg-field">
+              <label>寄存器数</label>
+              <input type="number" id="cfg-count" value="2" min="1" max="32">
+            </div>
+          </div>
+          <div class="cfg-row">
+            <div class="cfg-field">
+              <label>采集周期(ms)</label>
+              <input type="number" id="cfg-interval" value="2000" min="100" step="100">
+            </div>
+            <div class="cfg-field">
+              <label>重试次数</label>
+              <input type="number" id="cfg-retry" value="1" min="0">
+            </div>
+            <div class="cfg-checkbox">
+              <input type="checkbox" id="cfg-enable" checked>
+              <label for="cfg-enable" style="text-transform:none;letter-spacing:0;font-size:12px;color:var(--text)">启用</label>
+            </div>
+          </div>
+
+          <!-- 点位表 -->
+          <div style="font-size:11px;color:var(--dim);margin:8px 0 4px;">点位表</div>
+          <div class="cfg-points" id="cfg-points-list"></div>
+          <button class="cfg-btn" onclick="cfgAddPoint()">+ 添加点位</button>
+        </div>
+
+        <!-- 生成按钮 -->
+        <div class="cfg-btn-row">
+          <button class="cfg-btn primary" onclick="cfgGenerate()">生成并填入命令框</button>
+          <button class="cfg-btn" onclick="cfgLoadTemplate('light')">模板:光照传感器</button>
+          <button class="cfg-btn" onclick="cfgLoadTemplate('water')">模板:水浸传感器</button>
+          <button class="cfg-btn" onclick="cfgLoadTemplate('temp')">模板:温湿度</button>
+        </div>
+      </div>
+
       <div class="cmd-input-row">
         <input type="text" class="cmd-input" id="cmd-input"
                placeholder='JSON 格式，如 {"slave":2,"func":6,"addr":0,"val":100}'
@@ -933,6 +1114,9 @@ const PRESETS = [
   {label: "写寄存器 200", cmd: '{"slave":2,"func":6,"addr":0,"val":200}'},
   {label: "读保持寄存器", cmd: '{"slave":2,"func":3,"addr":0,"val":5}'},
   {label: "读输入寄存器", cmd: '{"slave":3,"func":4,"addr":0,"val":5}'},
+  {label: "⚙ 新增光照传感器", cmd: '{"op":"upsert","slaves":[{"id":1,"fc":3,"reg":2,"count":2,"interval":2000,"enable":true,"retry":1,"points":[{"reg_index":0,"type":"uint32","scale":0.001,"name":"light","unit":"Lux"}]}]}'},
+  {label: "⚙ 新增水浸传感器", cmd: '{"op":"upsert","slaves":[{"id":2,"fc":3,"reg":9088,"count":1,"interval":1000,"enable":true,"retry":2,"points":[{"reg_index":0,"type":"uint16","scale":1,"name":"water","unit":""}]}]}'},
+  {label: "⚙ 删除从站4", cmd: '{"op":"delete","slaves":[{"id":4}]}'},
 ];
 
 // 渲染预设按钮
@@ -949,6 +1133,138 @@ PRESETS.forEach(p => {
 function clearMsgs() {
   document.getElementById('msg-list').innerHTML = '<div class="no-data">已清空</div>';
 }
+
+// ==================== 配置变更生成器 ====================
+
+// 展开/收起配置面板
+function toggleCfgPanel() {
+  const toggle = document.getElementById('cfg-toggle');
+  const panel = document.getElementById('cfg-panel');
+  toggle.classList.toggle('open');
+  panel.classList.toggle('open');
+}
+
+// 操作类型变化时，upsert 才显示从站参数和点位表
+document.getElementById('cfg-op').addEventListener('change', function() {
+  document.getElementById('cfg-slave-fields').style.display = (this.value === 'upsert') ? 'block' : 'none';
+});
+
+// 点位计数器
+var cfgPointCounter = 0;
+
+// 添加一个点位编辑行
+function cfgAddPoint(data) {
+  data = data || {};
+  cfgPointCounter++;
+  var div = document.createElement('div');
+  div.className = 'cfg-point-item';
+  div.id = 'cfgpt_' + cfgPointCounter;
+  div.innerHTML =
+    '<div class="cfg-point-header">' +
+      '<span>点位 #' + cfgPointCounter + '</span>' +
+      '<button class="cfg-point-del" onclick="this.closest(\'.cfg-point-item\').remove()">删除</button>' +
+    '</div>' +
+    '<div class="cfg-row">' +
+      '<div class="cfg-field"><label>下标</label><input type="number" class="cfgpt-idx" value="' + (data.reg_index||0) + '" min="0" max="31"></div>' +
+      '<div class="cfg-field"><label>类型</label><select class="cfgpt-type">' +
+        '<option value="uint16"' + (data.type==='uint16'?' selected':'') + '>uint16</option>' +
+        '<option value="int16"' + (data.type==='int16'?' selected':'') + '>int16</option>' +
+        '<option value="uint32"' + (data.type==='uint32'?' selected':'') + '>uint32</option>' +
+        '<option value="int32"' + (data.type==='int32'?' selected':'') + '>int32</option>' +
+        '<option value="float32"' + (data.type==='float32'?' selected':'') + '>float32</option>' +
+        '<option value="bit"' + (data.type==='bit'?' selected':'') + '>bit</option>' +
+      '</select></div>' +
+      '<div class="cfg-field"><label>系数</label><input type="number" step="any" class="cfgpt-scale" value="' + (data.scale!==undefined?data.scale:1) + '"></div>' +
+      '<div class="cfg-field"><label>偏移</label><input type="number" step="any" class="cfgpt-offset" value="' + (data.offset||0) + '"></div>' +
+    '</div>' +
+    '<div class="cfg-row">' +
+      '<div class="cfg-field"><label>名称(≤7字符)</label><input type="text" class="cfgpt-name" value="' + (data.name||'') + '" maxlength="7"></div>' +
+      '<div class="cfg-field"><label>单位(≤7字符)</label><input type="text" class="cfgpt-unit" value="' + (data.unit||'') + '" maxlength="7"></div>' +
+    '</div>';
+  document.getElementById('cfg-points-list').appendChild(div);
+}
+
+// 生成配置变更 JSON 并填入命令输入框
+function cfgGenerate() {
+  var op = document.getElementById('cfg-op').value;
+  var slave = { id: parseInt(document.getElementById('cfg-id').value) || 1 };
+
+  if (op === 'upsert') {
+    slave.fc = parseInt(document.getElementById('cfg-fc').value) || 3;
+    slave.reg = parseInt(document.getElementById('cfg-reg').value) || 0;
+    slave.count = parseInt(document.getElementById('cfg-count').value) || 1;
+    slave.interval = parseInt(document.getElementById('cfg-interval').value) || 2000;
+    slave.retry = parseInt(document.getElementById('cfg-retry').value) || 0;
+    slave.enable = document.getElementById('cfg-enable').checked;
+
+    // 收集点位
+    var points = [];
+    document.querySelectorAll('.cfg-point-item').forEach(function(pe) {
+      points.push({
+        reg_index: parseInt(pe.querySelector('.cfgpt-idx').value) || 0,
+        type: pe.querySelector('.cfgpt-type').value,
+        scale: parseFloat(pe.querySelector('.cfgpt-scale').value) || 1,
+        offset: parseFloat(pe.querySelector('.cfgpt-offset').value) || 0,
+        name: pe.querySelector('.cfgpt-name').value || '',
+        unit: pe.querySelector('.cfgpt-unit').value || '',
+        bit_index: 0
+      });
+    });
+    if (points.length > 0) slave.points = points;
+  }
+
+  var cmd = { op: op, slaves: [slave] };
+  var json = JSON.stringify(cmd);
+  document.getElementById('cmd-input').value = json;
+
+  // 自动展开命令面板提示
+  showResult('ok', '✓ 已生成配置命令，填入命令框。检查后点「发送」');
+}
+
+// 加载模板
+function cfgLoadTemplate(name) {
+  document.getElementById('cfg-op').value = 'upsert';
+  document.getElementById('cfg-slave-fields').style.display = 'block';
+
+  var templates = {
+    light: {
+      id:1, fc:3, reg:2, count:2, interval:2000, retry:1, enable:true,
+      points: [{reg_index:0, type:'uint32', scale:0.001, name:'light', unit:'Lux'}]
+    },
+    water: {
+      id:2, fc:3, reg:9088, count:1, interval:1000, retry:2, enable:true,
+      points: [{reg_index:0, type:'uint16', scale:1, name:'water', unit:''}]
+    },
+    temp: {
+      id:5, fc:3, reg:0, count:2, interval:3000, retry:1, enable:true,
+      points: [
+        {reg_index:0, type:'int16', scale:0.1, name:'temp', unit:'C'},
+        {reg_index:1, type:'uint16', scale:0.1, name:'hum', unit:'pct'}
+      ]
+    }
+  };
+
+  var t = templates[name];
+  if (!t) return;
+
+  document.getElementById('cfg-id').value = t.id;
+  document.getElementById('cfg-fc').value = t.fc;
+  document.getElementById('cfg-reg').value = t.reg;
+  document.getElementById('cfg-count').value = t.count;
+  document.getElementById('cfg-interval').value = t.interval;
+  document.getElementById('cfg-retry').value = t.retry;
+  document.getElementById('cfg-enable').checked = t.enable;
+
+  // 清空旧点位，加载新点位
+  document.getElementById('cfg-points-list').innerHTML = '';
+  cfgPointCounter = 0;
+  t.points.forEach(function(pt) { cfgAddPoint(pt); });
+
+  cfgGenerate();
+}
+
+// 初始化：添加一个默认点位
+cfgAddPoint({reg_index:0, type:'uint32', scale:0.001, name:'light', unit:'Lux'});
 
 // 下发命令
 let pendingCmdTime = null;  // 记录上次发命令的时间，用于匹配 ack

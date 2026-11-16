@@ -17,456 +17,439 @@
  *            换成 HAL 的 lan8720_link_read()/HAL_ETH_Stop/HAL_ETH_Start_IT
  */
 
-/* ================= 一、头文件：每个都是干什么的 ================= */
-#include "lwip/mem.h"        /* lwip 堆内存 API（mem_malloc 等，本文件没直接用，netif 体系需要） */
-#include "lwip/memp.h"       /* lwip 内存池 API（memp_xxx，netif 内部依赖） */
-#include "lwip/tcp.h"        /* TCP 协议控制块类型（netif 关联 TCP 需要） */
-#include "lwip/tcpip.h"      /* ★核心：tcpip_init()（创建 lwip 内核线程）+ tcpip_input()（喂包入口） */
-#include "lwip/udp.h"        /* UDP 控制块类型 */
-#include "netif/etharp.h"    /* ARP 模块（etharp_output 在 ethernetif 里用） */
-#include "lwip/dhcp.h"       /* ★DHCP：dhcp_start/dhcp_stop/dhcp_supplied_address */
-#include "lwip/dns.h"        /* ★DNS：dns_setserver（静态 IP 兜底时设公共 DNS） */
-#include "lwip/init.h"       /* lwip_init（tcpip_init 内部会调，不用直接调） */
-#include "lwip/timeouts.h"   /* lwip 超时管理（tcpip 线程内部用） */
-#include "lwip/netif.h"      /* ★netif 结构体：netif_add/netif_set_default/netif_is_link_up 等 */
-#include "lwip/netifapi.h"   /* ★线程安全封装：netifapi_netif_set_up/down/link_up/down、
-                                netifapi_dhcp_start/stop、netifapi_netif_set_addr。
-                                带 OS 且 LWIP_TCPIP_CORE_LOCKING=0 时，凡修改 netif 状态的 API
-                                都必须经它投递到 tcpip_thread 执行，不能在别的任务里直接调
-                                netif_set 或 dhcp_start 系列函数（否则和内核线程竞争 netif 结构）。 */
+// ===== 一、头文件，每个都有自己的用处 =====
+#include "lwip/mem.h"        // LwIP堆内存API，netif体系内部需要，本文件没直接调
+#include "lwip/memp.h"       // LwIP内存池API，netif内部依赖它
+#include "lwip/tcp.h"        // TCP协议控制块类型，netif关联TCP需要
+#include "lwip/tcpip.h"      // 核心：tcpip_init创建内核线程，tcpip_input是喂包入口
+#include "lwip/udp.h"        // UDP控制块类型
+#include "netif/etharp.h"    // ARP模块，ethernetif里发数据要用etharp_output
+#include "lwip/dhcp.h"       // DHCP：开始、停止、判断有没有拿到IP
+#include "lwip/dns.h"        // DNS：静态IP兜底时设置公共DNS服务器
+#include "lwip/init.h"       // LwIP初始化，tcpip_init内部会调，不用自己调
+#include "lwip/timeouts.h"   // LwIP超时管理，tcpip线程内部用
+#include "lwip/netif.h"      // 核心：netif结构体，添加网卡、设默认、判断链路状态
+#include "lwip/netifapi.h"   // 线程安全封装：带OS时改netif状态必须经它投递到内核线程，不能直接调
 
-#include "FreeRTOS.h"        /* ★FreeRTOS 主头：taskENTER_CRITICAL 等 */
-#include "task.h"            /* ★vTaskDelay（线程延时） */
+#include "FreeRTOS.h"        // FreeRTOS主头，临界区宏在这里
+#include "task.h"            // 任务相关API，vTaskDelay延时函数
 
-#include "stm32f4xx_hal.h"   /* HAL 主头：HAL_ETH_Stop / HAL_ETH_Start_IT */
-#include <stdio.h>           /* printf（同事已在 main.c 实现重定向，直接能用） */
+#include "stm32f4xx_hal.h"   // HAL主头，操作ETH硬件的启停
+#include <stdio.h>           // printf打印，main.c已经重定向好了，直接能用
 
-#include "ethernet.h"        /* 本模块对外接口（Day1 约定） */
-#include "ethernetif.h"      /* 网卡驱动：ethernetif_init（netif_add 的回调）+ lan8720_link_read */
+#include "ethernet.h"        // 本模块对外接口
+#include "ethernetif.h"      // 网卡驱动：初始化回调、读PHY链路状态
 
-/* 同事 Core/Src/eth.c 里的 ETH 句柄。
-   链接线程里要 HAL_ETH_Stop/Start_IT 操作这个句柄，所以必须 extern 声明。
-   （不是重复定义！定义在同事 eth.c，这里只是"借用"） */
-extern ETH_HandleTypeDef heth;
+// 同事 Core/Src/eth.c 里的 ETH 硬件句柄，这里只是借用，不是重复定义
+// 链接线程里要操作硬件启停，必须用这个句柄，所以用 extern 声明
+extern ETH_HandleTypeDef heth;                     // 引用CubeMX生成的ETH句柄，链接线程操作硬件用
 
-/* ================= 二、全局控制结构（照探索者例程） ================= */
-/* lwip 控制结构体：记录本机 IP/掩码/网关/状态，供调试打印和 DHCP 回落用 */
-typedef struct
+// ===== 二、全局控制结构，照探索者例程改的 =====
+// LwIP控制结构体，记录本机IP、掩码、网关和各种状态，打印和DHCP回落用
+typedef struct                                   // LwIP控制结构体定义开始
 {
-  uint8_t  remoteip[4];   /* 远端 IP（探索者例程 TCP 客户端测试用，M2 暂时用不到，保留字段） */
-  uint8_t  ip[4];         /* 本机 IP：DHCP 成功时更新 / DHCP 超时回落用静态值 */
-  uint8_t  netmask[4];    /* 子网掩码，默认 255.255.255.0 */
-  uint8_t  gateway[4];    /* 默认网关，默认 192.168.1.1 */
-  uint8_t  dhcpstatus;    /* DHCP 状态标记：0=没用DHCP 1=请求中 2=成功 0xFF=超时已回落静态 */
-  uint8_t  link_status;   /* 链路状态：0=断链 1=已链接（链接线程更新，打印/业务用） */
-} __lwip_dev;
+  uint8_t  remoteip[4];   // 远端IP，例程测试用的，M2暂时用不到，保留字段
+  uint8_t  ip[4];         // 本机IP，DHCP成功就更新，超时回落静态IP
+  uint8_t  netmask[4];    // 子网掩码，默认255.255.255.0
+  uint8_t  gateway[4];    // 默认网关，默认192.168.1.1
+  uint8_t  dhcpstatus;    // DHCP状态：0没用、1请求中、2成功、0xFF超时回落
+  uint8_t  link_status;   // 链路状态：0断链、1已连接，链接线程更新
+} __lwip_dev;                                    // 结构体别名__lwip_dev定义结束
 
-static __lwip_dev g_lwipdev;          /* lwip 控制结构体（静态=只本文件用） */
-static struct netif g_lwip_netif;     /* 全局网络接口（lwip 的核心对象，代表"这块网卡"） */
-static uint8_t  g_m2_eth_inited = 0;  /* 幂等保护：已初始化过就不再初始化（防止 main 里重复调用） */
-static uint8_t g_tcpip_started;
-static volatile uint8_t g_tcpip_ready;
-static uint8_t g_netif_added;
-#if LWIP_NETIF_LINK_CALLBACK
-static sys_thread_t g_link_thread;
-#endif
-#if LWIP_DHCP
-static sys_thread_t g_dhcp_thread;
-#endif
+static __lwip_dev g_lwipdev;          // 控制结构体实例，static只本文件能用
+static struct netif g_lwip_netif;     // LwIP网络接口对象，代表这块网卡，核心对象
+static uint8_t  g_m2_eth_inited = 0;  // 幂等保护：初始化过就不再初始化，防止重复调用
+static uint8_t g_tcpip_started;       // tcpip内核有没有启动的标志
+static volatile uint8_t g_tcpip_ready; // 内核是否就绪，volatile防优化
+static uint8_t g_netif_added;         // 网卡有没有添加成功的标志
+#if LWIP_NETIF_LINK_CALLBACK                    // 开了链路回调编译才保留链接线程句柄
+static sys_thread_t g_link_thread;    // 链接线程句柄，开了链路回调才用
+#endif                                           // 条件编译结束
+#if LWIP_DHCP                                    // 开了DHCP编译才保留DHCP线程句柄
+static sys_thread_t g_dhcp_thread;    // DHCP线程句柄，开了DHCP才用
+#endif                                           // 条件编译结束
 
-/* DHCP 状态枚举（照例程 netconf.h，值别改，线程状态机靠它跳转）：
-   OFF=没开始 → START=开始申请 → WAIT_ADDRESS=等分配 → ADDRESS_ASSIGNED=分配成功
-   LINK_DOWN=网线断了 → TIMEOUT=申请超时（回落静态） */
-#define LWIP_DHCP_OFF           0
-#define LWIP_DHCP_START         1
-#define LWIP_DHCP_WAIT_ADDRESS  2
-#define LWIP_DHCP_ADDRESS_ASSIGNED 3
-#define LWIP_DHCP_LINK_DOWN     4
-#define LWIP_DHCP_TIMEOUT       5
-static uint8_t g_lwip_dhcp_state = LWIP_DHCP_OFF;   /* 当前 DHCP 状态（全局，线程和链接回调都改它） */
+// DHCP状态枚举，线程状态机靠这些值跳转，值不能随便改
+// OFF没开始 → START开始申请 → WAIT等分配 → ASSIGNED成功 → LINK_DOWN断网 → TIMEOUT超时
+#define LWIP_DHCP_OFF           0                // 状态0：没开始DHCP
+#define LWIP_DHCP_START         1                // 状态1：开始申请
+#define LWIP_DHCP_WAIT_ADDRESS  2                // 状态2：等服务器分配IP
+#define LWIP_DHCP_ADDRESS_ASSIGNED 3             // 状态3：IP分配成功
+#define LWIP_DHCP_LINK_DOWN     4                // 状态4：网线断了
+#define LWIP_DHCP_TIMEOUT       5                // 状态5：超时放弃
+static uint8_t g_lwip_dhcp_state = LWIP_DHCP_OFF;   // 当前DHCP状态，线程和回调都会改它
 
-#define LWIP_LINK_OFF           0   /* 断链 */
-#define LWIP_LINK_ON            1   /* 已链接 */
+#define LWIP_LINK_OFF           0   // 断链
+#define LWIP_LINK_ON            1   // 已连接
 
-/* DHCP 最大尝试次数：超过这个数还拿不到 IP 就放弃，回落静态 IP。
-   例程原值 10（约 10 秒），太小容易被路由器慢启动误杀，太大等太久 */
-#define LWIP_MAX_DHCP_TRIES     2   /* ★调试临时改小：直连PC无DHCP服务器，快速超时回落静态IP。正式环境恢复10。 */
+// DHCP最大尝试次数，超过还拿不到IP就放弃，回落静态IP
+// 调试临时改小成2，直连PC没DHCP服务器能快速超时；正式环境要恢复成10
+#define LWIP_MAX_DHCP_TRIES     2                // DHCP最多试2次（临时值，正式改10）
 
-/* ================= 三、线程配置（照例程） ================= */
-/* 链接线程：优先级 3，栈 128*6=768 字（单位是"字"=4 字节，即 3KB）。
-   ★为什么不是例程的 128*2=256 字（1KB）：这线程里 lwip 会往串口打印
-   "The network cable is connected" 这类信息，printf 本身就要吃掉几百字节栈，
-   1KB 在带调试打印时很容易爆栈（爆栈 → vApplicationStackOverflowHook → 全系统停机） */
-#define LWIP_LINK_TASK_PRIO     24    /* ★osPriorityNormal：和 Storage/MQTT 同级。
-                                        * 之前=3 太低，被 Modbus(32)/Storage(24) 等业务任务饿死，
-                                        *  link 线程永远不被调度 → PHY link 变化检测不到。 */
-#define LWIP_LINK_STK_SIZE      128 * 6
+// ===== 三、线程配置，照探索者例程改的 =====
+// 链接线程栈大小：768字=3KB，因为有printf打印，1KB栈会爆
+// 优先级24，和Storage/MQTT同级，之前太低会被业务任务饿死，永远调度不到
+#define LWIP_LINK_TASK_PRIO     24               // 链接线程优先级24，和业务同级防饿死
+#define LWIP_LINK_STK_SIZE      128 * 6          // 链接线程栈768字=3KB，printf需要大栈
 
-/* DHCP 线程：优先级 4（比链接线程高 1，因为拿 IP 更重要）、栈 768 字 = 3KB。
-   ★这里必须给足栈：发 DHCP 请求的调用链是
-   dhcp_start → udp_send → ip4_output → etharp_output → netif->linkoutput
-   → low_level_output（里面还有 [TX] 调试 printf），链很深；
-   例程的 256 字（1KB）在这个深度上会爆栈，实测就是卡在这里导致整机停机。
-   为什么优先级都不高？因为 tcpip 内核线程优先级是 configMAX_PRIORITIES-2（最高档），
-   协议栈处理不能被低优先级线程打断太久，所以业务线程都让着内核 */
-#define LWIP_DHCP_TASK_PRIO     24    /* ★osPriorityNormal：同 link 线程，避免被业务任务饿死 */
-#define LWIP_DHCP_STK_SIZE      128 * 6
+// DHCP线程栈也是3KB，发DHCP请求调用链很深，1KB栈会爆
+// 优先级同样24，避免被业务任务饿死；tcpip内核线程优先级最高，业务线程都让着它
+#define LWIP_DHCP_TASK_PRIO     24               // DHCP线程优先级24，和业务同级防饿死
+#define LWIP_DHCP_STK_SIZE      128 * 6          // DHCP线程栈768字=3KB，调用链深需要大栈
 
-/* 函数声明（提前声明，避免编译器"隐式声明"告警） */
-static void lwip_link_thread(void *argument);       /* 链接线程入口 */
-static void lwip_dhcp_process(void *pvParameters);  /* DHCP 线程入口 */
-static void lwip_link_status_updated(struct netif *netif);  /* 链接变化回调 */
+// 函数提前声明，避免编译器报隐式声明警告
+static void lwip_link_thread(void *argument);       // 链接线程入口函数
+static void lwip_dhcp_process(void *pvParameters);  // DHCP线程入口函数
+static void lwip_link_status_updated(struct netif *netif);  // 链路变化回调函数
 
-/* ================= 四、默认静态 IP（DHCP 超时回落用） ================= */
-static void lwip_comm_default_ip_set(__lwip_dev *lwipx)
+// ===== 四、默认静态IP，DHCP超时回落用 =====
+// 函数：lwip_comm_default_ip_set —— 设置默认静态IP
+// 功能：DHCP反复申请失败或超时后，把网卡的IP/子网掩码/网关设成固定静态值（192.168.2.121网段那套），保证拿不到DHCP也能在局域网通信，设备不会彻底失联
+// 参数：lwipx —— LwIP设备结构指针，里面的ip/nums等字段会被填上默认静态地址
+// 返回：void，无返回值，纯结构体赋值
+static void lwip_comm_default_ip_set(__lwip_dev *lwipx)   // 设置默认静态IP，DHCP超时回落用
 {
-  /* 电脑直连时的经典网段：板子在 192.168.2.x 同网段，电脑在 192.168.2.45 就能互 ping。
-     ★静态回落 IP 的末字节从芯片 UID 派生（评审要求）：以前固定 .30，
-     多块板同时 DHCP 失败回落时会互相撞地址。UID 96 位取低 2 字节异或，映射到 2~254。 */
-  uint32_t u = *(volatile uint32_t *)0x1FFF7A10 ^ *(volatile uint32_t *)0x1FFF7A14 ^ *(volatile uint32_t *)0x1FFF7A18;
-  uint8_t host = (uint8_t)((u & 0xFFU) ^ ((u >> 8) & 0xFFU));
-  if (host < 2)   host = 2;
-  if (host > 254) host = 254;
-  host = 124;  /* ★调试临时固定：直连PC无DHCP服务器，回落到已知IP(192.168.2.124)方便验证MQTT。正式环境删此行恢复UID派生。 */
+  // 静态IP末字节本来要从芯片96位UID派生，防止多块板回落时撞IP
+  // 三个UID地址都是STM32出厂固化的，只读，异或混合一下
+  uint32_t u = *(volatile uint32_t *)0x1FFF7A10 ^ *(volatile uint32_t *)0x1FFF7A14 ^ *(volatile uint32_t *)0x1FFF7A18;  // 三个UID字异或混合成主机号种子
+  uint8_t host = (uint8_t)((u & 0xFFU) ^ ((u >> 8) & 0xFFU));  // 取低两个字节再异或
+  if (host < 2)   host = 2;                    // 主机号不能是0或1，最小2
+  if (host > 254) host = 254;                  // 最大254，255是广播地址
+  host = 124;  // 调试临时固定成124，方便直连验证；正式环境要删掉这行恢复UID派生
 
-  lwipx->remoteip[0] = 192; lwipx->remoteip[1] = 168; lwipx->remoteip[2] = 0;   lwipx->remoteip[3] = 120;
-  lwipx->ip[0]       = 192; lwipx->ip[1]       = 168; lwipx->ip[2]       = 2;    lwipx->ip[3]       = host;
-  lwipx->netmask[0]  = 255; lwipx->netmask[1]  = 255; lwipx->netmask[2]  = 255; lwipx->netmask[3]  = 0;
-  lwipx->gateway[0]  = 192; lwipx->gateway[1]  = 168; lwipx->gateway[2]  = 2;   lwipx->gateway[3]  = 1;
-  lwipx->dhcpstatus  = 0;   /* 初始没开 DHCP */
+  lwipx->remoteip[0] = 192; lwipx->remoteip[1] = 168; lwipx->remoteip[2] = 0;   lwipx->remoteip[3] = 120;  // 远端IP，测试用
+  lwipx->ip[0]       = 192; lwipx->ip[1]       = 168; lwipx->ip[2]       = 2;    lwipx->ip[3]       = host;  // 本机IP，192.168.2.x
+  lwipx->netmask[0]  = 255; lwipx->netmask[1]  = 255; lwipx->netmask[2]  = 255; lwipx->netmask[3]  = 0;     // 子网掩码24位
+  lwipx->gateway[0]  = 192; lwipx->gateway[1]  = 168; lwipx->gateway[2]  = 2;   lwipx->gateway[3]  = 1;     // 网关192.168.2.1
+  lwipx->dhcpstatus  = 0;                      // 初始没开DHCP，状态0
 }
 
 /* ================= 五、初始化入口 ================= */
-/* tcpip 线程完成初始化后报告就绪；重试复用同一个协议栈。 */
-static void lwip_init_done(void *argument)
+// 函数：lwip_init_done —— tcpip内核就绪回调
+// 功能：tcpip_init初始化LwIP内核线程完成后LwIP自动调这个回调，把内核就绪信号量释放掉，让m2_ethernet_init里等待的代码继续往下跑，确认协议栈真正可用
+// 参数：argument —— 回调上下文参数，本回调没用到
+// 返回：void，无返回值，作用是释放就绪信号量
+static void lwip_init_done(void *argument)      // tcpip内核线程就绪回调
 {
-  (void)argument;
-  g_tcpip_ready = 1;
+  (void)argument;                              // 没用到参数，显式忽略
+  g_tcpip_ready = 1;                           // 把全局就绪标志置1
 }
 
-/* 仅由启动任务串行调用；失败保留已创建的基础资源，重试只补缺项。 */
-int32_t m2_ethernet_init(void)
+// 函数：m2_ethernet_init —— 以太网初始化主入口（对外接口）
+// 功能：以太网全部初始化的总入口，只由启动任务串行调用：初始化MAC和PHY（LAN8720A）→起tcpip内核线程并等就绪→挂网卡netif→建链接状态回调→起DHCP申请线程和PHY轮询线程→标记初始化完成；已初始化过直接返回成功，单项失败下轮可重试补缺
+// 参数：无（操作全局LwIP设备结构和网卡状态）
+// 返回：int32_t，0代表初始化全部完成；负数错误码代表某一步失败（PHY没响应/DHCP线程没建起来等），可稍后重试
+int32_t m2_ethernet_init(void)                   // 以太网初始化主入口，启动任务调用
 {
-  ip_addr_t ipaddr, netmask, gw;
+  ip_addr_t ipaddr, netmask, gw;               // 临时IP地址变量，添加网卡时用
 
-  if (g_m2_eth_inited)
-    return ETH_OK;
-  if (heth.gState == HAL_ETH_STATE_RESET || heth.gState == HAL_ETH_STATE_ERROR)
+  if (g_m2_eth_inited)                           // 幂等保护判断
+    return ETH_OK;                             // 已经初始化过了直接返回成功，幂等保护
+  if (heth.gState == HAL_ETH_STATE_RESET || heth.gState == HAL_ETH_STATE_ERROR)  // HAL句柄没就绪或出错
   {
-    printf("[ETH] HAL not ready: state=%u\r\n", (unsigned)heth.gState);
-    return ETH_ERR_CONFIG;
+    printf("[ETH] HAL not ready: state=%u\r\n", (unsigned)heth.gState);  // HAL硬件还没就绪
+    return ETH_ERR_CONFIG;                     // 返回配置错误
   }
 
-  if (!g_tcpip_started)
-  {
-    g_tcpip_started = 1;
-    tcpip_init(lwip_init_done, NULL);
-  }
-  uint32_t started_ms = HAL_GetTick();
-  while (!g_tcpip_ready)
-  {
-    if ((uint32_t)(HAL_GetTick() - started_ms) >= 2000U)
-    {
-      printf("[ETH] tcpip init timeout\r\n");
-      return ETH_ERR_CONFIG;
-    }
-    vTaskDelay(pdMS_TO_TICKS(10));
-  }
+  if (!g_tcpip_started)                          // 内核还没启动
+  {                                               // 分支体开始
+    g_tcpip_started = 1;                       // 标记内核启动中
+    tcpip_init(lwip_init_done, NULL);          // 启动LwIP内核线程，传就绪回调
+  }                                             // 分支体结束
+  uint32_t started_ms = HAL_GetTick();         // 记录开始等待的时间
+  while (!g_tcpip_ready)                        // 等内核就绪标志置1
+  {                                             // 等待循环开始
+    if ((uint32_t)(HAL_GetTick() - started_ms) >= 2000U)  // 等够2秒还没就绪
+    {                                           // 超时分支开始
+      printf("[ETH] tcpip init timeout\r\n");   // 等2秒还没就绪，超时
+      return ETH_ERR_CONFIG;                    // 超时返回配置错误
+    }                                           // 超时分支结束
+    vTaskDelay(pdMS_TO_TICKS(10));              // 没就绪就等10毫秒再看，不占CPU
+  }                                             // 等待循环结束
 
-  if (!g_netif_added)
-  {
-    lwip_comm_default_ip_set(&g_lwipdev);
-#if LWIP_DHCP
-    ip_addr_set_zero_ip4(&ipaddr);
-    ip_addr_set_zero_ip4(&netmask);
-    ip_addr_set_zero_ip4(&gw);
-#else
-    IP4_ADDR(&ipaddr, g_lwipdev.ip[0], g_lwipdev.ip[1], g_lwipdev.ip[2], g_lwipdev.ip[3]);
-    IP4_ADDR(&netmask, g_lwipdev.netmask[0], g_lwipdev.netmask[1], g_lwipdev.netmask[2], g_lwipdev.netmask[3]);
-    IP4_ADDR(&gw, g_lwipdev.gateway[0], g_lwipdev.gateway[1], g_lwipdev.gateway[2], g_lwipdev.gateway[3]);
-#endif
-    /* netifapi 使用协议栈互斥锁，PHY 等待期间保持硬件中断可用。 */
-    if (netifapi_netif_add(&g_lwip_netif, &ipaddr, &netmask, &gw,
-                          NULL, ethernetif_init, tcpip_input) != ERR_OK)
-    {
-      printf("[ETH] netif init failed\r\n");
-      return ETH_ERR_CONFIG;
-    }
-    g_netif_added = 1;
-#if LWIP_NETIF_LINK_CALLBACK
-    LOCK_TCPIP_CORE();
-    lwip_link_status_updated(&g_lwip_netif);
-    netif_set_link_callback(&g_lwip_netif, lwip_link_status_updated);
-    UNLOCK_TCPIP_CORE();
-#endif
-  }
+  if (!g_netif_added)                            // 网卡还没添加
+  {                                             // 分支体开始
+    lwip_comm_default_ip_set(&g_lwipdev);       // 先设置默认静态IP参数
+#if LWIP_DHCP                                   // 开了DHCP走这个分支
+    ip_addr_set_zero_ip4(&ipaddr);              // 开了DHCP就先把IP清零，等DHCP分配
+    ip_addr_set_zero_ip4(&netmask);             // 掩码也清零
+    ip_addr_set_zero_ip4(&gw);                  // 网关也清零
+#else                                           // 没开DHCP走静态IP分支
+    // 没开DHCP就用静态IP，把四个字节拼成IP地址
+    IP4_ADDR(&ipaddr, g_lwipdev.ip[0], g_lwipdev.ip[1], g_lwipdev.ip[2], g_lwipdev.ip[3]);   // 拼本机IP
+    IP4_ADDR(&netmask, g_lwipdev.netmask[0], g_lwipdev.netmask[1], g_lwipdev.netmask[2], g_lwipdev.netmask[3]);  // 拼掩码
+    IP4_ADDR(&gw, g_lwipdev.gateway[0], g_lwipdev.gateway[1], g_lwipdev.gateway[2], g_lwipdev.gateway[3]);  // 拼网关
+#endif                                          // 条件编译结束
+    // 线程安全地添加网卡，ethernetif_init是网卡初始化回调，tcpip_input是收包入口
+    if (netifapi_netif_add(&g_lwip_netif, &ipaddr, &netmask, &gw,   // 添加网卡到LwIP
+                          NULL, ethernetif_init, tcpip_input) != ERR_OK)  // 不带state，初始化回调和收包入口
+    {                                           // 失败分支开始
+      printf("[ETH] netif init failed\r\n");    // 网卡添加失败
+      return ETH_ERR_CONFIG;                    // 返回配置错误
+    }                                           // 失败分支结束
+    g_netif_added = 1;                         // 标记网卡已添加
+#if LWIP_NETIF_LINK_CALLBACK                    // 开了链路回调才注册
+    LOCK_TCPIP_CORE();                           // 锁住内核，直接操作netif
+    lwip_link_status_updated(&g_lwip_netif);     // 先读一次当前链路状态
+    netif_set_link_callback(&g_lwip_netif, lwip_link_status_updated);  // 注册链路变化回调
+    UNLOCK_TCPIP_CORE();                         // 解锁内核
+#endif                                          // 条件编译结束
+  }                                             // 分支体结束
 
-  if (netifapi_netif_set_default(&g_lwip_netif) != ERR_OK)
-    return ETH_ERR_CONFIG;
+  if (netifapi_netif_set_default(&g_lwip_netif) != ERR_OK)  // 设默认网卡失败判断
+    return ETH_ERR_CONFIG;                       // 把这块网卡设为默认网卡，失败返回错误
 
-#if LWIP_NETIF_LINK_CALLBACK
-  if (g_link_thread.thread_handle == NULL)
-  {
-    g_link_thread = sys_thread_new("eth_link", lwip_link_thread, &g_lwip_netif,
-                                   LWIP_LINK_STK_SIZE, LWIP_LINK_TASK_PRIO);
-    if (g_link_thread.thread_handle == NULL)
-      return ETH_ERR_CONFIG;
-  }
-#endif
-#if LWIP_DHCP
-  if (g_dhcp_thread.thread_handle == NULL)
-  {
-    g_dhcp_thread = sys_thread_new("eth_dhcp", lwip_dhcp_process, &g_lwip_netif,
-                                   LWIP_DHCP_STK_SIZE, LWIP_DHCP_TASK_PRIO);
-    if (g_dhcp_thread.thread_handle == NULL)
-      return ETH_ERR_CONFIG;
-  }
-#endif
+#if LWIP_NETIF_LINK_CALLBACK                    // 开了链路回调才创建链接线程
+  if (g_link_thread.thread_handle == NULL)      // 链接线程还没创建过
+  {                                             // 分支体开始
+    // 创建链接线程，名字叫eth_link，入口lwip_link_thread，传网卡对象
+    g_link_thread = sys_thread_new("eth_link", lwip_link_thread, &g_lwip_netif,   // 创建链接线程
+                                   LWIP_LINK_STK_SIZE, LWIP_LINK_TASK_PRIO);   // 栈3KB优先级24
+    if (g_link_thread.thread_handle == NULL)    // 句柄还是空说明创建失败
+      return ETH_ERR_CONFIG;                     // 线程创建失败，内存不够
+  }                                             // 分支体结束
+#endif                                          // 条件编译结束
+#if LWIP_DHCP                                   // 开了DHCP才创建DHCP线程
+  if (g_dhcp_thread.thread_handle == NULL)      // DHCP线程还没创建过
+  {                                             // 分支体开始
+    // 创建DHCP线程，名字叫eth_dhcp，入口lwip_dhcp_process
+    g_dhcp_thread = sys_thread_new("eth_dhcp", lwip_dhcp_process, &g_lwip_netif,   // 创建DHCP线程
+                                   LWIP_DHCP_STK_SIZE, LWIP_DHCP_TASK_PRIO);   // 栈3KB优先级24
+    if (g_dhcp_thread.thread_handle == NULL)    // 句柄还是空说明创建失败
+      return ETH_ERR_CONFIG;                     // 创建失败
+  }                                             // 分支体结束
+#endif                                          // 条件编译结束
 
-  g_m2_eth_inited = 1;
-  return ETH_OK;
+  g_m2_eth_inited = 1;                           // 全部初始化成功，标记已初始化
+  return ETH_OK;                                 // 返回成功
+}                                               // 初始化函数结束
+
+// ===== 六、链路等待和轮询接口 =====
+
+// 函数：m2_ethernet_link_wait —— 等待物理链路建立（对外接口）
+// 功能：给MQTT等上层调的接口：阻塞等待网线插好、PHY协商成功链路up，期间周期性检查不占死CPU；MQTT连broker前先调这个确认物理层通，避免白发连接
+// 参数：timeout_ms —— 最长等待毫秒数，传0表示无限等下去直到链路通
+// 返回：int32_t，0代表链路已建立；ERR_LINK超时（规定时间内链路一直没通）
+int32_t m2_ethernet_link_wait(uint32_t timeout_ms)   // 等链路建立，MQTT连接前调用
+{
+  if (!g_m2_eth_inited)                          // 初始化没做过
+    return ETH_ERR_CONFIG;                  // 还没初始化，直接返回错误
+  uint32_t elapsed = 0;                    // 已经等了多少毫秒
+
+  // 循环查LwIP的链路标志，这个标志由链接线程/回调更新，不是自己直接改
+  while (netif_is_link_up(&g_lwip_netif) == 0)   // 链路还是断的
+  {                                         // 等待循环开始
+    if ((timeout_ms != 0) && (elapsed >= timeout_ms))   // 有限时且到点了
+      return ETH_ERR_LINK;                 // 超时了还没连上，返回链路错误
+    vTaskDelay(100 / portTICK_PERIOD_MS);  // 睡100毫秒再查，不空转烧CPU
+    elapsed += 100;                         // 累计等待时间
+  }                                         // 等待循环结束
+  return ETH_OK;                           // 链路好了，返回成功
+}                                           // 链路等待函数结束
+
+// 函数：m2_ethernet_poll —— 空轮询（接口兼容用）
+// 功能：带OS版本下的空实现：收包实际由ethernetif网卡线程在后台自动处理，不需要任何人手动轮询；保留这个函数只为兼容无OS裸机版本的接口形状，别的模块调了也不做任何事
+// 参数：无
+// 返回：void，无返回值，函数体是空的
+void m2_ethernet_poll(void)                      // 空轮询，接口兼容用
+{
 }
 
-/* ================= 六、链路等待 / 轮询接口 ================= */
-
-/**
- * @brief  等待链路建立（网线插好 + PHY 已链接）
- * @param  timeout_ms 超时毫秒（0=无限等待）
- * @retval ETH_OK 已链接；ETH_ERR_LINK 超时
- * @note   谁用？以后的 mqtt 服务连服务器前先等这个，保证网络就绪
- */
-int32_t m2_ethernet_link_wait(uint32_t timeout_ms)
+// ===== 七、链接状态更新回调 =====
+// 函数：lwip_link_status_updated —— 链路状态变化回调
+// 功能：LwIP在网线插拔链路up/down变化时自动调用（注册在netif链路回调）：通知DHCP状态机跟随链路——插线就从OFF重新开始申请IP，拔线就停申请并清状态，防止拔线后DHCP状态机空转
+// 参数：netif —— 发生链路变化的网卡结构指针，从中判断链路是up还是down
+// 返回：void，无返回值
+static void lwip_link_status_updated(struct netif *netif)   // 链路变化回调
 {
-  if (!g_m2_eth_inited)
-    return ETH_ERR_CONFIG;
-  uint32_t elapsed = 0;                   /* 已等待时间（毫秒累计） */
-
-  /* 循环查 lwip 的"链路已链接"标志：
-     netif_is_link_up 由链接线程/回调更新（lwip 内部维护），不是我们直接置的 */
-  while (netif_is_link_up(&g_lwip_netif) == 0)
+  if (netif_is_up(netif))                 // 网口up状态，网络就绪
   {
-    if ((timeout_ms != 0) && (elapsed >= timeout_ms))
-      return ETH_ERR_LINK;                /* 超时：网线没插好或对端没起来 */
-    vTaskDelay(100 / portTICK_PERIOD_MS); /* 睡 100ms 再查（别空转烧 CPU） */
-    elapsed += 100;
+#if LWIP_DHCP                           // 开了DHCP才有这逻辑
+    g_lwip_dhcp_state = LWIP_DHCP_START;  // 让DHCP线程进入开始申请状态
+    printf("The network cable is connected\r\n");   // 打印网线已连接
+#endif                                    // 条件编译结束
   }
-  return ETH_OK;                          /* 链路好了 */
-}
-
-/** 带 OS 版空实现：收包由 ethernetif_thread（第 2 步）处理。
-    保留这个函数是为了跟 Day1 骨架的接口约定兼容（以后 mqtt 层调用不报错） */
-void m2_ethernet_poll(void)
-{
-}
-
-/* ================= 七、链接状态更新回调 =================
- * 被 lwip 自动调用（注册在 netif_set_link_callback），
- * 触发时机：netif_set_link_up/down、netif_set_up/down 时。
- * 作用：网线插拔时通知 DHCP 状态机去启动/停止申请 */
-static void lwip_link_status_updated(struct netif *netif)
-{
-  if (netif_is_up(netif))                 /* 网口处于 up 状态 = 网络就绪 */
+  else                                    // 网口down，断线了
   {
-#if LWIP_DHCP
-    g_lwip_dhcp_state = LWIP_DHCP_START;  /* 让 DHCP 线程进入"开始申请"状态 */
-    printf("The network cable is connected\r\n");
-#endif
+#if LWIP_DHCP                           // 开了DHCP才有这逻辑
+    g_lwip_dhcp_state = LWIP_DHCP_LINK_DOWN;  // 让DHCP线程停掉申请
+    printf("The network cable is not connected\r\n");   // 打印网线断了
+#endif                                    // 条件编译结束
   }
-  else                                    /* 网口 down = 断线 */
-  {
-#if LWIP_DHCP
-    g_lwip_dhcp_state = LWIP_DHCP_LINK_DOWN;  /* 让 DHCP 线程去停掉申请 */
-    printf("The network cable is not connected\r\n");
-#endif
-  }
-}
+}                                         // 回调函数结束
 
-/* ================= 八、链接线程 =================
- * 每秒检查一次 PHY 链接状态（网线插没插），变化时：
- *   - 断线：停掉 ETH（DMA 停止收包）+ 网卡标记 down
- *   - 插线：重启 ETH（DMA + 接收中断）+ 网卡标记 up
- * 为什么要自己盯 PHY 而不是靠中断？RMII 没有"链接中断"引脚给 MCU，
- * 只能用轮询方式读 PHY 状态寄存器 */
-static void lwip_link_thread(void *argument)
+// ===== 八、链接线程，每秒轮询一次PHY状态 =====
+// 函数：lwip_link_thread —— 链接状态轮询线程
+// 功能：FreeRTOS线程入口，每1秒读一次PHY的BSR寄存器（bit2链路状态）：链路从断到通就标记netif链路up并打日志，从通到断就标记down；RMII接口没有专用链路中断脚，只能这样轮询感知网线插拔
+// 参数：argument —— FreeRTOS线程参数，没用到
+// 返回：void，无返回值，死循环不退出
+static void lwip_link_thread(void *argument)    // 链接线程入口，每秒轮询PHY
 {
-  struct netif *netif = (struct netif *)argument;  /* 线程参数 = 网卡对象 */
-  int link_again_num = 0;   /* ★去抖计数器：连续 2 次读到"断线"才当真 */
-                            /* 为什么去抖？网线接触不良/交换机重启会瞬间闪断，
-                               不处理，PHY 状态会在 1 秒内抖动，反复启停 ETH 反而搞挂协议栈 */
+  struct netif *netif = (struct netif *)argument;  // 线程参数就是网卡对象
+  int link_again_num = 0;   // 去抖计数器，连续2次读到断线才当真，防止闪断抖动
 
-  for (;;)
-  {
-    /* 读 PHY 链接状态：1=网线插好且对端活着，0=没插/对端没电 */
-    if (lan8720_link_read() == 0)
-    {
-      g_lwipdev.link_status = LWIP_LINK_OFF;   /* 记录断链（业务层能查） */
-      link_again_num++;                        /* 断线计数 +1 */
+  for (;;)                                  // 线程死循环
+  {                                         // 循环体开始
+    // 读PHY链路状态：1=插好且对端活着，0=没插或者对端没电
+    if (lan8720_link_read() == 0)           // PHY报链路断
+    {                                       // 断线分支开始
+      g_lwipdev.link_status = LWIP_LINK_OFF;   // 记录断链，业务层可以查
+      link_again_num++;                        // 断线计数加1
 
-      if (link_again_num >= 2)
-      {
-        /* 已经连续 2 秒断线：上轮已处理过，不再重复关网卡。
-         * ★这里绝对不能 continue —— 那会跳过循环末尾的 vTaskDelay(1000)，
-         * 本线程(优先级 3)变成死循环，把 FreeRTOS 定时器任务(优先级 2)饿死，
-         * Modbus 的超时定时器和 T35 帧间隔定时器全部停摆：
-         * 表现就是只发出第一帧，之后主站永远等不到超时通知，队列塞满。 */
+      if (link_again_num >= 2)                 // 连续断线
+      {                                       // 分支体开始
+        // 连续2秒断线，上一轮已经处理过了，这里什么都不做，不能continue，会跳过末尾延时
+      }                                       // 分支体结束
+      else          // 第一次读到断线，真正执行断线处理
+      {                                       // 分支体开始
+#if LWIP_DHCP                                // 开了DHCP才通知
+        g_lwip_dhcp_state = LWIP_DHCP_LINK_DOWN;  // 通知DHCP线程停止申请
+#endif                                       // 条件编译结束
+        // 不调HAL_ETH_Stop，实测停了再启动会导致TX描述符状态不一致，只停netif层就行
+        // 改netif状态必须用netifapi线程安全封装，投递到内核线程执行，不能直接调
+        netifapi_netif_set_down(netif);     // 网卡标记down，走内核线程
+        netifapi_netif_set_link_down(netif);  // 链路标记断开
+        netifapi_dhcp_stop(netif);          // 停掉DHCP申请
+      }                                      // 分支体结束
+    }                                        // 断线分支结束
+    else  // 网线插入，或者链路恢复了
+    {                                       // 恢复分支开始
+      link_again_num = 0;                       // 清零去抖计数器
+      if (g_lwipdev.link_status == LWIP_LINK_OFF)  // 之前是断的，现在好了，要重新启动
+      {                                     // 分支体开始
+        g_lwipdev.link_status = LWIP_LINK_ON;   // 记录已连接
+        // 不调HAL_ETH_Start_IT，MAC本来就一直在跑，重复启动会搞坏TX描述符，只恢复netif层
+        netifapi_netif_set_up(netif);        // 线程安全地标记网卡up，走内核线程
+        netifapi_netif_set_link_up(netif);   // 链路标记连上
+      }                                     // 分支体结束
+      // 本来就连着的话什么都不做
+    }                                        // 恢复分支结束
+
+    vTaskDelay(1000 / portTICK_PERIOD_MS);      // 睡1秒，每秒轮询一次，去抖粒度就是1秒
+  }                                          // 死循环结束
+}                                            // 链接线程结束
+
+// ===== 九、DHCP线程，状态机，每秒循环一次 =====
+// 状态流转：START开始 → WAIT等分配 → ASSIGNED成功，或者TIMEOUT超时回落静态IP
+// 网线断了就LINK_DOWN → OFF，等下次插线再重新开始
+#if LWIP_DHCP                                   // 开了DHCP才编译这个线程
+// 函数：lwip_dhcp_process —— DHCP申请线程
+// 功能：FreeRTOS线程入口，跑DHCP状态机：START开始→WAIT等DHCP服务器分配（期间每250ms轮询一次）→ASSIGNED拿到IP打日志→网线断走LINK_DOWN清状态回OFF等下次插线；反复超时就调lwip_comm_default_ip_set回落静态IP
+// 参数：pvParameters —— FreeRTOS线程参数，没用到
+// 返回：void，无返回值，死循环不退出
+static void lwip_dhcp_process(void *pvParameters)   // DHCP线程入口，状态机
+{
+  printf("[DHCP] thread started, state=%d freeHeap=%u\r\n", g_lwip_dhcp_state, (unsigned)xPortGetFreeHeapSize());  // 线程启动日志，打印状态和剩余堆
+  struct netif *netif = (struct netif *)pvParameters;  // 线程参数就是网卡对象
+  uint32_t ip = 0, netmask = 0, gw = 0;               // 缓存读出来的地址，打印用
+  struct dhcp *dhcp;                                  // DHCP内部状态结构，看尝试次数
+
+  g_lwipdev.dhcpstatus = 1;   // 1=正在向DHCP服务器申请
+
+  for (;;)                                  // 线程死循环
+  {                                         // 循环体开始
+    switch (g_lwip_dhcp_state)   // 按当前状态执行对应动作
+    {                                       // 状态机开始
+      case LWIP_DHCP_START:                 // 开始申请状态
+      {                                     // case体开始
+        // 先把网卡地址清零，回到0.0.0.0，这是DHCP申请的前置条件，必须走netifapi线程安全
+        ip_addr_t zero;                     // 临时清零地址
+        ip_addr_set_zero_ip4(&zero);        // 填成0.0.0.0
+        netifapi_netif_set_addr(netif, &zero, &zero, &zero);   // 清零网卡三地址
+        g_lwip_dhcp_state = LWIP_DHCP_WAIT_ADDRESS;   // 进入等分配状态
+        netifapi_dhcp_start(netif);   // 真正发起DHCP广播请求，在内核线程执行
+        printf("Looking for DHCP server, please wait...\r\n");   // 打印正在找DHCP服务器
       }
-      else          /* 第一次读到断线：真正执行"断线处理" */
-      {
-#if LWIP_DHCP
-        g_lwip_dhcp_state = LWIP_DHCP_LINK_DOWN;  /* 通知 DHCP 线程停止申请 */
-#endif
-        /* ★不调HAL_ETH_Stop：实测Stop后再Start_IT导致TX DMA描述符状态不一致，板子发TX但网络收不到。
-           MAC从low_level_init的Start_IT起一直跑，链路down只停netif层即可，PHY物理断开后MAC自然收不到包。 */
-        /* 下面 3 个都是改 netif 状态的 API，必须经 netifapi 投递到 tcpip_thread 执行，
-           不能在链接线程里直接 netif_set_down/netif_set_link_down（评审指出的线程安全问题） */
-        netifapi_netif_set_down(netif);
-        netifapi_netif_set_link_down(netif);
-        netifapi_dhcp_stop(netif);
-      }
-    }
-    else  /* 网线插入（或恢复链接） */
-    {
-      link_again_num = 0;                       /* 清零去抖计数 */
-      if (g_lwipdev.link_status == LWIP_LINK_OFF)  /* 之前是断的 → 现在好了，要"重新启动" */
-      {
-        g_lwipdev.link_status = LWIP_LINK_ON;   /* 记录已链接 */
-        /* ★不调HAL_ETH_Start_IT：MAC已在low_level_init时启动，重复Start_IT会搞坏TX DMA描述符。
-           链路up时只需恢复netif层状态，PHY链路恢复后包自动传上来。 */
-        netifapi_netif_set_up(netif);        /* 同样走 tcpip_thread */
-        netifapi_netif_set_link_up(netif);
-      }
-      /* 若本来就连着，什么都不做 */
-    }
+      break;                                // 跳出switch，开始申请动作完成
 
-    vTaskDelay(1000 / portTICK_PERIOD_MS);      /* 每秒轮询一次（去抖粒度就是 1 秒） */
-  }
-}
+      case LWIP_DHCP_WAIT_ADDRESS:           // 等分配状态
+      {                                       // case体开始
+        // 每次循环先把当前地址读出来，DHCP成功了LwIP会自动写进netif
+        ip      = g_lwip_netif.ip_addr.addr;       // 读当前IP
+        netmask = g_lwip_netif.netmask.addr;       // 读当前掩码
+        gw      = g_lwip_netif.gw.addr;            // 读当前网关
 
-/* ================= 九、DHCP 线程：状态机 =================
- * 状态流转（照例程 netconf.c）：
- *   START → WAIT_ADDRESS →（拿到 IP）ADDRESS_ASSIGNED
- *                       →（tries 超 10 次）TIMEOUT：停 DHCP，回落静态 IP
- *   LINK_DOWN（网线断）→ 停 DHCP → OFF，等下次插线回调再 START
- * 每秒循环一次，状态由链接回调和其他分支改写 */
-#if LWIP_DHCP
-static void lwip_dhcp_process(void *pvParameters)
-{
-  printf("[DHCP] thread started, state=%d freeHeap=%u\r\n", g_lwip_dhcp_state, (unsigned)xPortGetFreeHeapSize());
-  struct netif *netif = (struct netif *)pvParameters;  /* 线程参数 = 网卡对象 */
-  uint32_t ip = 0, netmask = 0, gw = 0;               /* 缓存从 netif 读出的地址（解析字节用） */
-  struct dhcp *dhcp;                                  /* DHCP 客户端内部状态（看尝试次数） */
+        // 判断LwIP是不是已经标记DHCP给了地址
+        if (dhcp_supplied_address(netif))    // DHCP已给地址
+        {                                   // 分配成功分支开始
+          g_lwip_dhcp_state = LWIP_DHCP_ADDRESS_ASSIGNED;  // 进入稳定态，不再重复申请
+          if (ip != 0)   // 地址非0才是真拿到了
+          {                               // 分支体开始
+            g_lwipdev.dhcpstatus = 2;    // 2=DHCP成功
 
-  g_lwipdev.dhcpstatus = 1;   /* 1=正在向 DHCP 服务器申请 */
+            // 把32位大端地址拆成4个字节存起来，方便打印，右移24拿最高字节
+            g_lwipdev.ip[3]      = (uint8_t)(ip >> 24);   // IP最高字节
+            g_lwipdev.ip[2]      = (uint8_t)(ip >> 16);   // IP次高字节
+            g_lwipdev.ip[1]      = (uint8_t)(ip >> 8);    // IP次低字节
+            g_lwipdev.ip[0]      = (uint8_t)(ip);         // IP最低字节
+            g_lwipdev.netmask[3] = (uint8_t)(netmask >> 24);  // 掩码最高字节
+            g_lwipdev.netmask[2] = (uint8_t)(netmask >> 16);  // 掩码次高字节
+            g_lwipdev.netmask[1] = (uint8_t)(netmask >> 8);   // 掩码次低字节
+            g_lwipdev.netmask[0] = (uint8_t)(netmask);        // 掩码最低字节
+            g_lwipdev.gateway[3] = (uint8_t)(gw >> 24);   // 网关最高字节
+            g_lwipdev.gateway[2] = (uint8_t)(gw >> 16);   // 网关次高字节
+            g_lwipdev.gateway[1] = (uint8_t)(gw >> 8);    // 网关次低字节
+            g_lwipdev.gateway[0] = (uint8_t)(gw);         // 网关最低字节
+            printf("DHCP assigned: %d.%d.%d.%d / %d.%d.%d.%d / gw %d.%d.%d.%d\r\n",   // 打印分配结果
+                   g_lwipdev.ip[0], g_lwipdev.ip[1], g_lwipdev.ip[2], g_lwipdev.ip[3],   // IP四个字节
+                   g_lwipdev.netmask[0], g_lwipdev.netmask[1], g_lwipdev.netmask[2], g_lwipdev.netmask[3],   // 掩码四个字节
+                   g_lwipdev.gateway[0], g_lwipdev.gateway[1], g_lwipdev.gateway[2], g_lwipdev.gateway[3]);  // 网关四个字节
+          }                                 // 分支体结束
+        }                                   // 分配成功分支结束
+        else                                // 还没拿到地址
+        {                                   // 等待分支开始
+          // 还没拿到IP，从netif里拿DHCP客户端状态，看尝试次数超没超限
+          dhcp = (struct dhcp *)netif_get_client_data(netif, LWIP_NETIF_CLIENT_DATA_INDEX_DHCP);  // 取DHCP内部状态
+          if (dhcp->tries > LWIP_MAX_DHCP_TRIES)   // 尝试次数超限
+          {                                 // 超时分支开始
+            // DHCP超时，放弃动态分配，回落静态IP
+            printf("DHCP timeout, fallback to static IP...\r\n");   // 打印超时回落静态IP
+            g_lwip_dhcp_state = LWIP_DHCP_TIMEOUT;  // 进入超时态，不再重复尝试
+            netifapi_dhcp_stop(netif);                // 线程安全停掉DHCP
+            g_lwipdev.dhcpstatus = 0xFF;             // 0xFF标记现在用静态IP
 
-  for (;;)
-  {
-    switch (g_lwip_dhcp_state)   /* 按当前状态执行对应动作 */
-    {
-      case LWIP_DHCP_START:
-      {
-        /* 清零网卡上的地址（回到 0.0.0.0），这是 DHCP 申请的前置条件。
-           ★不能再像旧版那样直接 ip_addr_set_zero_ip4(&netif->ip_addr) 写内核结构——
-           必须走 netifapi，由 tcpip_thread 执行 */
-        ip_addr_t zero;
-        ip_addr_set_zero_ip4(&zero);
-        netifapi_netif_set_addr(netif, &zero, &zero, &zero);
-        g_lwip_dhcp_state = LWIP_DHCP_WAIT_ADDRESS;   /* 进入"等分配"状态 */
-        netifapi_dhcp_start(netif);   /* ★真正发起 DHCP 请求（发广播包），在 tcpip 线程执行 */
-        printf("Looking for DHCP server, please wait...\r\n");
-      }
-      break;
+            // 把静态IP通过netifapi写进网卡，不能直接改内核字段
+            {                               // 回落块开始
+              ip_addr_t sip, snm, sgw;      // 临时静态三地址
+              IP4_ADDR(&sip, g_lwipdev.ip[0], g_lwipdev.ip[1], g_lwipdev.ip[2], g_lwipdev.ip[3]);   // 拼静态IP
+              IP4_ADDR(&snm, g_lwipdev.netmask[0], g_lwipdev.netmask[1], g_lwipdev.netmask[2], g_lwipdev.netmask[3]);  // 拼掩码
+              IP4_ADDR(&sgw, g_lwipdev.gateway[0], g_lwipdev.gateway[1], g_lwipdev.gateway[2], g_lwipdev.gateway[3]);  // 拼网关
+              netifapi_netif_set_addr(netif, &sip, &snm, &sgw);   // 写进网卡
+              // 先down再up，强制清ARP缓存、重新初始化，不然ARP表脏了ping不通
+              netifapi_netif_set_down(netif);   // 网卡down
+              netifapi_netif_set_up(netif);     // 网卡重新up
 
-      case LWIP_DHCP_WAIT_ADDRESS:
-      {
-        /* 每次循环把当前地址读出来（DHCP 成功时 lwip 会写进 netif） */
-        ip      = g_lwip_netif.ip_addr.addr;
-        netmask = g_lwip_netif.netmask.addr;
-        gw      = g_lwip_netif.gw.addr;
+              // 静态IP没有DHCP给DNS，手动设公共DNS，不然解析不了云平台域名
+              {                             // DNS块开始
+                ip_addr_t dns1, dns2;      // 两个DNS服务器
+                IP4_ADDR(&dns1, 114, 114, 114, 114);   // 114公共DNS
+                IP4_ADDR(&dns2, 223, 5, 5, 5);         // 阿里公共DNS
+                dns_setserver(0, &dns1);    // 设第一个DNS
+                dns_setserver(1, &dns2);    // 设第二个DNS
+              }                             // DNS块结束
+            }                               // 回落块结束
+            printf("Static IP: %d.%d.%d.%d / %d.%d.%d.%d / gw %d.%d.%d.%d\r\n",   // 打印静态IP结果
+                   g_lwipdev.ip[0], g_lwipdev.ip[1], g_lwipdev.ip[2], g_lwipdev.ip[3],   // IP四个字节
+                   g_lwipdev.netmask[0], g_lwipdev.netmask[1], g_lwipdev.netmask[2], g_lwipdev.netmask[3],   // 掩码四个字节
+                   g_lwipdev.gateway[0], g_lwipdev.gateway[1], g_lwipdev.gateway[2], g_lwipdev.gateway[3]);  // 网关四个字节
+          }                                 // 超时分支结束
+        }                                   // 等待分支结束
+      }                                     // case体结束
+      break;                                // 跳出switch
 
-        /* ★判断是否已经拿到 IP：lwip 内部标记"DHCP 给了地址" */
-        if (dhcp_supplied_address(netif))
-        {
-          g_lwip_dhcp_state = LWIP_DHCP_ADDRESS_ASSIGNED;  /* 进入稳定态（不再重复申请） */
-          if (ip != 0)   /* 地址非 0 才是真的拿到了 */
-          {
-            g_lwipdev.dhcpstatus = 2;    /* 2=DHCP 成功 */
+      case LWIP_DHCP_LINK_DOWN:             // 断网状态
+      {                                       // case体开始
+        // 网线断了，停掉DHCP，回到OFF，下次插线回调会置START重新申请
+        netifapi_dhcp_stop(netif);          // 停DHCP
+        g_lwip_dhcp_state = LWIP_DHCP_OFF;  // 回OFF态
+      }                                     // case体结束
+      break;                                // 跳出switch
 
-            /* 把 netif 里的 32 位地址拆成 4 字节存进 g_lwipdev 打印用。
-               ★注意字节顺序：lwip 存的是大端（网络字节序），
-               ip >> 24 取出的是最高字节 = 点分十进制第一段（如 192） */
-            g_lwipdev.ip[3]      = (uint8_t)(ip >> 24);
-            g_lwipdev.ip[2]      = (uint8_t)(ip >> 16);
-            g_lwipdev.ip[1]      = (uint8_t)(ip >> 8);
-            g_lwipdev.ip[0]      = (uint8_t)(ip);
-            g_lwipdev.netmask[3] = (uint8_t)(netmask >> 24);
-            g_lwipdev.netmask[2] = (uint8_t)(netmask >> 16);
-            g_lwipdev.netmask[1] = (uint8_t)(netmask >> 8);
-            g_lwipdev.netmask[0] = (uint8_t)(netmask);
-            g_lwipdev.gateway[3] = (uint8_t)(gw >> 24);
-            g_lwipdev.gateway[2] = (uint8_t)(gw >> 16);
-            g_lwipdev.gateway[1] = (uint8_t)(gw >> 8);
-            g_lwipdev.gateway[0] = (uint8_t)(gw);
-            printf("DHCP assigned: %d.%d.%d.%d / %d.%d.%d.%d / gw %d.%d.%d.%d\r\n",
-                   g_lwipdev.ip[0], g_lwipdev.ip[1], g_lwipdev.ip[2], g_lwipdev.ip[3],
-                   g_lwipdev.netmask[0], g_lwipdev.netmask[1], g_lwipdev.netmask[2], g_lwipdev.netmask[3],
-                   g_lwipdev.gateway[0], g_lwipdev.gateway[1], g_lwipdev.gateway[2], g_lwipdev.gateway[3]);
-          }
-        }
-        else
-        {
-          /* 还没拿到：看尝试次数是否超限（超过 LWIP_MAX_DHCP_TRIES 次） */
-          dhcp = (struct dhcp *)netif_get_client_data(netif, LWIP_NETIF_CLIENT_DATA_INDEX_DHCP);
-          if (dhcp->tries > LWIP_MAX_DHCP_TRIES)
-          {
-            /* ★DHCP 超时：放弃动态分配，回落静态 IP */
-            printf("DHCP timeout, fallback to static IP...\r\n");
-            g_lwip_dhcp_state = LWIP_DHCP_TIMEOUT;  /* 进入超时态（不再重复尝试） */
-            netifapi_dhcp_stop(netif);                /* 停掉 DHCP（走 tcpip 线程） */
-            g_lwipdev.dhcpstatus = 0xFF;             /* 0xFF=正在用静态 */
+      default:                              // 其他稳定态
+        break;   // 成功、超时、OFF这些稳定态，什么都不做
+    }                                         // 状态机结束
 
-            /* 把默认静态 IP 经 netifapi 写进网卡（不能再直接写 g_lwip_netif.ip_addr 字段） */
-            {
-              ip_addr_t sip, snm, sgw;
-              IP4_ADDR(&sip, g_lwipdev.ip[0], g_lwipdev.ip[1], g_lwipdev.ip[2], g_lwipdev.ip[3]);
-              IP4_ADDR(&snm, g_lwipdev.netmask[0], g_lwipdev.netmask[1], g_lwipdev.netmask[2], g_lwipdev.netmask[3]);
-              IP4_ADDR(&sgw, g_lwipdev.gateway[0], g_lwipdev.gateway[1], g_lwipdev.gateway[2], g_lwipdev.gateway[3]);
-              netifapi_netif_set_addr(netif, &sip, &snm, &sgw);
-              /* ★DHCP超时回落后netif的ARP/接口状态可能不一致（DHCP期间IP=0.0.0.0导致ARP表脏），
-                 先down再up强制LWIP清ARP缓存、重新初始化接口、发gratuitous ARP，否则PC ping不通。 */
-              netifapi_netif_set_down(netif);
-              netifapi_netif_set_up(netif);
-
-              /* ★静态 IP 兜底没有 DHCP 提供 DNS，手动设公共 DNS，否则解析不了云平台域名 */
-              {
-                ip_addr_t dns1, dns2;
-                IP4_ADDR(&dns1, 114, 114, 114, 114);
-                IP4_ADDR(&dns2, 223, 5, 5, 5);
-                dns_setserver(0, &dns1);
-                dns_setserver(1, &dns2);
-              }
-            }
-            printf("Static IP: %d.%d.%d.%d / %d.%d.%d.%d / gw %d.%d.%d.%d\r\n",
-                   g_lwipdev.ip[0], g_lwipdev.ip[1], g_lwipdev.ip[2], g_lwipdev.ip[3],
-                   g_lwipdev.netmask[0], g_lwipdev.netmask[1], g_lwipdev.netmask[2], g_lwipdev.netmask[3],
-                   g_lwipdev.gateway[0], g_lwipdev.gateway[1], g_lwipdev.gateway[2], g_lwipdev.gateway[3]);
-          }
-        }
-      }
-      break;
-
-      case LWIP_DHCP_LINK_DOWN:
-      {
-        /* 网线断了：停掉 DHCP，回到 OFF；下次插线回调会置 START 重新申请 */
-        netifapi_dhcp_stop(netif);
-        g_lwip_dhcp_state = LWIP_DHCP_OFF;
-      }
-      break;
-
-      default:
-        break;   /* ADDRESS_ASSIGNED / TIMEOUT / OFF：稳定态，什么都不做 */
-    }
-
-    vTaskDelay(1000 / portTICK_PERIOD_MS);   /* 每秒跑一次状态机（DHCP 响应本身也是秒级） */
-  }
-}
-#endif /* LWIP_DHCP */
+    vTaskDelay(1000 / portTICK_PERIOD_MS);   // 每秒跑一次状态机，DHCP响应本身就是秒级
+  }                                          // 死循环结束
+}                                            // DHCP线程结束
+#endif // LWIP_DHCP 条件编译结束
