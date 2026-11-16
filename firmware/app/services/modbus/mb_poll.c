@@ -372,7 +372,7 @@ bool Modbus_LoadSlave(const modbus_t *config, const mb_point_t *points)
  *  启动 10 秒后再投递 4 号 FC05、5 号 FC06 两个写请求。
  *  MB_TEST_MODE=0：不加载测试配置，只运行正常轮询。
  */
-#define MB_TEST_MODE  1
+#define MB_TEST_MODE  0
 
 void vModbusPollTask(void *argument)
 {
