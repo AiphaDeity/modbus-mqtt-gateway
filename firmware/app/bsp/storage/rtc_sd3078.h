@@ -1,4 +1,3 @@
-//**SD3078 实时时钟芯片的接口声明头文件**，只规定好了「上层代码可以调用哪些和时钟相关的函数、参数
 #ifndef RTC_SD3078_H
 #define RTC_SD3078_H
 
@@ -12,6 +11,7 @@
  * 依赖：CubeMX 已生成 MX_I2C1_Init()，全局句柄 hi2c1 可用。
  *
  * 时间结构体：BCD 编码与十进制互相转换由本驱动内部完成。
+ * I2C接口由调用方持有总线互斥锁；时间换算函数不访问硬件。
  */
 
 // RTC 时间（2000-01-01 ~ 2099-12-31）
@@ -26,22 +26,25 @@ typedef struct
     uint8_t  weekday; // 0 ~ 6，周日=0
 } rtc_datetime_t;
 
-// 初始化：检查 SD3078 是否在线，若停止运行则重新启动
+// 初始化只探测；不清除上电/停振标志，也不自动设置时间。
 HAL_StatusTypeDef rtc_sd3078_init(void);
 
 // 读取当前时间
 HAL_StatusTypeDef rtc_sd3078_get_time(rtc_datetime_t *dt);
 
-// 设置时间
+// 完整写入24小时制时间，读回一致才清停振标志，返回前尝试重新上锁。
 HAL_StatusTypeDef rtc_sd3078_set_time(const rtc_datetime_t *dt);
 
-// 判断 RTC 是否在走（停止标志位）
+// 检查CTR1的上电/停振标志均已清除；I/O失败返回false。
 bool rtc_sd3078_is_running(void);
 
-// 将 RTC 时间转为 Unix 时间戳（秒，UTC，2000-01-01 起）
+#define RTC_SD3078_UNIX_MIN 946684800U
+#define RTC_SD3078_UNIX_MAX 4102444799U
+
+// UTC Unix秒从1970年起；仅接受2000～2099年，非法日期返回0。
 uint32_t rtc_sd3078_to_unix(const rtc_datetime_t *dt);
 
-// 将 Unix 时间戳转为 RTC 时间
+// 将UTC Unix秒转为RTC时间；越界清零输出，调用方不可据此写入。
 void rtc_sd3078_from_unix(uint32_t unix_s, rtc_datetime_t *dt);
 
 #endif /* RTC_SD3078_H */

@@ -28,11 +28,10 @@ static bool Checkpoint(void *context, uint32_t started_ms, uint32_t timeout_ms, 
                   : Boot_WatchdogCheck(started_ms, timeout_ms);
 }
 
-// DWT 采样与诊断输出仅在 Boot 适配层，公共认证层通过回调报告验签阶段。
-#if defined(DEBUG) || defined(BOOT_PACKAGE_RECEIVE_TEST)
-// 采集分段验签周期数并输出诊断结果。
+// 记录验签失败的库错误码；调试构建额外采集分段周期数。
 static void SignatureEvent(void *context, UpgradePackageSignatureEvent event, int result)
 {
+#if defined(DEBUG) || defined(BOOT_PACKAGE_RECEIVE_TEST)
   Boot_PackageTiming *timing = context;
   switch (event)
   {
@@ -64,8 +63,14 @@ static void SignatureEvent(void *context, UpgradePackageSignatureEvent event, in
     default:
       break;
   }
-}
+#else
+  (void)context;
+  if ((event == UPGRADE_PACKAGE_SIGNATURE_END) && (result != 0))
+  {
+    printf("Package signature failed result=%d\r\n", result);
+  }
 #endif
+}
 
 // 建立使用 Boot 时基及监督回调的认证操作。
 static void InitOperation(UpgradePackageOperation *operation, UpgradePackagePlatform *platform,
@@ -74,11 +79,7 @@ static void InitOperation(UpgradePackageOperation *operation, UpgradePackagePlat
   platform->context = timing;
   platform->now_ms = NowMs;
   platform->checkpoint = Checkpoint;
-#if defined(DEBUG) || defined(BOOT_PACKAGE_RECEIVE_TEST)
   platform->signature_event = SignatureEvent;
-#else
-  platform->signature_event = NULL;
-#endif
   operation->platform = platform;
   operation->started_ms = HAL_GetTick();
   operation->timeout_ms = UPGRADE_PACKAGE_TIMEOUT_MS;
@@ -145,8 +146,14 @@ bool Boot_PackageDecrypt(Boot_PackageRead read, void *read_context, size_t packa
   UpgradePackagePlatform platform;
   UpgradePackageOperation operation;
   InitOperation(&operation, &platform, &timing);
-  return UpgradePackage_Decrypt(&operation, read, read_context, package_size,
-                                 public_key, aes_key, write, write_context);
+  bool ok = UpgradePackage_Decrypt(&operation, read, read_context, package_size,
+                                    public_key, aes_key, write, write_context);
+  if (!ok)
+  {
+    printf("Package decrypt failed error=%u size=%lu\r\n",
+           (unsigned int)operation.error, (unsigned long)package_size);
+  }
+  return ok;
 }
 
 // 在 Boot 主线程认证包及向量，沿用固定期限和分段进展监督。
@@ -158,6 +165,12 @@ bool Boot_PackageVerifyImage(Boot_PackageRead read, void *context, size_t packag
   UpgradePackagePlatform platform;
   UpgradePackageOperation operation;
   InitOperation(&operation, &platform, &timing);
-  return UpgradePackage_VerifyImage(&operation, read, context, package_size,
-                                     public_key, aes_key, image);
+  bool ok = UpgradePackage_VerifyImage(&operation, read, context, package_size,
+                                        public_key, aes_key, image);
+  if (!ok)
+  {
+    printf("Package verify failed error=%u size=%lu\r\n",
+           (unsigned int)operation.error, (unsigned long)package_size);
+  }
+  return ok;
 }

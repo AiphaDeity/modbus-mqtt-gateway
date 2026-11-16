@@ -62,9 +62,6 @@ const osThreadAttr_t myTaskModbusA_attributesTCP = {
 const osThreadAttr_t myTaskModbusB_attributes = {
     .name = "TaskModbusMaster",
     .priority = (osPriority_t) osPriorityNormal,
-    /* ★从 512×4=2KB 提到 1024×4=4KB
-     * sendTxBuffer 里有 printf×5 + busy-wait + HAL 中断嵌套，
-     * 2KB 栈根本不够用 → 爆栈 → Error_Handler 死循环 → 调试串口也停了 */
     .stack_size = 1024 * 4
 };
 
@@ -90,7 +87,7 @@ modbusHandler_t *mHandlers[MAX_M_HANDLERS];
 
 static bool sendTxBuffer(modbusHandler_t *modH);
 static int16_t getRxBuffer(modbusHandler_t *modH);
-static uint8_t validateAnswer(modbusHandler_t *modH);
+static int8_t validateAnswer(modbusHandler_t *modH, const modbus_t *telegram);
 static void buildException( uint8_t u8exception, modbusHandler_t *modH );
 static uint8_t validateRequest(modbusHandler_t * modH);
 static uint16_t word(uint8_t H, uint8_t l);
@@ -1150,7 +1147,7 @@ void StartTaskModbusMaster(void *argument)
 
 
 
-	  if ( modH->u8BufferSize < 6){
+	  if ( modH->u8BufferSize < 5){
 
 		  modH->i8state = COM_IDLE;
 		  modH->i8lastError = ERR_BAD_SIZE;
@@ -1163,7 +1160,7 @@ void StartTaskModbusMaster(void *argument)
 
 
 	  // validate message: id, CRC, FCT, exception
-	  int8_t u8exception = validateAnswer(modH);
+	  int8_t u8exception = validateAnswer(modH, &telegram);
 	  if (u8exception != 0)
 	  {
 		 modH->i8state = COM_IDLE;
@@ -1174,6 +1171,16 @@ void StartTaskModbusMaster(void *argument)
 
 	  modH->i8lastError = u8exception;
 
+      // 与快照和点表读取共用数据锁，避免32位值混入两轮寄存器。
+      if (osMutexAcquire(mb_handle->xSlaveDataMutex,
+                         pdMS_TO_TICKS(TIMEOUT_MODBUS + 200U)) != osOK)
+      {
+          modH->i8state = COM_IDLE;
+          modH->i8lastError = ERR_UNKNOWN;
+          mb_runtime_fail();
+          xTaskNotify((TaskHandle_t)telegram.u32CurrentTask, ERR_UNKNOWN, eSetValueWithOverwrite);
+          continue;
+      }
 	  xSemaphoreTake(modH->ModBusSphrHandle , portMAX_DELAY); //before processing the message get the semaphore
 	  // process answer
 	  switch( modH->u8Buffer[ FUNC ] )
@@ -1202,6 +1209,7 @@ void StartTaskModbusMaster(void *argument)
 	  if (modH->i8lastError ==0) // no error the error_OK, we need to use a different value than 0 to detect the timeout
 	  {
 		  xSemaphoreGive(modH->ModBusSphrHandle); //Release the semaphore
+          osMutexRelease(mb_handle->xSlaveDataMutex);
 		  xTaskNotify((TaskHandle_t)telegram.u32CurrentTask, ERR_OK_QUERY, eSetValueWithOverwrite);
 	  }
 
@@ -1263,8 +1271,11 @@ void get_FC3(modbusHandler_t *modH)
  * @return 0 if OK, EXCEPTION if anything fails
  * @ingroup buffer
  */
-uint8_t validateAnswer(modbusHandler_t *modH)
+// 核对本次请求的地址、功能、长度及写应答回显，成功后才允许复制寄存器。
+int8_t validateAnswer(modbusHandler_t *modH, const modbus_t *telegram)
 {
+    if (telegram == NULL || telegram->u16reg == NULL || modH->u8BufferSize < 5U)
+        return ERR_BAD_SIZE;
     // check message crc vs calculated crc
 
 #if ENABLE_TCP ==1
@@ -1284,11 +1295,16 @@ uint8_t validateAnswer(modbusHandler_t *modH)
 #endif
 
 
-    // check exception
+    if (modH->u8Buffer[ID] != telegram->u8id)
+        return ERR_BAD_SLAVE_ID;
+    if ((modH->u8Buffer[FUNC] & 0x7FU) != telegram->u8fct)
+        return EXC_FUNC_CODE;
+
+    // 异常应答固定5字节，不读取普通数据区。
     if ((modH->u8Buffer[ FUNC ] & 0x80) != 0)
     {
     	modH->u16errCnt ++;
-        return ERR_EXCEPTION;
+        return modH->u8BufferSize == 5U ? ERR_EXCEPTION : ERR_BAD_SIZE;
     }
 
     // check fct code
@@ -1307,7 +1323,31 @@ uint8_t validateAnswer(modbusHandler_t *modH)
         return EXC_FUNC_CODE;
     }
 
-    return 0; // OK, no exception code thrown
+    uint16_t count = telegram->u16CoilsNo;
+    if (telegram->u8fct == MB_FC_READ_COILS || telegram->u8fct == MB_FC_READ_DISCRETE_INPUT ||
+        telegram->u8fct == MB_FC_READ_REGISTERS || telegram->u8fct == MB_FC_READ_INPUT_REGISTER)
+    {
+        bool bits = telegram->u8fct == MB_FC_READ_COILS || telegram->u8fct == MB_FC_READ_DISCRETE_INPUT;
+        uint16_t capacity = bits ? MB_REG_MAX_PER_SLAVE * 16U : MB_REG_MAX_PER_SLAVE;
+        uint16_t bytes = bits ? (count + 7U) / 8U : count * 2U;
+        if (count == 0U || count > capacity || bytes + 5U != modH->u8BufferSize ||
+            modH->u8Buffer[2] != bytes)
+            return ERR_BAD_SIZE;
+    }
+    else
+    {
+        if (modH->u8BufferSize != 8U ||
+            word(modH->u8Buffer[ADD_HI], modH->u8Buffer[ADD_LO]) != telegram->u16RegAdd)
+            return ERR_BAD_SIZE;
+        uint16_t expected = count;
+        if (telegram->u8fct == MB_FC_WRITE_COIL)
+            expected = telegram->u16reg[0] != 0U ? 0xFF00U : 0U;
+        else if (telegram->u8fct == MB_FC_WRITE_REGISTER)
+            expected = telegram->u16reg[0];
+        if (word(modH->u8Buffer[NB_HI], modH->u8Buffer[NB_LO]) != expected)
+            return ERR_BAD_SIZE;
+    }
+    return 0;
 }
 
 
@@ -1339,14 +1379,6 @@ int16_t getRxBuffer(modbusHandler_t *modH)
 		modH->u16InCnt++;
 		i16result = modH->u8BufferSize;
 
-        /* 打印 RX 帧 hex dump（最多 32 字节） */
-        if (modH->u8BufferSize > 0) {
-            int _i;
-            printf("[RX] len=%d |", (int)modH->u8BufferSize);
-            for (_i = 0; _i < modH->u8BufferSize && _i < 32; _i++)
-                printf(" %02X", modH->u8Buffer[_i]);
-            printf("\n");
-        }
 	}
 
 	if(modH->xTypeHW == USART_HW)
@@ -1553,7 +1585,7 @@ extern uint8_t CDC_Transmit_FS(uint8_t* Buf, uint16_t Len);
  * This is done with TC bit.
  * The CRC is appended to the buffer before starting to send it.
  *
- * @return nothing
+ * @return true表示已启动发送；false表示准入或UART启动失败，未启动应答计时。
  * @ingroup modH Modbus handler
  */
 static bool sendTxBuffer(modbusHandler_t *modH)
@@ -1581,14 +1613,6 @@ if(modH->xTypeHW != TCP_HW)
     {
 #endif
 
-        /* 打印 TX 帧 hex dump（最多 32 字节） */
-        {
-            int _i;
-            printf("[TX] len=%d |", (int)modH->u8BufferSize);
-            for (_i = 0; _i < modH->u8BufferSize && _i < 32; _i++)
-                printf(" %02X", modH->u8Buffer[_i]);
-            printf("\n");
-        }
 
 #if ENABLE_USART_DMA ==1
     	if(modH->xTypeHW == USART_HW)
@@ -1618,51 +1642,7 @@ if(modH->xTypeHW != TCP_HW)
         }
 #endif
 
-        /* ================== 临时诊断：RS485 接收链路 ==================
-         * TX 结束后 12ms 内高频采样 PD9(USART3_RX) 电平：
-         *   low > 0  → 对端应答确实到了引脚，问题在 UART/配置侧
-         *   low == 0 → 引脚上什么都没有，问题在 485 收发器/接线
-         * 定位完成后整段删掉。
-         */
-        {
-            uint32_t _t0 = HAL_GetTick();
-            uint32_t _n = 0, _low = 0;
-            while ((HAL_GetTick() - _t0) < 12U)
-            {
-                _n++;
-                if ((GPIOD->IDR & GPIO_PIN_9) == 0U) { _low++; }
-            }
-            printf("[PD9] n=%lu low=%lu de=%d\n",
-                   (unsigned long)_n, (unsigned long)_low,
-                   (int)((GPIOD->ODR & GPIO_PIN_15) != 0U));
-        }
-        /* ================== 临时诊断结束 ================== */
-
-        /*
-         * ★DE 不在这里拉低！
-         *
-         * HAL 的 TC 中断会调 HAL_UART_TxCpltCallback，由它在 ISR 上下文里
-         * 立刻把 DE 拉低（微秒级），见 UARTCallback.c。
-         *
-         * 以前这里是「自旋等 TC → printf → 拉低 DE」。printf 走日志串口，
-         * 115200 下一个字符约 87us，32 个字符就要 2.8ms；而从站通常在收完
-         * 帧后 1~2ms 就回包 —— 这段时间 DE 还是高，收发器仍在驱动总线，
-         * 应答被自己的空闲电平顶掉，永远收不到（表现就是发得出去、每帧
-         * 1200ms 超时，rxneie=1 也一样）。
-         *
-         * 注意：也不能在这里「提前」拉低，最后一个字节还在移位寄存器里。
-         * 正确时机只有一个：硬件 TC 中断。
-         */
-
-         /* ★DE 刚拉低，立即清一次 USART 错误标志
-          * 发送方向期间 RS485 收发器的 RX 引脚可能浮空，产生 FE 噪声。
-          * 这些错误标志如果残留，HAL_IRQHandler 会在收到第一帧 PC 应答时
-          * 先调 UART_EndRxTransfer_IT() 把 RX IT 静默终止！ */
-         {
-             volatile uint32_t _sr = modH->port->Instance->SR;
-             volatile uint32_t _dr = modH->port->Instance->DR;
-             (void)_sr; (void)_dr;
-         }
+        /* 发送完成中断切回接收；接收和错误回调负责读取UART数据寄存器。 */
 
          // set timeout for master query
          if(modH->uModbusType == MB_MASTER )

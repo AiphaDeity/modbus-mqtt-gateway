@@ -9,9 +9,8 @@
  *
  * 全部消息为值传递：M2 put 返回后栈上缓冲即可复用，无生命周期约束。
  *
- * ★ 关键设计：四个队列的控制块 + buffer 全部用静态数组（.bss），
- *   不走 pvPortMalloc。否则 s_write_q（8×532B）+ s_resp_q（1×4.3KB）
- *   就吃 ~8.6KB heap，加上 M1/MQTT 资源和碎片，20KB heap 必然顶不住。
+ * 四个队列的控制块和消息区使用静态数组，不走 pvPortMalloc。
+ * 应答容量随 storage_fetch_resp_t 及公共批量上限一起调整。
  */
 
 #include "storage_m2.h"
@@ -27,7 +26,7 @@
 
 static osMessageQueueId_t s_write_q   = NULL;   /* 元素：storage_write_req_t（544B 值） */
 static osMessageQueueId_t s_fetch_q   = NULL;   /* 元素：storage_fetch_req_t（值） */
-static osMessageQueueId_t s_resp_q    = NULL;   /* 元素：storage_fetch_resp_t（~2.2KB 值，深度 1；收缩前 ~5.4KB） */
+static osMessageQueueId_t s_resp_q    = NULL;   /* 元素：storage_fetch_resp_t，深度 1 */
 static osMessageQueueId_t s_ack_q     = NULL;   /* 元素：storage_ack_t（值） */
 /* 写入失败可能已推进介质状态，锁存后保留原队首，不自动重试冒充重复成功。 */
 static HAL_StatusTypeDef s_write_error;
@@ -126,6 +125,8 @@ static HAL_StatusTypeDef process_fetch_queue(void)
 {
     storage_fetch_req_t req;
     if (xQueuePeek((QueueHandle_t)s_fetch_q, &req, 0U) != pdPASS) return HAL_OK;
+    // 先应用旧批次的所有已核验确认，不能把尚未结算的记录当新批次返回。
+    if (osMessageQueueGetCount(s_ack_q) != 0U) return HAL_BUSY;
     if (osMessageQueueGetSpace(s_resp_q) == 0U) return HAL_BUSY;
 
     uint16_t max_count = req.max_count;
@@ -159,8 +160,8 @@ HAL_StatusTypeDef storage_m2_process(void)
         return HAL_ERROR;
     if (!storage_mutation_begin()) return HAL_BUSY;
     HAL_StatusTypeDef write_result = process_write_queue();
-    HAL_StatusTypeDef fetch_result = process_fetch_queue();
     HAL_StatusTypeDef ack_result = process_ack_queue();
+    HAL_StatusTypeDef fetch_result = process_fetch_queue();
     storage_mutation_end();
     if (write_result == HAL_ERROR || fetch_result == HAL_ERROR || ack_result == HAL_ERROR)
         return HAL_ERROR;

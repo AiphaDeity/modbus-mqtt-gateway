@@ -1,21 +1,11 @@
 /*
- * https_tls_mbedtls_config.h —— HTTPS 固件下载 TLS 客户端配置（v3，集成入 App 构建）
+ * HTTPS下载与升级认证共用的mbedTLS配置。
  *
  * 目标服务器：百度云 BOS bj.bcebos.com:443
  *   TLS1.2 / ECDHE-RSA-AES128-GCM-SHA256 / 单向服务器认证 / RSA-2048 / 必须 SNI
  *
- * ★统一原则★：本配置 include upgrade_mbedtls_config.h（升级验签 10 宏），
- *   并显式启用 MBEDTLS_BLOCK_CIPHER_C，使 gcm_context 与升级算法同尺寸（实测 616B）。
- *   升级验签与 TLS 必须共用本配置编译，禁止两套配置混链（会导致 gcm_context 616 vs 384 错配）。
- *
- * v3 集成修正：
- *   - IN/OUT_CONTENT_LEN 改 2048（候选2，匹配可用 C 堆 ~11KiB）
- *   - 加 MBEDTLS_NO_PLATFORM_ENTROPY（裸机必须，否则 entropy_poll.c 编译失败）
- *   - 删 MBEDTLS_SSL_DEFAULT_CIPHERSUITES（3.6.7 无此宏，靠只启用 ECDHE_RSA 套件自然限制）
- *   - 加 MBEDTLS_BLOCK_CIPHER_C（统一 gcm_context 尺寸）
- *   - 加 MBEDTLS_HAVE_TIME/HAVE_TIME_DATE/PLATFORM_TIME（证书有效期检查）
- *   - 加 MBEDTLS_ECDH_C（ECDHE_RSA 前置依赖）
- *   - 加 MBEDTLS_ALLOW_PRIVATE_ACCESS（3.6 字段私有化后 sizeof 提取需要）
+ * 输入6 KiB用于证书消息重组，输出2 KiB；输入区由TLS分配钩子放入CCM。
+ * 升级认证和TLS使用同一配置编译，保持共用密码对象布局一致。
  */
 #ifndef HTTPS_TLS_MBEDTLS_CONFIG_H
 #define HTTPS_TLS_MBEDTLS_CONFIG_H
@@ -34,6 +24,7 @@
 #define MBEDTLS_SSL_PROTO_TLS1_2
 #define MBEDTLS_SSL_SERVER_NAME_INDICATION  /* SNI：BCE 按域名分发证书，必须 */
 #define MBEDTLS_SSL_EXTENDED_MASTER_SECRET  /* 安全性：extended master secret */
+#define MBEDTLS_SSL_MAX_FRAGMENT_LENGTH
 
 /* ===== 3. X.509 证书解析与验证 ===== */
 #define MBEDTLS_X509_USE_C
@@ -77,10 +68,10 @@
 #define MBEDTLS_MD_C
 #define MBEDTLS_OID_C
 #define MBEDTLS_PLATFORM_C
-/* 不定义 MBEDTLS_PLATFORM_MEMORY：newlib calloc/free 经 _sbrk 已可用，免多余间接层 */
+#define MBEDTLS_PLATFORM_MEMORY
 
-/* ===== 10. 内存相关宏（候选2：IN/OUT=2048，总峰值 ~8KiB）===== */
-#define MBEDTLS_SSL_IN_CONTENT_LEN      2048   /* 候选2：每方向 2KiB，总 4KiB */
+// 输入区还要重组完整证书消息；BOS当前证书消息4660 B，记录协商仍请求2048 B。
+#define MBEDTLS_SSL_IN_CONTENT_LEN      6144
 #define MBEDTLS_SSL_OUT_CONTENT_LEN     2048
 /* #define MBEDTLS_SSL_KEEP_PEER_CERTIFICATE */  /* 不保留对端证书：握手验证后释放，下载阶段省 ~6KiB */
 /* #define MBEDTLS_ERROR_C */                    /* 关 error 字符串表，省 Flash；如需 strerror 再开 */

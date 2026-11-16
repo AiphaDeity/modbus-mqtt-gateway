@@ -18,8 +18,6 @@
 #define STORAGE_M2_WRITE_Q_DEPTH    8
 #define STORAGE_M2_FETCH_Q_DEPTH    1   /* 单在途协议：M2 发一个 fetch_req 等一个 fetch_resp，depth=1 够 */
 #define STORAGE_M2_ACK_Q_DEPTH      8
-/* 内存收缩：10→4，回收 CCMRAM（records 数组 + 应答缓冲 + 响应队列三处）。
- * 单批 4 条 × 544B ≈ 2.1KB，配合 MQTT 载荷上限 1KiB 仍在同量级，补传吞吐靠多轮拉取。 */
 #define STORAGE_M2_FETCH_BATCH_MAX  4
 
 /* 4.1 M2 → M3：写入一条待持久化记录（离线缓存）。值传递，put 即拷贝 */
@@ -44,7 +42,7 @@ typedef struct {
     record_out_t records[STORAGE_M2_FETCH_BATCH_MAX];
 } storage_fetch_resp_t;
 
-/* 4.4 M2 → M3：上传成功回执（按 seq 水位删除，取本批最大 seq） */
+// 4.4 M2 → M3：仅提交已发送且逐条业务确认的连续批次前缀，不能取任意最大seq。
 typedef struct {
     uint64_t ack_upto_seq;
 } storage_ack_t;

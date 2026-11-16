@@ -9,7 +9,6 @@
 
 #include <string.h>
 
-#define BOOT_FLASH_CAPACITY (16U * 1024U * 1024U)
 #define BOOT_FLASH_READ_MAX 256U
 #define BOOT_FLASH_SECTOR_SIZE 4096U
 // 兼容当前支持的最慢 256 分频：256 字节约需 12.5ms，留出软件开销。
@@ -21,13 +20,14 @@
 static HAL_StatusTypeDef Boot_FlashReadStatus(uint8_t *value)
 {
   uint8_t command = 0x05U;
-  HAL_GPIO_WritePin(SPI_FLASH_CS_GPIO_Port, SPI_FLASH_CS_Pin, GPIO_PIN_RESET);
-  HAL_StatusTypeDef status = HAL_SPI_Transmit(&hspi2, &command, 1U, 10U);
+  *value = 0xFFU; // 全双工Receive会同时发送缓冲内容，状态读取也固定发送FF。
+  HAL_GPIO_WritePin(EXT_SPI_FLASH_CS_GPIO_Port, EXT_SPI_FLASH_CS_Pin, GPIO_PIN_RESET);
+  HAL_StatusTypeDef status = HAL_SPI_Transmit(&hspi3, &command, 1U, 10U);
   if (status == HAL_OK)
   {
-    status = HAL_SPI_Receive(&hspi2, value, 1U, 10U);
+    status = HAL_SPI_Receive(&hspi3, value, 1U, 10U);
   }
-  HAL_GPIO_WritePin(SPI_FLASH_CS_GPIO_Port, SPI_FLASH_CS_Pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(EXT_SPI_FLASH_CS_GPIO_Port, EXT_SPI_FLASH_CS_Pin, GPIO_PIN_SET);
   return status;
 }
 
@@ -35,9 +35,9 @@ static HAL_StatusTypeDef Boot_FlashReadStatus(uint8_t *value)
 static HAL_StatusTypeDef Boot_FlashWriteEnable(void)
 {
   uint8_t command = 0x06U;
-  HAL_GPIO_WritePin(SPI_FLASH_CS_GPIO_Port, SPI_FLASH_CS_Pin, GPIO_PIN_RESET);
-  HAL_StatusTypeDef status = HAL_SPI_Transmit(&hspi2, &command, 1U, 10U);
-  HAL_GPIO_WritePin(SPI_FLASH_CS_GPIO_Port, SPI_FLASH_CS_Pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(EXT_SPI_FLASH_CS_GPIO_Port, EXT_SPI_FLASH_CS_Pin, GPIO_PIN_RESET);
+  HAL_StatusTypeDef status = HAL_SPI_Transmit(&hspi3, &command, 1U, 10U);
+  HAL_GPIO_WritePin(EXT_SPI_FLASH_CS_GPIO_Port, EXT_SPI_FLASH_CS_Pin, GPIO_PIN_SET);
   if (status != HAL_OK)
   {
     return status;
@@ -126,13 +126,13 @@ static HAL_StatusTypeDef Boot_FlashModify(uint8_t instruction, uint32_t address,
   {
     instruction, (uint8_t)(address >> 16U), (uint8_t)(address >> 8U), (uint8_t)address
   };
-  HAL_GPIO_WritePin(SPI_FLASH_CS_GPIO_Port, SPI_FLASH_CS_Pin, GPIO_PIN_RESET);
-  status = HAL_SPI_Transmit(&hspi2, command, sizeof(command), 10U);
+  HAL_GPIO_WritePin(EXT_SPI_FLASH_CS_GPIO_Port, EXT_SPI_FLASH_CS_Pin, GPIO_PIN_RESET);
+  status = HAL_SPI_Transmit(&hspi3, command, sizeof(command), 10U);
   if ((status == HAL_OK) && (size > 0U))
   {
-    status = HAL_SPI_Transmit(&hspi2, (uint8_t *)data, size, BOOT_FLASH_DATA_TIMEOUT_MS);
+    status = HAL_SPI_Transmit(&hspi3, (uint8_t *)data, size, BOOT_FLASH_DATA_TIMEOUT_MS);
   }
-  HAL_GPIO_WritePin(SPI_FLASH_CS_GPIO_Port, SPI_FLASH_CS_Pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(EXT_SPI_FLASH_CS_GPIO_Port, EXT_SPI_FLASH_CS_Pin, GPIO_PIN_SET);
   if (status != HAL_OK)
   {
     return status;
@@ -324,11 +324,12 @@ HAL_StatusTypeDef Boot_FlashRecoveryJournalProgram(uint32_t address, const uint8
   return Boot_FlashProgramChecked(address, data, size);
 }
 
-// 在同一次片选期间发读命令并接收数据，所有 HAL 错误均交给调用方处理。
+// 按芯片偏移同步读取指定字节，数据阶段发送固定的0xFF占位字节。
 HAL_StatusTypeDef Boot_FlashRead(uint32_t address, uint8_t *data, uint16_t size)
 {
+  // 检查缓冲、长度和地址范围
   if ((data == NULL) || (size == 0U) || (size > BOOT_FLASH_READ_MAX)
-      || (address >= BOOT_FLASH_CAPACITY) || (size > BOOT_FLASH_CAPACITY - address))
+      || (address >= FLASH_CAPACITY_BYTES) || (size > FLASH_CAPACITY_BYTES - address))
   {
     return HAL_ERROR;
   }
@@ -336,14 +337,16 @@ HAL_StatusTypeDef Boot_FlashRead(uint32_t address, uint8_t *data, uint16_t size)
   {
     0x03U, (uint8_t)(address >> 16U), (uint8_t)(address >> 8U), (uint8_t)address
   };
-
-  HAL_GPIO_WritePin(SPI_FLASH_CS_GPIO_Port, SPI_FLASH_CS_Pin, GPIO_PIN_RESET);
-  HAL_StatusTypeDef status = HAL_SPI_Transmit(&hspi2, command, sizeof(command), 10U);
+  // 双线主机的HAL接收会同时发送data原内容，先填固定值再开始事务。
+  memset(data, 0xFF, size);
+  // CS 拉低，发送 0x03 + 三字节地址，发送成功后接收数据，CS 拉高
+  HAL_GPIO_WritePin(EXT_SPI_FLASH_CS_GPIO_Port, EXT_SPI_FLASH_CS_Pin, GPIO_PIN_RESET);
+  HAL_StatusTypeDef status = HAL_SPI_Transmit(&hspi3, command, sizeof(command), 10U);
   if (status == HAL_OK)
   {
-    status = HAL_SPI_Receive(&hspi2, data, size, BOOT_FLASH_DATA_TIMEOUT_MS);
+    status = HAL_SPI_Receive(&hspi3, data, size, BOOT_FLASH_DATA_TIMEOUT_MS);
   }
-  HAL_GPIO_WritePin(SPI_FLASH_CS_GPIO_Port, SPI_FLASH_CS_Pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(EXT_SPI_FLASH_CS_GPIO_Port, EXT_SPI_FLASH_CS_Pin, GPIO_PIN_SET);
   return status;
 }
 
@@ -376,8 +379,8 @@ bool Boot_PackageReadFlash(void *context, size_t offset, uint8_t *data, size_t s
   const Boot_PackageFlashSource *source = context;
   if ((source == NULL) || (data == NULL) || (size == 0U)
       || (size > BOOT_FLASH_READ_MAX)
-      || (source->address >= BOOT_FLASH_CAPACITY)
-      || (source->size > BOOT_FLASH_CAPACITY - source->address)
+      || (source->address >= FLASH_CAPACITY_BYTES)
+      || (source->size > FLASH_CAPACITY_BYTES - source->address)
       || (offset > source->size) || (size > source->size - offset))
   {
     return false;

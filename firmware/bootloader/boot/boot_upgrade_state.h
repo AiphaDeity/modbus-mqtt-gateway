@@ -23,7 +23,7 @@ typedef UpgradeStateRecord Boot_UpgradeState;
 #define BOOT_UPGRADE_RESTORING UPGRADE_STATE_RESTORING
 
 /*
- * 普通上下文同步调用，调用方独占 SPI2；输出失败时清零。
+ * 普通上下文同步调用，调用方独占 SPI3；输出失败时清零。
  * EMPTY 仅表示两个记录及提交页均为空白，IO_ERROR 不能当作空白。
  */
 Boot_UpgradeResult Boot_UpgradeLoad(Boot_UpgradeState *state);

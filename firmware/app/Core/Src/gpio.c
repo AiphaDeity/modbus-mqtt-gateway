@@ -56,6 +56,9 @@ void MX_GPIO_Init(void)
   HAL_GPIO_WritePin(GPIOE, SPI_FLASH_CS_Pin|SPI_IMU_CS_Pin|ETH_NRST_Pin, GPIO_PIN_SET);
 
   /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(EXT_SPI_FLASH_CS_GPIO_Port, EXT_SPI_FLASH_CS_Pin, GPIO_PIN_SET);
+
+  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(RS485_DIR_GPIO_Port, RS485_DIR_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pins : SPI_FLASH_CS_Pin SPI_IMU_CS_Pin ETH_NRST_Pin */
@@ -71,12 +74,12 @@ void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(TF_UPGRADE_KEY_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : RS485_DIR_Pin */
-  GPIO_InitStruct.Pin = RS485_DIR_Pin;
+  /*Configure GPIO pins : EXT_SPI_FLASH_CS_Pin RS485_DIR_Pin */
+  GPIO_InitStruct.Pin = EXT_SPI_FLASH_CS_Pin|RS485_DIR_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(RS485_DIR_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 
   /*Configure GPIO pin : SD_CARD_DET_Pin */
   GPIO_InitStruct.Pin = SD_CARD_DET_Pin;

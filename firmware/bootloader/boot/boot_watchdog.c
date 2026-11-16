@@ -28,16 +28,19 @@ bool Boot_WatchdogEnableCycleCounter(void)
 // 启动 Boot 看门狗并记录初始时基，失败时锁存故障。
 bool Boot_WatchdogStart(void)
 {
+  // 已经锁存失败就返回 false
   if (watchdog_failed)
   {
     return false;
   }
+  // 已经启动就返回 true
   if (watchdog_started)
   {
     return true;
   }
 
 #if defined(DEBUG)
+  // 调试器暂停 CPU 时，冻结 IWDG 计数
   bool ok = Watchdog_Start(true);
 #else
   bool ok = Watchdog_Start(false);
@@ -77,6 +80,7 @@ bool Boot_WatchdogCheck(uint32_t started_ms, uint32_t timeout_ms)
 // 检查期限并在时基前进时刷新看门狗。
 bool Boot_WatchdogProgress(uint32_t started_ms, uint32_t timeout_ms)
 {
+  // 	检查是否超时、是否已经锁存故障
   if (!Boot_WatchdogCheck(started_ms, timeout_ms))
   {
     return false;
@@ -85,7 +89,7 @@ bool Boot_WatchdogProgress(uint32_t started_ms, uint32_t timeout_ms)
   return Boot_WatchdogIdleProgress();
 }
 
-// 在正常空闲等待取得进展后刷新看门狗。
+// 	检查允许后，在时基前进时喂狗
 bool Boot_WatchdogIdleProgress(void)
 {
   if (watchdog_failed)

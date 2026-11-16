@@ -24,7 +24,7 @@
 
 /* ===== 1. 毫秒时间戳 =====
  * MBEDTLS_PLATFORM_MS_TIME_ALT 要求 app 提供 mbedtls_ms_time()。
- * HAL_GetTick() 返回 uwTick（毫秒，FreeRTOS SysTick 递增），单调递增。
+ * HAL_GetTick()返回毫秒tick，由当前HAL时基中断递增。
  */
 mbedtls_ms_time_t mbedtls_ms_time(void)
 {
@@ -35,7 +35,7 @@ mbedtls_ms_time_t mbedtls_ms_time(void)
  * MBEDTLS_PLATFORM_TIME_ALT 要求 app 提供 mbedtls_time 函数指针。
  * 通过 mbedtls_platform_set_time() 注册，在 HttpsTls_Init() 中调用。
  *
- * 返回 Unix 时间戳（秒，2000-01-01 起）。
+ * 返回UTC Unix秒（1970-01-01起）；时间服务未就绪时为0，证书校验不会放行。
  * time 非空时同时写入 *time（与标准 C time() 语义一致）。
  */
 static mbedtls_time_t tls_platform_time(mbedtls_time_t *t)
@@ -69,6 +69,7 @@ void https_tls_register_time(void)
 
 static bool rng_ready = false;
 
+// 首次采集前使能RNG时钟和外设，不重复重新播种硬件。
 static void rng_init_once(void)
 {
     if (rng_ready) return;
@@ -79,20 +80,24 @@ static void rng_init_once(void)
     rng_ready = true;
 }
 
+// 从硬件RNG采集熵；失败返回已取得长度，不使用软件伪随机替代。
 int mbedtls_hardware_poll(void *data,
                            unsigned char *output, size_t len, size_t *olen)
 {
     (void)data;
+    if (olen == NULL || (output == NULL && len != 0U)) return -1;
+    *olen = 0U;
     rng_init_once();
 
     size_t filled = 0;
+    uint32_t started_ms = HAL_GetTick();
     while (filled < len)
     {
-        /* 等待 DRRDY（最多轮询 100 次，约 100µs） */
-        uint32_t timeout = 100;
+        // 全次熵采集最多等待10 ms，错误和超时不提供伪随机回退。
         while (!(RNG->SR & RNG_SR_DRDY))
         {
-            if (--timeout == 0)
+            if ((RNG->SR & (RNG_SR_CECS | RNG_SR_SECS)) != 0U ||
+                (uint32_t)(HAL_GetTick() - started_ms) >= 10U)
             {
                 *olen = filled;
                 return -1;   /* 超时 */

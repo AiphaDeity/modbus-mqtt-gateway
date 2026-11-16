@@ -4,10 +4,13 @@
 #include <stdint.h>
 
 /*
- * W25Q128 (16MiB) 外部 SPI Flash 分区定义。
+ * W25Q64 (8MiB) 外部 SPI Flash 分区定义。
  * 依据系统设计说明书第 7.5 节。
  * 地址为相对偏移（半开区间 [start, end)）。
  */
+
+#define FLASH_CAPACITY_BYTES          (8U * 1024U * 1024U)
+#define FLASH_JEDEC_ID                0xEF4017U
 
 /* === 配置区：A/B/C 三槽，每槽 80KiB === */
 #define FLASH_PART_CONFIG_BASE       0x000000U
@@ -63,6 +66,6 @@
 
 /* === 保留区 === */
 #define FLASH_PART_RESERVED_BASE     0x3C0000U
-#define FLASH_PART_RESERVED_END      0x1000000U  /* 12.25MiB */
+#define FLASH_PART_RESERVED_END      FLASH_CAPACITY_BYTES  /* 4.25MiB */
 
 #endif /* FLASH_PARTITION_H */

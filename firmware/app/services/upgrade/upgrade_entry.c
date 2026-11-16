@@ -362,7 +362,16 @@ UpgradeStageResult UpgradeEntry_Finish(const UpgradeEntryPeer *peer, uint32_t se
     }
     if (result == UPGRADE_STAGE_OK)
     {
-      result = UpgradeStage_Commit(session_id);
+      // 认证可能耗时；提交前复查权限，撤权后由原调用方完成取消结算。
+      if (!Authorized(peer))
+      {
+        (void)UpgradeStage_RequestAbort(session_id);
+        result = UPGRADE_STAGE_MODE;
+      }
+      else
+      {
+        result = UpgradeStage_Commit(session_id);
+      }
     }
   }
   return Release(result);

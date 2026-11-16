@@ -3,13 +3,19 @@
 #include <stdint.h>
 #include "modbus.h"
 #include "mb_pointmap.h"
+#include "app_config.h"
+
+/* Config任务在完整校验后初始化总线及空运行表，再按真实配置逐站LoadSlave。 */
+bool Modbus_LoadConfig(const app_config_t *cfg);
+/* 仅Config启动加载调用；运行快照发布后拒绝修改，不重新分配从站表。 */
+bool Modbus_LoadSlave(const modbus_t *config, const mb_point_t *points);
 
 /* ========= 前向声明 ========= */
 typedef struct mb_slave_runtime mb_slave_runtime_t;
 
 
-#define MB_REG_MAX_PER_SLAVE     32U   // 每一个从站，最多存32个寄存器
-#define MB_SLAVE_HARD_MAX        4U    // 固定4个从站槽位，不在运行期扩容
+#define MB_REG_MAX_PER_SLAVE     CONTROL_VALUES_MAX   // 每一个从站，最多存32个寄存器
+#define MB_SLAVE_HARD_MAX        CONFIG_ACTIVE_SLAVE_MAX // 固定4个从站槽位，不在运行期扩容
 #define MB_WRITE_QUEUE_DEPTH     4U    // 外部写请求队列深度（MQTT下发配置/运行写操作）
 
 /* ============= 日志等级控制（量产时设为 MB_LOG_LEVEL_OFF 关掉所有日志）============= */
@@ -102,6 +108,7 @@ typedef enum
     MB_NOT_SUPPORT_FC_ERR, // 不支持的功能码
     MB_WAIT_TIMEOUT_ERR,  // 同步等待写结果超时
     MB_UPGRADE_BUSY_ERR,  // 试运行、升级暂停或已有事务时拒绝新变更
+    MB_CONTROL_REJECTED_ERR, // 缺少完整控制对象及持久受理信息，禁止直接写总线
 } mb_status_e;
 
 /**
@@ -258,26 +265,10 @@ mb_handle_t* mb_handle_get(void);
  */
 void mb_set_config_change_cb(mb_cfg_change_cb_t cb, void *ctx);
 
-/**
- * @brief 外部注入写请求（FC5 / FC6 / FC15 / FC16）
- *
- *  由 MQTT 任务/配置管理任务调用，请求会投入队列，
- *  poll 任务在 IDLE 状态优先取出，用 ModbusQueryInject 头插发送。
- *
- * @param slave_id       目标从站 (1~247)
- * @param func_code      MB_FC_WRITE_REGISTER(6) / MB_FC_WRITE_MULTIPLE_REGISTERS(16)
- *                       MB_FC_WRITE_COIL(5) / MB_FC_WRITE_MULTIPLE_COILS(15)
- *                       线圈写时 write_values 传 0/1（FC15 内部打包为 bit 字）
- * @param reg_addr       起始寄存器/线圈地址（协议地址，直达从站）
- * @param reg_count      FC5/FC6 强制为 1；FC15/FC16 传写入数量 (≤ MB_REG_MAX_PER_SLAVE)
- * @param write_values   要写入的值数组（直接拷贝，无指针生命周期问题）
- * @param result_sem     保留原调用形态：非NULL选择本函数内同步等待；后台不访问该对象
- * @param result_err_out 仅同步返回时写结果；异步须为NULL，超时返回ERR_UNKNOWN
- * @param result_timeout_ms  同步等待超时（ms），仅当 result_sem != NULL 时生效；
- *                           0使用TIMEOUT_MODBUS+1000 ms，不再无限等待
- * @return MB_STATUS_OK 成功投递；MB_QUEUE_FULL_ERR 队列满；
- *         MB_NOT_SUPPORT_FC_ERR 功能码不支持；MB_WAIT_TIMEOUT_ERR 同步等待超时；
- *         MB_UPGRADE_BUSY_ERR 门控拒绝。同步成功还须检查result_err_out，不能自动重试UNKNOWN。
+/*
+ * 旧参数接口不含command_id、期限或持久受理信息，固定返回MB_CONTROL_REJECTED_ERR。
+ * 不读取write_values、不入队、不发总线；result_err_out非NULL时写ERR_CONTROL_REJECTED。
+ * 保留签名供未适配调用方明确处理拒绝；完整控制入口尚未接通，不能绕过纯校验/持久事务。
  */
 mb_status_e mb_inject_write(uint8_t slave_id,
                             uint8_t func_code,

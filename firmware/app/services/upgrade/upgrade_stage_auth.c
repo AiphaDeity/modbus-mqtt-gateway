@@ -77,6 +77,35 @@ static bool ReadPackage(void *context, size_t offset, uint8_t *data, size_t size
   return auth->io_result == UPGRADE_STAGE_OK;
 }
 
+// 复用分段P-256验签和监督回调；本函数须与包认证串行，不修改持久状态。
+UpgradeStageResult UpgradeStage_AuthenticateNotice(const UpgradeStageBackend *adapter, void *context,
+                                                  const uint8_t *digest, const uint8_t *signature)
+{
+  const uint8_t *public_key = NULL;
+  const uint8_t *aes_key = NULL;
+  UpgradeStageResult result = adapter->keys(context, 1U, 1U, &public_key, &aes_key);
+  if (result != UPGRADE_STAGE_OK)
+  {
+    return result;
+  }
+  if (public_key == NULL || public_key[0] != 0x04U)
+  {
+    return UPGRADE_STAGE_NOT_READY;
+  }
+  uint32_t started_ms = HAL_GetTick();
+  AuthContext auth = {0};
+  UpgradePackagePlatform platform = {&auth, NowMs, Checkpoint, NULL};
+  UpgradePackageOperation operation = {&platform, started_ms,
+    UPGRADE_PACKAGE_SIGNATURE_TIMEOUT_MS, UPGRADE_PACKAGE_ERROR_NONE};
+  if (UpgradePackage_VerifyDigestResult(&operation, digest, signature, public_key) == 0)
+  {
+    return UPGRADE_STAGE_OK;
+  }
+  if (auth.io_result != UPGRADE_STAGE_OK) return auth.io_result;
+  if (operation.error == UPGRADE_PACKAGE_ERROR_TIMEOUT) return UPGRADE_STAGE_TIMEOUT;
+  return operation.error == UPGRADE_PACKAGE_ERROR_INTERNAL ? UPGRADE_STAGE_INTERNAL : UPGRADE_STAGE_AUTH;
+}
+
 // 解析密钥编号并调用公共认证，映射首个失败原因。
 UpgradeStageResult UpgradeStage_Authenticate(const UpgradeStageBackend *backend, void *context,
                                             uint32_t session_id, uint32_t total_size,

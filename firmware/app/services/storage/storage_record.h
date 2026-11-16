@@ -14,12 +14,12 @@
  *   - M3 内部只用 (kind, seq) 定位；record_id 字符串由 M2 补传时拼装
  *
  * 壳格式（M3 内部实现，M2 无感；语义与 M2 约定一致）：
- *   - 段文件 /records/seg_0000.bin ~ seg_0047.bin，576B 定长槽
+ *   - 段文件 /records/seg_0000.bin ~ seg_0047.bin，832B 定长槽
  *   - 定长槽 + CRC32 + 提交尾标：掉电最多留半成品（无尾标），扫槽时跳过
  *   - 环状态（cur_seg/next_slot/ack水位/dropped）持久化在 W25Q128 双副本，
  *     上电免全盘扫描（原实现开机要读 192MiB，不可接受）
  *
- * 记录槽（576B，小端）：
+ * 记录槽（832B，小端）：
  *   偏移 0    magic(4)  = 'FRMT'
  *   偏移 4    format_version(2)
  *   偏移 6    kind(2)              1=telemetry 2=event
@@ -30,11 +30,11 @@
  *   偏移 28   reserved(4)
  *   偏移 32   payload(payload_len) JSON 原文 UTF-8，最大 768B
  *   偏移 32+len  crc32(4)          覆盖 [0, 32+len)
- *   偏移 572  commit(4) = 'RCDT'   最后写入
+ *   偏移 828  commit(4) = 'RCDT'   最后写入
  */
 
 #define RECORD_FORMAT_VERSION    3U  /* v3: PAYLOAD_MAX 512→768（16点完整报文） */
-#define RECORD_SLOT_SIZE         832U  /* 32B 头 + 768B payload + 4B CRC + 4B commit + 22B 对齐余量 */
+#define RECORD_SLOT_SIZE         832U  /* 32B头 + 768B正文 + 4B CRC + 4B提交尾标 + 24B余量 */
 #define RECORD_PAYLOAD_MAX       768U
 #define RECORD_SEGMENT_SIZE      (4U * 1024U * 1024U)  /* 4 MiB */
 #define RECORD_SEGMENT_SLOTS     (RECORD_SEGMENT_SIZE / RECORD_SLOT_SIZE)
@@ -77,14 +77,14 @@ HAL_StatusTypeDef storage_record_sync(void);
 
 /*
  * 追加一条记录。seq 由调用方（M2 经 storage_seq_alloc）分配并保证单调；
- * captured_at_ms 未校时传 0；payload 为 JSON 原文，≤512B。
+ * captured_at_ms 未校时传 0；payload 为 JSON 原文，≤RECORD_PAYLOAD_MAX。
  * 段写满自动切下一段并回收最旧段（未 ack 的计入 dropped）。
  */
 HAL_StatusTypeDef storage_record_append(uint8_t kind, uint64_t seq,
                                         uint64_t captured_at_ms,
                                         const void *payload, uint16_t len);
 
-/* ack 水位推进：seq ≤ ack_upto_seq 的记录视为已上传，补传时跳过；节流持久化 */
+// 调用方须逐条核验待发前缀均已业务确认；不能凭乱序回执的最大seq推进。节流持久化。
 void storage_record_ack_upto(uint64_t ack_upto_seq);
 
 /*

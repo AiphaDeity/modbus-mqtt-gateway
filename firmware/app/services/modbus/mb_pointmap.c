@@ -4,7 +4,7 @@
  *
  *  核心换算：physical = raw * scale + offset
  *
- *  多字节寄存器拼接严格大端序：高寄存器在前（reg[i]<<16 | reg[i+1]）
+ *  寄存器报文字节保持原值；解释时按点位选择AB/BA或ABCD/BADC/CDAB/DCBA。
  *  float32 通过 memcpy 走，规避严格别名规则。
  *
  *  本文件依赖 mb_api.h（访问 slave_list / 锁 / cfg_change_cb）。
@@ -13,6 +13,7 @@
 #include "mb_pointmap.h"
 #include "mb_internal.h"
 #include <string.h>
+#include <math.h>
 
 /* ========= 全局上报模式 ========= */
 static mb_report_mode_t s_report_mode = MB_REPORT_PARSED;
@@ -26,11 +27,12 @@ static mb_report_mode_t s_report_mode = MB_REPORT_PARSED;
  * @param idx      点位 reg_index（reg 内起始下标）
  * @param type     数据类型
  * @param bit_idx  位号 0~15（仅 MB_DT_BIT 使用）
- * @return 换算前的原始值（int64_t 中间态，大类型能装下）
+ * @param byte_order 字节解释顺序：0/1用于16位，0～3用于32位
+ * @return 换算前的原始值
  */
 static double mb_pointmap_raw_value(const uint16_t *reg, uint16_t reg_len,
                                     uint16_t idx, mb_data_type_t type,
-                                    uint8_t bit_idx)
+                                    uint8_t bit_idx, uint8_t byte_order)
 {
     uint8_t need = mb_dt_reg_count[type];
     if (idx + need > reg_len)
@@ -38,13 +40,22 @@ static double mb_pointmap_raw_value(const uint16_t *reg, uint16_t reg_len,
         return 0.0;  // 越界，返回 0
     }
 
+    uint16_t high = reg[idx];
+    uint16_t low = need == 2U ? reg[idx + 1U] : 0U;
+    if ((byte_order & 1U) != 0U)
+    {
+        high = (uint16_t)((high << 8U) | (high >> 8U));
+        low = (uint16_t)((low << 8U) | (low >> 8U));
+    }
+    uint32_t raw32 = (byte_order & 2U) == 0U ? ((uint32_t)high << 16U) | low :
+                                             ((uint32_t)low << 16U) | high;
     switch (type)
     {
         case MB_DT_UINT16:
-            return (double)reg[idx];
+            return (double)high;
 
         case MB_DT_INT16:
-            return (double)(int16_t)reg[idx];
+            return (double)(int16_t)high;
 
         case MB_DT_BIT:
             // 位提取：FC01/02 线圈打包字，或寄存器里的状态位
@@ -53,14 +64,13 @@ static double mb_pointmap_raw_value(const uint16_t *reg, uint16_t reg_len,
             return (double)((reg[idx] >> bit_idx) & 0x01);
 
         case MB_DT_UINT32:
-            return (double)(((uint32_t)reg[idx] << 16) | reg[idx + 1]);
+            return (double)raw32;
 
         case MB_DT_INT32:
-            return (double)(int32_t)(((uint32_t)reg[idx] << 16) | reg[idx + 1]);
+            return (double)(int32_t)raw32;
 
         case MB_DT_FLOAT32:
         {
-            uint32_t raw32 = ((uint32_t)reg[idx] << 16) | reg[idx + 1];
             float f;
             memcpy(&f, &raw32, sizeof(f));   // 规避严格别名
             return (double)f;
@@ -185,15 +195,16 @@ int mb_pointmap_parse_slave(uint8_t slave_id, mb_parsed_point_t *out)
     {
         const mb_point_t *pt = &s->points[i];
         if (!pt->valid) continue;
-        if (pt->data_type >= MB_DT_MAX) continue;
+        if ((uint32_t)pt->data_type >= MB_DT_MAX ||
+            (uint32_t)pt->reg_index + mb_dt_reg_count[pt->data_type] > reg_len) continue;
 
         double raw = mb_pointmap_raw_value(reg, reg_len, pt->reg_index,
-                                           pt->data_type, pt->bit_index);
+                                           pt->data_type, pt->bit_index, pt->byte_order);
         float physical = (float)(raw * (double)pt->scale + (double)pt->offset);
 
         out[parsed_cnt].value     = physical;
         out[parsed_cnt].raw_type  = pt->data_type;
-        out[parsed_cnt].valid     = 1;
+        out[parsed_cnt].valid     = isfinite(physical) ? 1U : 0U;
         memcpy(out[parsed_cnt].name, pt->name, MB_POINT_NAME_MAX);
         memcpy(out[parsed_cnt].unit, pt->unit, MB_POINT_UNIT_MAX);
 

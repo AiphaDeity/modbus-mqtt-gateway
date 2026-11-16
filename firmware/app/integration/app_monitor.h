@@ -34,7 +34,7 @@ bool Monitor_BeginWait(AppModuleId module, uint32_t timeout_ms);
 void Monitor_ReportFatal(AppModuleId module);
 
 /*
- * 升级任务在实际I/O/运算进展后报告，阻塞前声明等待；其他调用任务直接返回true。
+ * TF/网络升级任务在实际I/O/运算进展后报告，阻塞前声明等待；其他任务返回true。
  * 等待使用现有操作剩余期限，另留1000 ms返回处理裕量，不延长操作本身期限。
  */
 bool Monitor_UpgradeProgress(void);

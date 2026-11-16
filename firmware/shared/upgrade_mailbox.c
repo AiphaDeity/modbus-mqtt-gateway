@@ -23,7 +23,7 @@ static uint32_t MessageCrc(const uint32_t *words)
   return ~crc;
 }
 
-// 读取并校验邮箱快照，成功后解码启动消息。
+// 复制邮箱快照，检查有效标记、版本、消息种类、身份字段和 CRC，通过后解码
 bool UpgradeMailbox_Read(const volatile uint32_t *buffer, UpgradeMessage *message)
 {
   if (message == NULL)
