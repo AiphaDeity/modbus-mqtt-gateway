@@ -1310,10 +1310,30 @@ function showResult(type, text) {
 function handleCmdAck(msg) {
   const elapsed = pendingCmdTime ? ((Date.now() - pendingCmdTime) / 1000).toFixed(1) + 's' : '';
   const parsed = msg.parsed;
-  if (parsed && parsed.status === 'ok') {
-    showResult('ok', '✓ 板子回执: 执行成功 ' + elapsed + '  ' + msg.payload);
-  } else if (parsed && parsed.status === 'err') {
-    showResult('err', '✗ 板子回执: 执行失败 ' + elapsed + '  err=' + (parsed.err || '?') + '  ' + msg.payload);
+  if (!parsed) {
+    showResult('ok', '板子回执: ' + msg.payload);
+    pendingCmdTime = null;
+    return;
+  }
+  // 根据 type 字段判断命令类型
+  const typeLabel = parsed.type === 'config' ? '配置变更'
+                  : (parsed.type === 'ota' ? 'OTA升级' : '写寄存器');
+  // 错误码中文翻译
+  const errMap = {
+    '-1': 'JSON解析失败',
+    '-2': '升级静默期拒绝',
+    '-3': '部分从站应用失败',
+    'bad_cmd': '命令参数错误'
+  };
+  if (parsed.status === 'ok') {
+    showResult('ok', '✓ ' + typeLabel + '成功 ' + elapsed + '  ' + msg.payload);
+  } else if (parsed.status === 'accepted') {
+    showResult('ok', '✓ ' + typeLabel + '已受理 ' + elapsed + '  ' + msg.payload);
+  } else if (parsed.status === 'busy') {
+    showResult('err', '✗ ' + typeLabel + '被拒绝(设备忙/升级静默期) ' + elapsed + '  ' + msg.payload);
+  } else if (parsed.status === 'err') {
+    const errDesc = errMap[String(parsed.err)] || parsed.err || '?';
+    showResult('err', '✗ ' + typeLabel + '失败 ' + elapsed + '  错误: ' + errDesc + '  ' + msg.payload);
   } else {
     showResult('ok', '板子回执: ' + msg.payload);
   }
