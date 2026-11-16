@@ -13,9 +13,10 @@
 #include "telemetry_task.h"
 #include "mb_api.h"
 #include "upgrade_tf.h"
+#include "config_task.h"
 
 #define STORAGE_STACK_SIZE_BYTES (6U * 1024U)  /* FatFs + storage_record，M3 说 8K 实测后可降 6K */
-#define CONFIG_STACK_SIZE_BYTES  (512U)         /* M1 config 还没实现，占位 */
+#define CONFIG_STACK_SIZE_BYTES  (2048U)        /* Config模块：FatFS文件读取 + JSON解析 + mb_apply_slave_config，2K栈 */
 #define MODBUS_STACK_SIZE_BYTES  (2U * 1024U)
 #define MQTT_STACK_SIZE_BYTES    (6U * 1024U)   /* netconn + snprintf 调用链深，4K 实测溢出 */
 #define TELEMETRY_STACK_SIZE_BYTES (2560U)       /* snprintf + printf 栈开销大，2.5K */
@@ -143,7 +144,7 @@ static AppModuleSlot module_slots[APP_MODULE_COUNT] =
   },
   [APP_MODULE_CONFIG] =
   {
-    .init = NULL, .task = NULL, .attributes = &config_attributes,
+    .init = Config_Init, .task = Config_Task, .attributes = &config_attributes,
     .result = APP_MODULE_INIT_NOT_READY, .task_state = APP_MODULE_TASK_NOT_STARTED
   },
   [APP_MODULE_MODBUS] =
