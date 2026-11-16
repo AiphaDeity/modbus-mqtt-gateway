@@ -50,8 +50,8 @@
 #include "hmac_sha256.h"     /* 百度云签名 SHA256 */
 #if GATEWAY_ENABLE_M2
 #include "network_upgrade.h" /* NetworkUpgrade_Notify() OTA 升级通知分流 */
-#include "config_task.h"     /* Config_HandleMessage() 配置变更命令分流 */
 #endif
+#include "config_task.h"     /* Config_HandleMessage() 配置变更命令分流（不依赖M2，独立编译） */
 
 /* ===== 上云模式选择 =====
  *   MQTT_USE_BAIDU=1：连百度云 IoT Core（域名 broker + SHA256 签名 + 自定义 topic）
@@ -790,6 +790,7 @@ static void mqtt_handle_command(const uint8_t *body, uint32_t body_len, uint8_t 
         MqttClient_Publish(g_topic_cmd_ack, (const uint8_t *)ack, (size_t)alen);  // 发回执到cmd_ack主题
         return;  // OTA处理完返回
     }
+#endif  // OTA分流到此结束（配置变更分支不依赖M2，独立编译）
 
     /* ★配置变更分流：JSON 含 "slaves" → 新增/删除/修改从站，转给 Config 模块。
      * 配置变更和普通命令复用 commands topic，靠 JSON 字段区分：
@@ -816,7 +817,6 @@ static void mqtt_handle_command(const uint8_t *body, uint32_t body_len, uint8_t 
         MqttClient_Publish(g_topic_cmd_ack, (const uint8_t *)ack, (size_t)alen);  // 发回执到cmd_ack主题
         return;  // 配置处理完返回
     }
-#endif  // 条件编译结束
 
     if (g_pause_requested || !UpgradeQuiesce_AllowsMutation())  // 暂停请求或升级静默期
     {
