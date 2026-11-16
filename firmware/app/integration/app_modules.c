@@ -18,7 +18,7 @@
 #endif
 
 #define STORAGE_STACK_SIZE_BYTES (6U * 1024U)  /* FatFs + storage_record，M3 说 8K 实测后可降 6K */
-#define CONFIG_STACK_SIZE_BYTES  (1536U)        /* Config值拷贝RPC和有界JSON解析，仍使用原静态任务 */
+#define CONFIG_STACK_SIZE_BYTES  (2U * 1024U) // 为从站和点位嵌套解析及存储RPC保留栈余量。
 #define MODBUS_STACK_SIZE_BYTES  (2U * 1024U)
 #define MQTT_STACK_SIZE_BYTES    (6U * 1024U)   /* netconn + snprintf 调用链深，4K 实测溢出 */
 #define TELEMETRY_STACK_SIZE_BYTES (2560U)       /* snprintf + printf 栈开销大，2.5K */
@@ -42,17 +42,17 @@ typedef struct
 } AppModuleSlot;
 
 /*
- * 存储栈使用普通 SRAM，确保栈上的 FIL/缓冲可供 DMA 访问；监督栈也使用普通 SRAM。
- * 标记 CCMRAM 的其他栈不可供 DMA 访问，其调用链不得把栈缓冲直接交给 DMA。
+ * 存储任务在挂载前将FatFs读写绑定到同步SDIO，SPI/I2C也使用轮询；升级任务经值拷贝RPC访问存储。
+ * 这些栈可放入CCMRAM，保留原栈容量；调用链不得把栈缓冲直接交给DMA。监督栈仍在普通SRAM。
  * 所有栈按 Cortex-M4 FreeRTOS 端口要求对齐到 8 B。
  */
-_Alignas(8) static StackType_t storage_stack[STORAGE_STACK_SIZE_BYTES / sizeof(StackType_t)];
+_Alignas(8) static StackType_t storage_stack[STORAGE_STACK_SIZE_BYTES / sizeof(StackType_t)]  __attribute__((section(".bss.ccmram")));
 _Alignas(8) static StackType_t config_stack[CONFIG_STACK_SIZE_BYTES / sizeof(StackType_t)]  __attribute__((section(".bss.ccmram")));
 _Alignas(8) static StackType_t modbus_stack[MODBUS_STACK_SIZE_BYTES / sizeof(StackType_t)]  __attribute__((section(".bss.ccmram")));
 _Alignas(8) static StackType_t mqtt_stack[MQTT_STACK_SIZE_BYTES / sizeof(StackType_t)]  __attribute__((section(".bss.ccmram")));
 _Alignas(8) static StackType_t telemetry_stack[TELEMETRY_STACK_SIZE_BYTES / sizeof(StackType_t)]  __attribute__((section(".bss.ccmram")));
 _Alignas(8) static StackType_t monitor_stack[MONITOR_STACK_SIZE_BYTES / sizeof(StackType_t)];
-_Alignas(8) static StackType_t upgrade_stack[UPGRADE_STACK_SIZE_BYTES / sizeof(StackType_t)];
+_Alignas(8) static StackType_t upgrade_stack[UPGRADE_STACK_SIZE_BYTES / sizeof(StackType_t)]  __attribute__((section(".bss.ccmram")));
 #if GATEWAY_ENABLE_M2
 _Alignas(8) static StackType_t network_upgrade_stack[NETWORK_UPGRADE_TASK_STACK_BYTES / sizeof(StackType_t)]
   __attribute__((section(".bss.ccmram")));

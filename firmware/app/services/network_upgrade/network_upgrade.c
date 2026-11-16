@@ -530,8 +530,9 @@ void NetworkUpgrade_Task(void *argument)
 {
     (void)argument;
 
+    // TLS密钥交换实测连续计算约5.6s，预留15s进展期限；下载总期限仍由下载器约束。
     if (!s_initialized ||
-        !Monitor_RegisterHealth(APP_MODULE_NETWORK_UPGRADE, 3000U,
+        !Monitor_RegisterHealth(APP_MODULE_NETWORK_UPGRADE, 15000U,
                                 UPGRADE_STAGE_PREPARE_TIMEOUT_MS + 1000U))
     {
         Monitor_ReportFatal(APP_MODULE_NETWORK_UPGRADE);

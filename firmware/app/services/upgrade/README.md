@@ -25,7 +25,7 @@ TF 维护由 PA0 长按至少 3 s、稳定松开触发。根目录仅有 /config
 | upgrade_quiesce.c/.h | 全局变更门控、模块暂停/结算/同步、失败逆序恢复 |
 | integration/app_upgrade、app_monitor | Boot交接、健康确认及任务进展/有限等待/栈余量监督 |
 
-Boot保留独立Flash驱动和保存入口；普通构建也具备实际安装及串口恢复路径。boot_package_receive不再包含测试密钥头文件，调用方传可信映射。测试根只由BOOT_PACKAGE_RECEIVE_TEST显式绑定，正式映射与该开关禁止同时选择。
+Boot保留独立Flash驱动和保存入口；普通构建具备实际安装及串口恢复路径。boot_recovery_receive由调用方传入可信映射，不从测试密钥头文件取得信任资料。
 
 ## 统一持久版本2
 
@@ -314,7 +314,7 @@ Storage_Task须有界唤醒/连续服务并保留控制/采样公平性，不能
 
 ## 信任资料、工具与启用
 
-普通F407 Boot/App由根CMake自动接入shared/upgrade_trust_flash.c，覆盖默认拒绝映射的弱实现；GATEWAY_UPGRADE_TRUST_SOURCE非空时使用指定的其他保护区实现。BOOT_PACKAGE_RECEIVE_TEST只使用显式测试根，不编入Boot预留区实现，也不能同时指定保护区实现。两边取得运行期间不变的65 B SEC1公钥和32 B AES只读指针，当前批准密钥编号均为1；没有有效记录时Initialize返回false，升级保持NOT_READY。
+F407 Boot/App由根CMake自动接入shared/upgrade_trust_flash.c，覆盖默认拒绝映射的弱实现；GATEWAY_UPGRADE_TRUST_SOURCE非空时使用指定的其他保护区实现。两边取得运行期间不变的65 B SEC1公钥和32 B AES只读指针，当前批准密钥编号均为1；没有有效记录时Initialize返回false，升级保持NOT_READY。
 
 Boot的64 KiB分区末尾[0x0800FF80,0x08010000)独立保留128 B信任记录，链接器将Boot代码/常量/初值限制在前65408 B。App仍从0x08010000开始，容量448 KiB；普通升级安装器只擦写App区域。记录单独置备，不编入通用ELF/bin。空白、格式、CRC、公钥或AES校验失败均拒绝，不从待验包、TF或配置文件取得替代密钥。
 

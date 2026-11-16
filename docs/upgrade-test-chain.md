@@ -1,6 +1,58 @@
 # 升级测试链路与验证记录
 
-截至 2026-11-15，当前 SPI3、W25Q64 和冻结 V121/V122 基线的升级验证可归并为 **13 组：11 组实板验证、2 组电脑端验证**。串口恢复、TF 正常升级、已测错误输入、失败回退及四个关键阶段的断电恢复已有通过记录；网络升级闭环仍待验证。
+## 2026-11-16 补充：V133 单模拟从站自动复位修复
+
+V132 在已导入一个从站配置后自行复位。首次监督失败现场为 Config 任务历史最低栈余量 244 B，低于 256 B 门槛；进展未超时、没有 fatal。随后在 Boot 清除复位标志前捕获 IWDG 复位，确认直接原因是栈余量不足导致监督停止喂狗，未发现实际栈越界证据。
+
+V133 仅将原 CCM 中的 Config 栈从 1536 B 增至 2048 B，保留监督门槛和其他任务容量。相比冻结 V132，普通 SRAM 各段地址和大小不变；CCM 占用增加 512 B 至 64296 B，剩余 1240 B。片内 App 为 458048 B，剩余 704 B。
+
+旧版自行复位中断了 TF 导入，因此本轮通过 USART2 正式恢复协议安装 V133；先查询受保护 B 槽，仅写 A 槽，收包认证通过后由 Boot 安装。V133 健康确认复位后，INFO 显示正常模式、无恢复会话、A 槽受保护，正式 RUN 应答成功。片内完整镜像与冻结 V133 一致，SHA-256 为 `730b871ffce20d21990c028b0b61260f308bbc762a4e405f5ca271c1f8f9b51d`。
+
+复测负载为电脑模拟 RTU 从站 1、115200/8N1、FC03、地址 0 的一个寄存器，值 1234，采集周期 1000 ms、上报周期 5000 ms。13 次只读快照覆盖连续 120043 ms MCU 运行时间：Config 栈最低余 756 B，RTOS 堆最低余 5632 B，C 堆 arena 峰值 3136 B；监督健康、无 fatal、无故障寄存器置位或再次复位。TF 恢复 result=0/ready=1，MQTT 在线，日志持续读取 1234。遥测 queued 仅证明入队，未据此认定云端落库。
+
+证据位于本机 `.local/tests/work/network-build-20261116/`：`v132-one-slave-first-failure.json`、`v133-build-check.json`、`v133-recovery-install.json`、`v133-one-slave-health.json`、`v133-recovery-uart1.log`、`v133-debug-close.json`。以上是原升级分组之外的单从站修复复测，不增加下文 15 组升级统计，不代表满容量或长期稳定性验收。实板使用本机 MQTT 凭据；仓库仅保留凭据占位符。
+
+提交前基于 Gitee 主线 `467f9a3` 集成队友新增的 MQTT 从站配置入口和回执显示。首次链接 App 超出 Flash 11248 B；对 `config.c`、`mini_json.c`、`mqtt_client.c` 单独启用 `-Os` 后，AppDebug 构建通过，Flash 占用 458320 B、余 432 B，普通 SRAM 链接占用 108648 B（较冻结 V133 增 8 B），CCM 占用仍为 64296 B。BootSizeCheck 构建通过，Boot 镜像仍为 54868 B。此合并构建包含新主线功能和编译优化，与上述已实测的冻结 V133 不同；未烧录该合并构建，新增云端配置路径的动态内存峰值和运行行为仍待实板验证。
+
+## 2026-11-16 补充：V131→V132 网络正常升级通过
+
+实际链路为：签名 MQTT 通知 → 百度 BOS HTTPS 下载 → 外部 Flash 候选 B 槽 → 整包认证 → 业务暂停与结算 → READY → Boot 安装 → V132 试运行 → 健康确认复位 → Boot 持久确认 → MQTT 上报 confirmed 并收到 PUBACK。
+
+- V132 加密包 458256 B，整包 SHA-256 为 `2158d6f3a80859f88414e81bd0db98a52ec2c64636c5bd0e02b32f26af5027e0`；BOS 回下载与本地一致。
+- 板端 TLS 保持证书校验，实际协商 `TLS-ECDHE-RSA-WITH-AES-128-GCM-SHA256`，完整下载 458256 B；没有关闭认证或扩大本轮缓冲。
+- Boot 安装后两次实际启动 V132；最终为 NORMAL、非试运行、sequence=25、tx=34、attempt=1。片内 458048 B 完整读回与冻结 V132 一致，镜像 SHA-256 为 `007b1360c24776e25408df3f544a4e3c3f5399519270a574afaf41f3d0beb09c`。
+- `boot result PUBACK: tx=0000000000000022 phase=confirmed` 与板端事务一致。此证据到 broker 确认接收为止，不代表另一个云端业务系统已处理完成。
+- 升级后 TF 恢复 `result=0 / ready=1`，配置已加载，MQTT 在线，无监督 fatal。此前同一内存布局的 V129→V131 已通过真实 PA0/TF 导入、认证、安装及健康确认。
+
+| 本轮资源 | 实测或冻结布局 | 余量 / 口径 |
+| --- | --- | --- |
+| C 堆 | 升级峰值 17.92 KiB / 容量 22.34 KiB | 峰值下余 4.43 KiB；按分配器 arena 高水位统计 |
+| FreeRTOS 堆 | 最低空闲 5.31 KiB | 总容量 24 KiB，已计入普通 SRAM 静态区 |
+| 网络升级任务栈 | 最低空闲 2.26 KiB | 原 6 KiB 容量未增 |
+| 普通 SRAM | mailbox 64 B + 静态 104.59 KiB + C 堆 22.34 KiB + MSP 1 KiB | 合计 128 KiB，静态区包含 FreeRTOS 堆 |
+| CCM | 链接占用 62.29 KiB / 64 KiB | 余 1.71 KiB；DMA 缓冲仍在普通 SRAM |
+
+本轮首次下载曾在 82296 B 返回接收超时，连接和候选会话正常清理，V131 保留运行。普通复位后用同一固件、同一包及同一通知定向复测完成上述闭环；没有命中接收失败断点，采样未见 RX 池分配失败。**首次接收停顿根因尚未定位，不能把重试成功写成已修复所有网络稳定性问题。** 之前 TLS 计算阶段超过 3 s 的监督问题已据现场将网络任务无进展期限改为 15 s，下载总期限和证书检查保持。
+
+按原有分组，N02 完整 HTTPS 下载、N03 网络正常升级与 broker 回执已有实板通过证据；N01 已验证合法通知及错误目标、过期、坏签名拒绝，完整撤权等边界未全部覆盖。原 13 组加 N02/N03 共 **15 组已有对应通过记录**，旧组仍限原版本及原负载。N01 剩余边界、N04 异常矩阵、真实从站并发及长期测试不计已完成。用户明确本轮正常闭环通过即停止，不继续追加这些测试。TF 配置正常导入、保存、重启生效已有本轮记录，完整非法字段及互斥矩阵仍未覆盖。
+
+14:35～14:44 按用户新要求再次完整复测：先以原 TF 包恢复 V131（tx=35），再使用相同 V132 包和仍有效的原通知。第一次下发在授权阶段被拒绝，未进入收包、未擦写候选槽；具体失败原因未捕获。一次针对授权返回码的复测中，返回 OK，UTC=1794811198 落在签名有效期内，随即移除断点并继续正常下载/认证/安装。最终 V132 为 NORMAL、sequence=33、tx=36、attempt=1、trial=false；片内完整读回一致，TF ready=1，MQTT 收到该事务的 confirmed PUBACK。C 堆峰值仍 18348 B，RTOS 最低空闲 5440 B，网络栈最低余 2316 B，没有生产源码改动。
+
+本次追加结果是**再次完成一轮闭环，但发生过一次尚未定位的授权拒绝**，不能描述为连续两次无故障通过；前一轮的接收超时也仍保留。追加证据为同目录的 `network-full-v132-result-repeat-normal.json`（授权失败）、`v131-repeat-authorize-capture.json`、`network-full-v132-result-repeat-auth-capture.json`（闭环通过）、`v132-repeat-final-state.json` 和 `v132-repeat-uart1.log`。重复执行不新增统计组数；结束时板子运行已确认的 V132，串口与调试器已释放。
+
+14:54～15:14 第三轮按用户要求复测：原 TF 包恢复 V131 后，已确认 NORMAL、sequence=37、tx=37、trial=false，完整镜像匹配。旧通知临近失效，用户仅重签 V132 通知，没有重制包或修改 BOS 文件。14:59:59 首次下发命中通知授权失败分支，实际 `authorized=8（AUTH）`、`utc=0`，候选会话仍为空、未进入 Begin；不是已捕获的 `E_MODE` 或 TRIAL 拒绝。证据：`v131-third-baseline-state.json`、`v131-third-auth-capture.json`、`network-full-v132-result-third-failure-capture.json`。
+
+针对时间读取的复测先观察正常周期检查 55 s，未见失败；随后复用同一有效通知，15:10:12 在 Storage 任务的 RTC 状态读取失败分支捕获 `HAL_ERROR`、`HAL_I2C_ERROR_AF=0x04`（应答失败），I2C 互斥已取得，控制寄存器的一个字节尚未读完。该现场证明 RTC/I2C 链存在偶发读取失败；它与前一次授权 UTC=0 不是同一次调用，尚不能唯一确定底层电气原因或把全部历史授权失败归为同一原因。证据：`v131-rtc-failure-capture.json`、`v131-rtc-notification-capture.json`。
+
+这次定向复测随后完整下载、认证并安装 V132，健康确认后再次启动，上报 `tx=0000000000000026 phase=confirmed` 并收到 PUBACK。最终 NORMAL、sequence=41、tx=38、attempt=1、trial=false，片内完整读回匹配，TF ready=1、配置加载、MQTT 在线，无 fatal。C 堆峰值 18348 B、RTOS 最低余 5440 B、网络升级栈最低余 2316 B。证据：`network-full-v132-result-third-rtc-capture.json`、`v132-third-final-state.json`、`v132-third-uart1.log`。没有新增生产代码或 SRAM 占用；断点已撤除、板子继续运行、串口与调试器已释放。正常闭环再次通过，RTC 偶发读取失败和先前接收超时仍保留为未解决项，不追加其他测试组。
+
+关于拒绝阶段的区分：TRIAL 期间 `App_UpgradeCanCommit()` 确实禁止 Begin，但不能据此推断本次 AUTH 的根因。当前网络任务在 Begin 前先做通知有效期与签名校验，下载后 Finish 再认证升级包。确认由 App 健康判定、确认邮箱、复位及 Boot 持久确认完成，云端接收结果；不是云端把本地 trial 标志改为 false。连续升级工具应等待已确认基线，本轮工具已有 NORMAL 和镜像校验，上述基线证据也明确 trial=false。
+
+证据位于本机 `.local/tests/work/network-build-20261116/`：`pair-131/packages.json`、`v132-bos-check.json`、`v131-tf-result.json`、`network-full-v132-result.json`（首次失败）、`network-full-v132-result-recv-capture.json`（正常闭环通过）、`v131-recv-capture.json`、`v132-final-state.json`、`v129-network-uart1.log`，以及各次追加记录。无真实 Modbus 从站；不据此宣称满负载、长期运行或整机验收通过。
+
+**以下第 1～7 节保留 2026-11-15 的历史分组与测试过程；其中“当前”“剩余”的日期基准为 11 月 15 日，最新状态以上述补充为准。**
+
+截至 2026-11-15，SPI3、W25Q64 和冻结 V121/V122 基线的升级验证归并为 **13 组：11 组实板验证、2 组电脑端验证**。串口恢复、TF 正常升级、已测错误输入、失败回退及四个关键阶段的断电恢复已有通过记录；当时网络升级闭环待验证。
 
 本文供项目成员复盘和继续测试，说明每组测试怎样执行、依据什么判定、还缺什么。接线和资源详见[硬件与运行资源](hardware-resources.md)，接口、持久格式及恢复命令详见[升级说明](../firmware/app/services/upgrade/README.md)。
 
