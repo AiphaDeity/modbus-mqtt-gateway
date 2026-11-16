@@ -34,6 +34,7 @@ _Static_assert(sizeof(timefloor_record_t) == 12, "timefloor_record_t must be 12 
 static const uint32_t s_copy_addr[2] = { FLASH_TIME_FLOOR_A_ADDR, FLASH_TIME_FLOOR_B_ADDR };
 
 static bool s_read_error;
+static bool s_initialized;
 static bool s_copy_blank[2];
 
 
@@ -84,6 +85,9 @@ static HAL_StatusTypeDef copy_write(int idx, uint32_t floor)
 
 HAL_StatusTypeDef storage_timefloor_init(void)
 {
+    s_initialized = false;
+    s_floor = 0U;
+    s_newer = -1;
     s_read_error = false;
     s_copy_blank[0] = s_copy_blank[1] = false;
     timefloor_record_t rec_a = {0}, rec_b = {0};
@@ -115,6 +119,7 @@ HAL_StatusTypeDef storage_timefloor_init(void)
         const timefloor_record_t *rec = (s_newer == 0) ? &rec_a : &rec_b;
         s_floor = rec->time_floor;
     }
+    s_initialized = true;
     return HAL_OK;
 }
 
@@ -125,7 +130,9 @@ uint32_t storage_timefloor_get(void)
 
 static HAL_StatusTypeDef storage_timefloor_update_impl(uint32_t now)
 {
+    if (!s_initialized) return HAL_ERROR;
     if (now == 0) return HAL_OK;
+    if (now < TIMEFLOOR_MIN_VALID_UNIX) return HAL_ERROR;
 
     /* 时间倒退：不降低下界，直接忽略 */
     if (now < s_floor) return HAL_OK;
@@ -153,6 +160,7 @@ static HAL_StatusTypeDef storage_timefloor_update_impl(uint32_t now)
 
 bool storage_timefloor_trusted(uint32_t now)
 {
+    if (!s_initialized) return false;
     if (s_floor == 0) return true;   /* 无参考值（全新设备），不能据此否定 */
     return now >= s_floor;
 }

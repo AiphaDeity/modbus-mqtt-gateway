@@ -16,8 +16,8 @@ typedef struct
 } Boot_PackageFlashSource;
 
 /*
- * SPI2 普通上下文同步读取 W25Q128，单次 1～256 字节，调用前完成 GPIO/SPI 初始化。
- * 调用方独占 SPI2，其他从设备片选须保持高。命令限时 10ms，数据限时 50ms。
+ * SPI3 普通上下文同步读取 W25Q64，单次 1～256 字节，调用前完成 GPIO/SPI 初始化。
+ * 调用方独占 SPI3，其他从设备片选须保持高。命令限时 10ms，数据限时 50ms。
  * 错误返回 HAL 状态且释放 CS，data 可能已被部分改写，失败数据不得使用。
  */
 HAL_StatusTypeDef Boot_FlashRead(uint32_t address, uint8_t *data, uint16_t size);
@@ -25,7 +25,7 @@ HAL_StatusTypeDef Boot_FlashRead(uint32_t address, uint8_t *data, uint16_t size)
 /*
  * 轮询 BUSY 位，timeout_ms 为 0～1000ms，0 表示仅检查一次。
  * 空闲返回 HAL_OK，忙至超时返回 HAL_TIMEOUT，SPI 错误直接返回。
- * 必须在 HAL 毫秒时基正常前进的普通上下文调用，调用方独占 SPI2。
+ * 必须在 HAL 毫秒时基正常前进的普通上下文调用，调用方独占 SPI3。
  * 单次状态读取的命令/接收各限时 10ms，超时边界可额外包含这次传输。
  */
 HAL_StatusTypeDef Boot_FlashWaitReady(uint32_t timeout_ms);
@@ -44,7 +44,7 @@ HAL_StatusTypeDef Boot_FlashEraseSector(uint32_t address);
  * 向固件包槽写入 1～256 字节，不得跨越 256 字节页边界。
  * data 在调用期间可读且有效。调用方负责事先擦除允许改写的目标扇区。
  * 确认写使能后编程、等待完成并读回比对；失败不重试，内容可能部分改变。
- * 擦写接口均须先完成 GPIO/SPI 初始化，保持其他片选为高，独占 SPI2。
+ * 擦写接口均须先完成 GPIO/SPI 初始化，保持其他片选为高，独占 SPI3。
  * 页编程和读回共用3000 ms软件上限，成功后报告进展；监督失败后全部写接口拒绝修改。
  */
 HAL_StatusTypeDef Boot_FlashProgramPage(uint32_t address, const uint8_t *data, uint16_t size);

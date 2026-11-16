@@ -4,15 +4,37 @@
 #include "app_upgrade.h"
 #include "app_monitor.h"
 #include "upgrade_stage.h"
+#include "upgrade_entry.h"
+#include "upgrade_tf.h"
 #include "upgrade_trust.h"
 #include "cmsis_os2.h"
 #include "main.h"
 #if GATEWAY_ENABLE_M2
 #include "ethernet.h"   /* m2_ethernet_init()：以太网/LwIP 初始化入口 */
-#include "network_upgrade.h" /* NetworkUpgrade_Init/StartTask：OTA 升级入口 */
+#include "network_upgrade.h"
 #endif
 #include <stdio.h>      /* printf：网络初始化失败时记录最小错误信息（不阻塞业务） */
 
+// 按来源查询本次操作权限，不将包字段或网络连接状态当作授权。
+static bool AuthorizeUpgrade(void *context, const UpgradeEntryPeer *peer)
+{
+  (void)context;
+  if ((peer == NULL) || (peer->epoch == 0U))
+  {
+    return false;
+  }
+  switch (peer->source)
+  {
+    case UPGRADE_STAGE_SOURCE_TF:
+      return UpgradeTf_Authorize(peer);
+#if GATEWAY_ENABLE_M2
+    case UPGRADE_STAGE_SOURCE_NETWORK:
+      return NetworkUpgrade_Authorize(peer);
+#endif
+    default:
+      return false;
+  }
+}
 
 /*
  * 调度器启动后完成就绪状态、模块资源和业务任务的装配，然后退出启动任务。
@@ -28,6 +50,13 @@ void App_Entry(void *argument)
                   SCB->VTOR == 0x08010000U, osKernelGetTickCount());
   if (!UpgradeStage_Init())
   {
+    Error_Handler();
+    return;
+  }
+  const UpgradeEntryPolicy policy = {AuthorizeUpgrade, NULL};
+  if (UpgradeEntry_BindPolicy(&policy) != UPGRADE_STAGE_OK)
+  {
+    printf("[App] upgrade policy bind FAILED\r\n");
     Error_Handler();
     return;
   }
@@ -68,14 +97,9 @@ void App_Entry(void *argument)
   App_ModulesInit();
   printf("[App] ModulesInit done, starting ModulesStart\r\n");
   App_ModulesStart();
-#if GATEWAY_ENABLE_M2
-  /* 网络升级入口：绑定 Policy+Quiesce+Monitor 后创建执行任务。
-   * 在 ModulesStart 后调用，确保 M4 升级框架和 MQTT 模块已就绪。 */
-  NetworkUpgrade_Init();
-  NetworkUpgrade_StartTask();
-#endif
   printf("[App] ModulesStart done\r\n");
   Monitor_StartupComplete();
+  AppMemory_Report("startup");
 
   // 启动任务完成一次装配后退出
   osThreadExit();

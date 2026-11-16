@@ -809,26 +809,9 @@ void HAL_ETH_TxCpltCallback(ETH_HandleTypeDef *heth)
   (void)heth;
 }
 
-/** ETH 错误回调（DMA 错误等）
-    ★注意：HAL 在自己的 IRQHandler 里遇到致命总线错误(FBE)时会把 gState 直接置成
-    HAL_ETH_STATE_ERROR，之后 HAL_ETH_ReadData 一进门就返回错误 → 收包永久停止。
-    这里把错误次数和错误码记下来，交给收包线程打心跳时一起输出。
-
-    ★★2026-11-10 RBUS 分析：
-    错误码 0x00008080 = AIS(bit15) + RBUS(bit7)，不是 FBE(bit13, 0x2000)。
-    HAL 走非致命分支：清除 RBUS/AIS 标志，不设 gState=ERROR。
-    但 DMA RX 进程已挂起（Suspended），需要手动写 DMARPDR 恢复（见 ethernetif_thread）。
-    根因是 RX_POOL 太小（原 6 个），TCP 流量涌入时池耗尽 → RxAllocate 返回 NULL
-    → DMA 描述符无新缓冲 → RBUS。 */
+/* ETH中断只记录错误，DMA恢复与日志由收包线程处理，避免阻塞SD轮询。 */
 void HAL_ETH_ErrorCallback(ETH_HandleTypeDef *heth)
 {
   gdbg_err_irq++;
   gdbg_err_code = heth->DMAErrorCode;
-  /* ★RBUS 只在中断上下文打印一次，避免刷屏（高频错误时每秒可能触发数十次） */
-  if (gdbg_err_code & 0x0080U)  /* ETH_DMASR_RBUS */
-  {
-    printf("[ETH-ERR] RBUS! pool_alloc=%lu null=%lu free=%lu\r\n",
-           (unsigned long)gdbg_pool_alloc, (unsigned long)gdbg_pool_null,
-           (unsigned long)gdbg_pool_free);
-  }
 }

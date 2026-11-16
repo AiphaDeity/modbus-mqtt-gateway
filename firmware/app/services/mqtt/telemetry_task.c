@@ -15,10 +15,9 @@
  *      for each id:
  *        mb_take_slave_snapshot(id)          → 取数据快照（检查 data_valid）
  *        mb_pointmap_parse_slave(id)         → M1 把 raw reg 换成物理量
- *        拼 JSON
  *        storage_seq_alloc()                 → M3 分配全局 seq
  *        osMessageQueuePut(write_q)          → 丢给 M3 离线缓存
- *        MqttClient_Publish()                → 在线时直接发
+ *        MQTT从已提交记录统一发送，实时与补传使用同一record_id
  */
 
 #include <stdio.h>
@@ -32,6 +31,8 @@
 #include "mb_pointmap.h"
 #include "storage_m2.h"
 #include "storage_seq.h"
+#include "storage_identity.h"
+#include "storage_time.h"
 #include "mqtt_client.h"
 #include "app_modules.h"
 #include "app_monitor.h"
@@ -39,9 +40,6 @@
 
 /* 上报周期：Modbus 采集本身可能 1~2 秒一轮，这里 2 秒足够 */
 #define TELEMETRY_PERIOD_MS   2000U
-
-/* 单条 payload 上限：storage_write_req_t.payload[512] */
-#define PAYLOAD_MAX           512U
 
 /* 最多收集的从站 ID 数（MB_SLAVE_HARD_MAX=16） */
 #define TEL_MAX_SLAVES        16U
@@ -119,66 +117,67 @@ static bool publish_one_slave(uint8_t slave_id)
         return true;
     }
 
-    /* 3) 拼 JSON：{"g":"mb2mqtt_001","slave":2,"online":1,"pts":[{"n":"temp","v":25.3,"u":"C"},...]} */
-    static char buf[PAYLOAD_MAX] __attribute__((section(".bss.ccmram")));
-    int n = snprintf(buf, sizeof(buf),
-        "{\"g\":\"mb2mqtt_001\",\"slave\":%u,\"online\":%u,\"pts\":[",
-        (unsigned)slave_id, (unsigned)snap.is_online);
+    char gateway[GATEWAY_ID_MAX_LEN];
+    if (!MqttClient_GetGatewayId(gateway, sizeof(gateway)))
+        return true;
+    for (const char *c = gateway; *c; c++)
+        if ((unsigned char)*c < 0x20U || *c == '"' || *c == '\\') return true;
 
-    for (int i = 0; i < npts; i++)
-    {
-        if (!pts[i].valid) continue;
-        int w = snprintf(buf + n, sizeof(buf) - n,
-            "%s{\"n\":\"%s\",\"v\":%.2f,\"u\":\"%s\"}",
-            (n > 0 && buf[n-1] != '[') ? "," : "",
-            pts[i].name, (double)pts[i].value, pts[i].unit);
-        if (n + w >= (int)sizeof(buf) - 2) break;
-        n += w;
-    }
-    n += snprintf(buf + n, sizeof(buf) - n, "]}");
-
-    /* 4) 从 M3 取全局 seq 号 */
-    uint64_t seq = 0;
     if (!Monitor_BeginWait(APP_MODULE_TELEMETRY, 3000U)) return false;
-    HAL_StatusTypeDef sequence_status = storage_seq_alloc(&seq);
+    uint64_t captured_at_ms = (uint64_t)storage_get_unix_time() * 1000U;
     if (!Monitor_ReportProgress(APP_MODULE_TELEMETRY, true)) return false;
-    if (sequence_status != HAL_OK)
+
+    // 直接使用原存储请求编码；装不下的点继续写下一条，不截断点表。
+    for (int first = 0; first < npts; )
     {
-        printf("[TEL] seq_alloc failed, skip slave=%u\r\n", (unsigned)slave_id);
-        return true;
+        while (first < npts && !pts[first].valid) first++;
+        if (first == npts) break;
+        uint64_t seq = 0;
+        if (!Monitor_BeginWait(APP_MODULE_TELEMETRY, 3000U)) return false;
+        HAL_StatusTypeDef sequence_status = storage_seq_alloc(&seq);
+        if (!Monitor_ReportProgress(APP_MODULE_TELEMETRY, true)) return false;
+        if (sequence_status != HAL_OK) return true;
+
+        storage_write_req_t req = {.kind = RECORD_KIND_TELEMETRY, .seq = seq,
+                                   .captured_at_ms = captured_at_ms};
+        char *buf = (char *)req.payload;
+        int n = snprintf(buf, sizeof(req.payload),
+            "{\"g\":\"%s\",\"slave\":%u,\"online\":%u,\"pts\":[",
+            gateway, (unsigned)slave_id, (unsigned)snap.is_online);
+        if (n < 0 || n >= (int)sizeof(req.payload) - 2) return true;
+        int included = 0;
+        for (; first < npts; first++)
+        {
+            if (!pts[first].valid) continue;
+            int w = snprintf(buf + n, sizeof(req.payload) - (size_t)n,
+                "%s{\"n\":\"%s\",\"v\":%.2f,\"u\":\"%s\"}",
+                included ? "," : "", pts[first].name, (double)pts[first].value, pts[first].unit);
+            if (w < 0) return true;
+            if (n + w >= (int)sizeof(req.payload) - 2) break;
+            n += w;
+            included++;
+        }
+        if (included == 0) return true;
+        buf[n++] = ']';
+        buf[n++] = '}';
+        req.payload_len = (uint16_t)n;
+
+        taskENTER_CRITICAL();
+        bool allowed = !s_pause_requested && UpgradeQuiesce_AllowsMutation();
+        osStatus_t st = allowed ? osMessageQueuePut(storage_m2_write_queue(), &req, 0, 0) : osErrorResource;
+        taskEXIT_CRITICAL();
+        if (!allowed) return true;
+        if (st != osOK)
+        {
+            printf("[TEL] cache not accepted, seq=%08lX%08lX slave=%u status=%d\r\n",
+                   (unsigned long)(seq >> 32U), (unsigned long)seq, (unsigned)slave_id, (int)st);
+            return true;
+        }
+        // 入队不代表落盘；由MQTT拉取已提交记录后再发送。
+        printf("[TEL] queued seq=%08lX%08lX slave=%u pts=%d bytes=%u\r\n",
+               (unsigned long)(seq >> 32U), (unsigned long)seq,
+               (unsigned)slave_id, included, (unsigned)req.payload_len);
     }
-
-    /* 5) 填写请求，丢给 M3 离线缓存 */
-    storage_write_req_t req = {
-        .kind = 1,
-        .seq = seq,
-        .captured_at_ms = 0,
-        .payload_len = (uint16_t)n,
-    };
-    memcpy(req.payload, buf, n);
-
-    taskENTER_CRITICAL();
-    bool allowed = !s_pause_requested && UpgradeQuiesce_AllowsMutation();
-    osStatus_t st = allowed ? osMessageQueuePut(storage_m2_write_queue(), &req, 0, 0) : osErrorResource;
-    taskEXIT_CRITICAL();
-    if (!allowed) return true;
-    if (st != osOK)
-    {
-        printf("[TEL] cache not accepted, skip publish slave=%u status=%d\r\n",
-               (unsigned)slave_id, (int)st);
-        return true;
-    }
-
-    /* 6) 在线时直接 PUBLISH（不管队列是否满，队列只是离线备份） */
-    printf("[TEL-DATA] %.*s\r\n", (int)n, buf);
-    /* 现有发送锁最多12秒，写入最多10秒，另留返回处理余量。 */
-    if (!Monitor_BeginWait(APP_MODULE_TELEMETRY, 24000U)) return false;
-    int pr = MqttClient_Publish(MqttClient_TopicTelemetry(),
-                               (const uint8_t *)buf, (size_t)n);
-    if (!Monitor_ReportProgress(APP_MODULE_TELEMETRY, true)) return false;
-    printf("[TEL] seq=%lu slave=%u online=%u pts=%d mqtt_pub=%d\r\n",
-           (unsigned long)seq, (unsigned)slave_id,
-           (unsigned)snap.is_online, npts, pr);
     return true;
 }
 
@@ -199,16 +198,18 @@ void Telemetry_Task(void *argument)
         osDelay(pdMS_TO_TICKS(5000U)) != osOK)
         goto health_fail;
     printf("[TEL] task started\r\n");
+    uint32_t next_cycle_ms = HAL_GetTick();
 
     for (;;)
     {
         taskENTER_CRITICAL();
         bool healthy = Monitor_ReportProgress(APP_MODULE_TELEMETRY, true);
-        bool paused = s_pause_requested || !UpgradeQuiesce_AllowsMutation();
+        const app_config_t *config = AppConfig_Get();
+        bool paused = s_pause_requested || !UpgradeQuiesce_AllowsMutation() || config == NULL;
         s_pause_acknowledged = s_pause_requested && healthy;
         taskEXIT_CRITICAL();
         if (!healthy) goto health_fail;
-        if (paused)
+        if (paused || (int32_t)(HAL_GetTick() - next_cycle_ms) < 0)
         {
             if (!Monitor_BeginWait(APP_MODULE_TELEMETRY, 1500U) ||
                 osDelay(pdMS_TO_TICKS(500U)) != osOK)
@@ -230,8 +231,10 @@ void Telemetry_Task(void *argument)
         }
 
         printf("[TEL] cycle done: %u slaves\r\n", (unsigned)cnt);
-        if (!Monitor_BeginWait(APP_MODULE_TELEMETRY, TELEMETRY_PERIOD_MS + 1000U) ||
-            osDelay(pdMS_TO_TICKS(TELEMETRY_PERIOD_MS)) != osOK)
+        /* 长上报周期仍每500ms检查暂停和真实任务进展，不声明整周期的健康豁免。 */
+        next_cycle_ms = HAL_GetTick() + config->mq_report_interval_ms;
+        if (!Monitor_BeginWait(APP_MODULE_TELEMETRY, 1500U) ||
+            osDelay(pdMS_TO_TICKS(500U)) != osOK)
             goto health_fail;
     }
 

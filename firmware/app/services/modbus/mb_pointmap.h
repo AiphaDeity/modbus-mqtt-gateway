@@ -77,6 +77,7 @@ typedef struct
     char     unit[MB_POINT_UNIT_MAX];            // 单位
     uint8_t  valid;                              // 0=空位，1=有效配置
     uint8_t  bit_index;                          // 仅 MB_DT_BIT 用：位号 0~15（其它类型填 0）
+    uint8_t  byte_order;                         // 0=AB/ABCD，1=BA/BADC，2=CDAB，3=DCBA。
 } mb_point_t;
 
 /* ========= 解析结果（供 MQTT 方读取） ========= */

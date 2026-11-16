@@ -13,9 +13,12 @@
 #include "telemetry_task.h"
 #include "mb_api.h"
 #include "upgrade_tf.h"
+#if GATEWAY_ENABLE_M2
+#include "network_upgrade.h"
+#endif
 
 #define STORAGE_STACK_SIZE_BYTES (6U * 1024U)  /* FatFs + storage_record，M3 说 8K 实测后可降 6K */
-#define CONFIG_STACK_SIZE_BYTES  (512U)         /* M1 config 还没实现，占位 */
+#define CONFIG_STACK_SIZE_BYTES  (1536U)        /* Config值拷贝RPC和有界JSON解析，仍使用原静态任务 */
 #define MODBUS_STACK_SIZE_BYTES  (2U * 1024U)
 #define MQTT_STACK_SIZE_BYTES    (6U * 1024U)   /* netconn + snprintf 调用链深，4K 实测溢出 */
 #define TELEMETRY_STACK_SIZE_BYTES (2560U)       /* snprintf + printf 栈开销大，2.5K */
@@ -50,6 +53,11 @@ _Alignas(8) static StackType_t mqtt_stack[MQTT_STACK_SIZE_BYTES / sizeof(StackTy
 _Alignas(8) static StackType_t telemetry_stack[TELEMETRY_STACK_SIZE_BYTES / sizeof(StackType_t)]  __attribute__((section(".bss.ccmram")));
 _Alignas(8) static StackType_t monitor_stack[MONITOR_STACK_SIZE_BYTES / sizeof(StackType_t)];
 _Alignas(8) static StackType_t upgrade_stack[UPGRADE_STACK_SIZE_BYTES / sizeof(StackType_t)];
+#if GATEWAY_ENABLE_M2
+_Alignas(8) static StackType_t network_upgrade_stack[NETWORK_UPGRADE_TASK_STACK_BYTES / sizeof(StackType_t)]
+  __attribute__((section(".bss.ccmram")));
+static StaticTask_t network_upgrade_control_block __attribute__((section(".bss.ccmram")));
+#endif
 
 static StaticTask_t storage_control_block;
 static StaticTask_t config_control_block;
@@ -77,7 +85,7 @@ static const osThreadAttr_t config_attributes =
   .cb_size = sizeof(config_control_block),
   .stack_mem = config_stack,
   .stack_size = sizeof(config_stack),
-  .priority = osPriorityBelowNormal
+  .priority = osPriorityNormal // 与存储同级，启动扫描期间配置任务仍须按期报告进展。
 };
 
 static const osThreadAttr_t modbus_attributes =
@@ -130,6 +138,18 @@ static const osThreadAttr_t upgrade_attributes =
   .priority = osPriorityNormal
 };
 
+#if GATEWAY_ENABLE_M2
+static const osThreadAttr_t network_upgrade_attributes =
+{
+  .name = "nw_upgrade",
+  .cb_mem = &network_upgrade_control_block,
+  .cb_size = sizeof(network_upgrade_control_block),
+  .stack_mem = network_upgrade_stack,
+  .stack_size = sizeof(network_upgrade_stack),
+  .priority = NETWORK_UPGRADE_TASK_PRIORITY
+};
+#endif
+
 /*
  * init/task 必须成对绑定；均为 NULL 表示未接入，只绑定一个视为错误。
  * 监督任务提前创建；其余任务在基础初始化完成后，经统一入口创建。
@@ -143,7 +163,7 @@ static AppModuleSlot module_slots[APP_MODULE_COUNT] =
   },
   [APP_MODULE_CONFIG] =
   {
-    .init = NULL, .task = NULL, .attributes = &config_attributes,
+    .init = Config_Init, .task = Config_Task, .attributes = &config_attributes,
     .result = APP_MODULE_INIT_NOT_READY, .task_state = APP_MODULE_TASK_NOT_STARTED
   },
   [APP_MODULE_MODBUS] =
@@ -177,6 +197,15 @@ static AppModuleSlot module_slots[APP_MODULE_COUNT] =
   [APP_MODULE_UPGRADE] =
   {
     .init = UpgradeTf_Init, .task = UpgradeTf_Task, .attributes = &upgrade_attributes,
+    .result = APP_MODULE_INIT_NOT_READY, .task_state = APP_MODULE_TASK_NOT_STARTED
+  },
+  [APP_MODULE_NETWORK_UPGRADE] =
+  {
+#if GATEWAY_ENABLE_M2
+    .init = NetworkUpgrade_Init, .task = NetworkUpgrade_Task, .attributes = &network_upgrade_attributes,
+#else
+    .init = NULL, .task = NULL, .attributes = NULL,
+#endif
     .result = APP_MODULE_INIT_NOT_READY, .task_state = APP_MODULE_TASK_NOT_STARTED
   }
 };

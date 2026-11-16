@@ -87,6 +87,9 @@ bool Boot_AppFlashProgram(uint32_t address, const uint8_t *data, uint32_t len)
     status = HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, address + offset, word);
     if (status != HAL_OK)
     {
+      printf("App program failed address=0x%08lX HAL=%u error=0x%08lX\r\n",
+             (unsigned long)(address + offset), (unsigned int)status,
+             (unsigned long)HAL_FLASH_GetError());
       break;
     }
   }

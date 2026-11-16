@@ -1,29 +1,86 @@
 /*
- * network_upgrade_downloader.c —— HTTP 分块下载器实现（LwIP netconn）
+ * network_upgrade_downloader.c —— HTTP/HTTPS 分块下载器实现（LwIP netconn + mbedTLS）
  *
- * 实现流程：URL解析 → DNS → TCP连接 → HTTP GET → 收响应头 → 循环收body → 回调
+ * 实现流程：URL解析 → DNS → TCP连接 → [TLS握手] → HTTP GET → 收响应头 → 循环收body → 回调
  * 每块 ≤1016B（UPGRADE_STAGE_MAX_CHUNK_SIZE），回调里调 UpgradeEntry_Write。
+ *
+ * http://使用netconn；https://在同一连接上完成TLS认证与加密。
  */
 #include "network_upgrade_downloader.h"
 
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <limits.h>
+#include "app_monitor.h"
+#include "stm32f4xx_hal.h"
+#include "cmsis_os2.h"
 
 #include "lwip/api.h"        /* netconn_* */
 #include "lwip/dns.h"        /* netconn_gethostbyname */
 #include "lwip/ip_addr.h"
 
-/* ===== 内部缓冲（普通 SRAM，netbuf 数据拷贝出来后 CPU 处理） ===== */
+/* HTTPS 支持 */
+#include "https_tls.h"
+#include "https_ca_cert.h"   /* 百度BOS根证书DigiCert Global Root G2 */
+
+/* ===== 内部缓冲（CCMRAM，不挤占普通 SRAM） ===== */
 #define NW_DL_RX_BUF_SIZE  1024   /* 略大于 1016，收响应头和 body 复用 */
 #define NW_DL_HTTP_PORT    80
+#define NW_DL_HTTPS_PORT   443
+#define NW_DL_DNS_TIMEOUT_MS 20000U
+#define NW_DL_IO_TIMEOUT_MS 10000U
 
+/* ===== 全局连接引用（HTTP 路径用；HTTPS 路径由 TLS session 管理） ===== */
 static struct netconn *g_download_conn;
+static https_tls_session_t g_tls_session;
+static bool g_using_tls;
+static uint32_t g_started_ms;
+static uint32_t g_timeout_ms;
+static volatile bool g_connect_completed;
+// HTTP与HTTPS由同一升级任务串行执行，共用单行响应头和分块缓冲。
+static char g_header_buf[512] __attribute__((section(".bss.ccmram")));
+static uint8_t g_chunk_buf[NW_DL_RX_BUF_SIZE] __attribute__((section(".bss.ccmram")));
 
-/* 仅由升级任务调用；删除失败保留连接，下次下载先重试释放，不覆盖原始错误。 */
+// DNS、连接、收发与回调共同使用本次下载的固定期限。
+static uint32_t download_remaining(void)
+{
+    uint32_t elapsed = HAL_GetTick() - g_started_ms;
+    return elapsed < g_timeout_ms ? g_timeout_ms - elapsed : 0U;
+}
+
+// 阻塞前只声明本次剩余期限，不通过等待重置总超时。
+static bool download_wait(uint32_t limit_ms)
+{
+    uint32_t remaining = download_remaining();
+    uint32_t wait_ms = remaining < limit_ms ? remaining : limit_ms;
+    return wait_ms != 0U && Monitor_UpgradeWait(wait_ms);
+}
+
+/* ===== 关闭辅助 =====
+ * HTTP 路径：netconn_delete
+ * HTTPS 路径：HttpsTls_Close（内部已 netconn_delete）
+ * 仅由升级任务调用；删除失败保留引用，下次下载先重试释放，不覆盖原始错误。
+ */
 static nw_dl_status_t download_close(nw_dl_status_t result)
 {
+    if (g_using_tls)
+    {
+        HttpsTls_Close(&g_tls_session);
+        if (g_tls_session.conn != NULL)
+            return result == NW_DL_OK ? NW_DL_ERR_INTERNAL : result;
+        g_download_conn = NULL;
+        g_using_tls = false;
+        return result;
+    }
+
+    if (g_download_conn == NULL) return result;
+    uint32_t remaining = download_remaining();
+    uint32_t wait_ms = remaining == 0U ? 1U : remaining < NW_DL_IO_TIMEOUT_MS ? remaining : NW_DL_IO_TIMEOUT_MS;
+    netconn_set_sendtimeout(g_download_conn, wait_ms);
+    if (!Monitor_UpgradeWait(wait_ms)) return result == NW_DL_OK ? NW_DL_ERR_INTERNAL : result;
     err_t err = netconn_delete(g_download_conn);
+    (void)Monitor_UpgradeProgress();
     if (err == ERR_OK)
         g_download_conn = NULL;
     else
@@ -35,128 +92,314 @@ static nw_dl_status_t download_close(nw_dl_status_t result)
     return result;
 }
 
-/* 解析 URL：http://host[:port]/path → host, port, path
+// 连接完成或出错只记录事件，TCP/IP线程内不执行升级或阻塞操作。
+static void download_event(struct netconn *conn, enum netconn_evt event, u16_t len)
+{
+    (void)len;
+    if (conn == g_download_conn &&
+        (event == NETCONN_EVT_SENDPLUS || event == NETCONN_EVT_ERROR))
+        g_connect_completed = true;
+}
+
+// DNS按当前LwIP两服务器重试预算等待，TCP采用非阻塞连接避免SYN重传超出期限。
+static nw_dl_status_t download_connect(const char *host, uint16_t port)
+{
+    ip_addr_t ip;
+    if (download_remaining() < NW_DL_DNS_TIMEOUT_MS || !download_wait(NW_DL_DNS_TIMEOUT_MS))
+        return NW_DL_ERR_TIMEOUT;
+    err_t err = netconn_gethostbyname(host, &ip);
+    if (!Monitor_UpgradeProgress() || download_remaining() == 0U) return NW_DL_ERR_TIMEOUT;
+    if (err != ERR_OK)
+    {
+        printf("[NWDL] DNS fail host=%s err=%d\r\n", host, (int)err);
+        return NW_DL_ERR_DNS;
+    }
+    printf("[NWDL] DNS OK: %s\r\n", ipaddr_ntoa(&ip));
+    g_download_conn = netconn_new_with_callback(NETCONN_TCP, download_event);
+    if (g_download_conn == NULL) return NW_DL_ERR_CONNECT;
+    netconn_set_nonblocking(g_download_conn, 1);
+    g_connect_completed = false;
+    uint32_t wait_ms = download_remaining();
+    if (wait_ms > NW_DL_IO_TIMEOUT_MS) wait_ms = NW_DL_IO_TIMEOUT_MS;
+    if (!download_wait(wait_ms)) return download_close(NW_DL_ERR_TIMEOUT);
+    uint32_t started_ms = HAL_GetTick();
+    err = netconn_connect(g_download_conn, &ip, port);
+    if (err == ERR_INPROGRESS)
+    {
+        while (!g_connect_completed && download_remaining() != 0U &&
+               (uint32_t)(HAL_GetTick() - started_ms) < wait_ms)
+        {
+            uint32_t ticks = (osKernelGetTickFreq() + 99U) / 100U;
+            if (osDelay(ticks) != osOK) break;
+        }
+        err = g_connect_completed ? netconn_err(g_download_conn) : ERR_TIMEOUT;
+    }
+    netconn_set_nonblocking(g_download_conn, 0);
+    if (!Monitor_UpgradeProgress() || download_remaining() == 0U) err = ERR_TIMEOUT;
+    if (err != ERR_OK)
+    {
+        printf("[NWDL] connect fail err=%d\r\n", (int)err);
+        return download_close(err == ERR_TIMEOUT ? NW_DL_ERR_TIMEOUT : NW_DL_ERR_CONNECT);
+    }
+    printf("[NWDL] TCP connected\r\n");
+    return NW_DL_OK;
+}
+
+/* ===== URL 解析 =====
+ * 支持 http:// 和 https://
  * 返回 0=成功，-1=格式错误
  * url 例：http://abc.baidubce.com:8080/fw/firmware.gwp
- *       http://abc.baidubce.com/firmware.gwp
+ *       https://abc.bcebos.com/firmware.gwp
+ *
+ * 解析后输出：
+ *   host     - 域名或 IP（不含端口和路径）
+ *   port     - 端口号（URL 没写则用默认：HTTP=80, HTTPS=443）
+ *   path     - 路径（URL 没写则用 "/"）
+ *   is_https - true=HTTPS(443+TLS), false=HTTP(80明文)
  */
 static int parse_url(const char *url, char *host, int host_max,
-                     uint16_t *port, const char **path)
+                     uint16_t *port, const char **path, bool *is_https)
 {
-    if (strncmp(url, "http://", 7) != 0) return -1;
-    const char *p = url + 7;
+    *is_https = false;
+
+    /* 检查协议前缀，确定默认端口 */
+    if (strncmp(url, "https://", 8) == 0)
+    {
+        *is_https = true;
+        *port = NW_DL_HTTPS_PORT;   /* 443 */
+    }
+    else if (strncmp(url, "http://", 7) == 0)
+    {
+        *is_https = false;
+        *port = NW_DL_HTTP_PORT;    /* 80 */
+    }
+    else
+    {
+        return -1;   /* 不支持的协议 */
+    }
+
+    /* 跳过协议前缀，指向 host 起点 */
+    const char *p = url + (*is_https ? 8 : 7);
     const char *host_start = p;
-    /* 找 host 结尾（: / 或 \0） */
+    /* host 结尾标志：冒号(端口) / 斜杠(路径) / 结尾 */
     while (*p != ':' && *p != '/' && *p != '\0') p++;
     int host_len = p - host_start;
     if (host_len <= 0 || host_len >= host_max) return -1;
     memcpy(host, host_start, host_len);
     host[host_len] = '\0';
 
-    /* 解析端口 */
+    /* 解析端口（如有 ":8080"） */
     if (*p == ':')
     {
         *port = (uint16_t)atoi(p + 1);
-        while (*p != '/' && *p != '\0') p++;
-    }
-    else
-    {
-        *port = NW_DL_HTTP_PORT;
+        while (*p != '/' && *p != '\0') p++;   /* 跳过端口数字 */
     }
 
-    /* path */
+    /* path：有 "/" 则从斜杠开始，没有则用 "/" */
     *path = (*p == '/') ? p : "/";
     return 0;
 }
 
-/* 从响应头缓冲找 HTTP 状态码 */
-static int parse_http_status(const char *hdr, int hdr_len)
+typedef struct
 {
-    /* "HTTP/1.1 200 OK" 或 "HTTP/1.1 206 Partial Content" */
-    if (hdr_len < 12) return -1;
-    if (strncmp(hdr, "HTTP/", 5) != 0) return -1;
-    /* 跳过 HTTP/x.x */
-    const char *p = hdr + 5;
-    while (*p != ' ' && (p - hdr) < hdr_len) p++;
-    while (*p == ' ' && (p - hdr) < hdr_len) p++;
-    return atoi(p);
-}
+    bool status_seen;
+    bool length_seen;
+    bool complete;
+} nw_http_header_t;
 
-/* 从响应头找 Content-Length */
-static int32_t parse_content_length(const char *hdr, int hdr_len)
+// 逐行核验整包响应；拒绝重复长度和分块编码，不累积整份响应头。
+static nw_dl_status_t parse_header_line(char *line, int len, uint32_t expected,
+                                        nw_http_header_t *header)
 {
-    const char *needle = "Content-Length:";
-    const char *p = NULL;
-    /* 大小写不敏感查找 */
-    for (int i = 0; i <= hdr_len - (int)strlen(needle); i++)
+    if (len < 2 || line[len - 2] != '\r' || line[len - 1] != '\n')
+        return NW_DL_ERR_RESPONSE;
+    len -= 2;
+    if (!header->status_seen)
     {
-        int match = 1;
-        for (int j = 0; j < (int)strlen(needle); j++)
+        if (len < 13 || memcmp(line, "HTTP/1.", 7) != 0 ||
+            (line[7] != '0' && line[7] != '1') || line[8] != ' ' || line[12] != ' ')
+            return NW_DL_ERR_RESPONSE;
+        if (memcmp(line + 9, "200", 3) != 0)
         {
-            char a = hdr[i + j];
-            char b = needle[j];
-            if (a >= 'a' && a <= 'z') a -= 32;
-            if (a != b) { match = 0; break; }
+            printf("[NWDL] HTTP status %.3s\r\n", line + 9);
+            return NW_DL_ERR_HTTP_STATUS;
         }
-        if (match) { p = hdr + i + strlen(needle); break; }
+        header->status_seen = true;
+        return NW_DL_OK;
     }
-    if (!p) return -1;
-    while (*p == ' ' || *p == '\t') p++;
-    return atoi(p);
+    if (len == 0)
+    {
+        if (!header->length_seen) return NW_DL_ERR_NO_CONTENT_LEN;
+        header->complete = true;
+        return NW_DL_OK;
+    }
+
+    int colon = 0;
+    while (colon < len && line[colon] != ':')
+    {
+        unsigned char c = (unsigned char)line[colon];
+        if (c <= ' ' || c >= 127U) return NW_DL_ERR_RESPONSE;
+        if (c >= 'A' && c <= 'Z') line[colon] = (char)(c + ('a' - 'A'));
+        ++colon;
+    }
+    if (colon == 0 || colon == len) return NW_DL_ERR_RESPONSE;
+    line[colon] = '\0';
+    if (strcmp(line, "transfer-encoding") == 0) return NW_DL_ERR_RESPONSE;
+    if (strcmp(line, "content-length") != 0) return NW_DL_OK;
+    if (header->length_seen) return NW_DL_ERR_RESPONSE;
+
+    int pos = colon + 1;
+    while (pos < len && (line[pos] == ' ' || line[pos] == '\t')) ++pos;
+    if (pos == len || line[pos] < '0' || line[pos] > '9') return NW_DL_ERR_RESPONSE;
+    uint32_t length = 0U;
+    while (pos < len && line[pos] >= '0' && line[pos] <= '9')
+    {
+        uint32_t digit = (uint32_t)(line[pos++] - '0');
+        if (length > (UINT32_MAX - digit) / 10U) return NW_DL_ERR_RESPONSE;
+        length = length * 10U + digit;
+    }
+    while (pos < len && (line[pos] == ' ' || line[pos] == '\t')) ++pos;
+    if (pos != len) return NW_DL_ERR_RESPONSE;
+    if (length != expected) return NW_DL_ERR_SIZE_MISMATCH;
+    header->length_seen = true;
+    return NW_DL_OK;
 }
 
-nw_dl_status_t NetworkDownloader_Fetch(const nw_dl_params_t *params)
+// 连续消费所有netbuf段；头结束后的字节直接进入原分块缓冲，不另存残余副本。
+static nw_dl_status_t receive_response(struct netconn *conn, const nw_dl_params_t *params,
+                                       uint32_t chunk_size)
 {
-    char host[64];
-    uint16_t port;
-    const char *path;
-    ip_addr_t ip;
-    err_t err;
+    int hdr_len = 0;
+    nw_http_header_t header = {0};
+    uint32_t offset = 0;
+    uint32_t chunk_accum = 0;
+    nw_dl_status_t result = NW_DL_OK;
 
-    if (!params || !params->url || !params->cb) return NW_DL_ERR_URL;
-    if (download_close(NW_DL_OK) != NW_DL_OK) return NW_DL_ERR_INTERNAL;
-
-    uint32_t chunk_size = params->chunk_size;
-    if (chunk_size == 0 || chunk_size > 1016) chunk_size = 1016;
-    uint32_t timeout_ms = params->timeout_ms;
-    if (timeout_ms == 0) timeout_ms = 120000;
-
-    /* 1. 解析 URL */
-    if (parse_url(params->url, host, sizeof(host), &port, &path) != 0)
+    while ((result == NW_DL_OK) && (!header.complete || (offset < params->total_size)))
     {
-        printf("[NWDL] URL parse fail: %s\r\n", params->url);
-        return NW_DL_ERR_URL;
-    }
-    printf("[NWDL] host=%s port=%u path=%s\r\n", host, (unsigned)port, path);
+        struct netbuf *nbuf = NULL;
+        uint32_t wait_ms = download_remaining();
+        if (wait_ms > NW_DL_IO_TIMEOUT_MS) wait_ms = NW_DL_IO_TIMEOUT_MS;
+        netconn_set_recvtimeout(conn, wait_ms);
+        if (!download_wait(wait_ms)) return NW_DL_ERR_TIMEOUT;
+        err_t err = netconn_recv(conn, &nbuf);
+        if (!Monitor_UpgradeProgress() || download_remaining() == 0U)
+        {
+            if (nbuf != NULL) netbuf_delete(nbuf);
+            return NW_DL_ERR_TIMEOUT;
+        }
+        if ((err != ERR_OK) || (nbuf == NULL))
+        {
+            printf("[NWDL] recv %s fail err=%d at=%u expected=%u\r\n",
+                   header.complete ? "body" : "header", (int)err,
+                   (unsigned)(offset + chunk_accum), (unsigned)params->total_size);
+            if (nbuf != NULL) netbuf_delete(nbuf);
+            result = header.complete ? NW_DL_ERR_RECEIVE : NW_DL_ERR_RESPONSE;
+            break;
+        }
 
-    /* 2. DNS 解析（同步阻塞） */
-    err = netconn_gethostbyname(host, &ip);
-    if (err != ERR_OK)
+        do
+        {
+            void *data = NULL;
+            uint16_t len = 0;
+            if ((netbuf_data(nbuf, &data, &len) != ERR_OK) || ((len != 0U) && (data == NULL)))
+            {
+                result = header.complete ? NW_DL_ERR_RECEIVE : NW_DL_ERR_RESPONSE;
+                break;
+            }
+            uint16_t consumed = 0;
+            while (!header.complete && (consumed < len))
+            {
+                if (hdr_len >= (int)sizeof(g_header_buf) - 1)
+                {
+                    result = NW_DL_ERR_RESPONSE;
+                    break;
+                }
+                g_header_buf[hdr_len++] = ((const char *)data)[consumed++];
+                if ((hdr_len >= 2) && (g_header_buf[hdr_len - 2] == '\r') &&
+                    (g_header_buf[hdr_len - 1] == '\n'))
+                {
+                    result = parse_header_line(g_header_buf, hdr_len, params->total_size, &header);
+                    hdr_len = 0;
+                }
+                if (result != NW_DL_OK) break;
+            }
+            if (result != NW_DL_OK) break;
+
+            while (consumed < len)
+            {
+                uint32_t available = len - consumed;
+                uint32_t remaining = params->total_size - offset - chunk_accum;
+                if (available > remaining)
+                {
+                    result = NW_DL_ERR_SIZE_MISMATCH;
+                    break;
+                }
+                uint32_t space = chunk_size - chunk_accum;
+                uint32_t copy = available < space ? available : space;
+                memcpy(g_chunk_buf + chunk_accum, (const uint8_t *)data + consumed, copy);
+                consumed += (uint16_t)copy;
+                chunk_accum += copy;
+
+                if ((chunk_accum == chunk_size) || (offset + chunk_accum == params->total_size))
+                {
+                    if (params->cb(params->ctx, offset, g_chunk_buf, chunk_accum) != NW_DL_OK)
+                    {
+                        result = NW_DL_ERR_CALLBACK;
+                        break;
+                    }
+                    offset += chunk_accum;
+                    chunk_accum = 0;
+                }
+            }
+            // netbuf_next返回1表示已移到最后一段；只有负数才表示没有下一段。
+        } while ((result == NW_DL_OK) && (netbuf_next(nbuf) >= 0));
+
+        netbuf_delete(nbuf);
+    }
+
+    if (result != NW_DL_OK)
     {
-        printf("[NWDL] DNS fail: %s err=%d\r\n", host, (int)err);
-        return NW_DL_ERR_DNS;
+        printf("[NWDL] response fail: %s header_line=%d body=%u expected=%u\r\n",
+               NetworkDownloader_ErrorString(result), hdr_len,
+               (unsigned)(offset + chunk_accum), (unsigned)params->total_size);
     }
-    printf("[NWDL] DNS OK: %s\r\n", ipaddr_ntoa(&ip));
+    return result;
+}
 
-    /* 3. TCP 连接 */
-    struct netconn *conn = netconn_new(NETCONN_TCP);
-    if (!conn)
+/* ===== HTTPS 下载路径（mbedTLS） =====
+ * 流程：DNS → TCP → TLS握手 → GET → 收头 → 收body → 回调
+ * TLS 给出平字节流，头和 body 都直接 recv 到缓冲。
+ *
+ * 与 fetch_http 的区别仅在第 3 步多了 TLS 握手，收发用 HttpsTls_Send/Recv 替代 netconn_write/recv。
+ */
+static nw_dl_status_t fetch_https(const nw_dl_params_t *params,
+                                  const char *host, uint16_t port,
+                                  const char *path, uint32_t chunk_size)
+{
+    nw_dl_status_t connected = download_connect(host, port);
+    if (connected != NW_DL_OK) return connected;
+    struct netconn *conn = g_download_conn;
+    uint32_t remaining = download_remaining();
+    if (remaining == 0U) return download_close(NW_DL_ERR_TIMEOUT);
+
+    /* 按BOS服务器域名和预置CA执行证书校验及握手。 */
+    https_tls_result_t tls_ret = HttpsTls_Connect(&g_tls_session, conn,
+                                                    host,
+                                                    g_https_ca_cert_der,
+                                                    g_https_ca_cert_der_len,
+                                                    remaining);
+    if (tls_ret != HTTPS_TLS_OK)
     {
-        printf("[NWDL] netconn_new fail\r\n");
-        return NW_DL_ERR_CONNECT;
+        printf("[NWDL] TLS handshake fail: %d\r\n", (int)tls_ret);
+        g_using_tls = g_tls_session.conn != NULL;
+        return download_close(tls_ret == HTTPS_TLS_ERR_TIMEOUT ? NW_DL_ERR_TIMEOUT : NW_DL_ERR_CONNECT);
     }
-    g_download_conn = conn;
-    netconn_set_recvtimeout(conn, 10000);  /* 10s recv 超时 */
+    g_using_tls = true;
+    printf("[NWDL] TLS connected\r\n");
 
-    err = netconn_connect(conn, &ip, port);
-    if (err != ERR_OK)
-    {
-        printf("[NWDL] connect fail err=%d\r\n", (int)err);
-        return download_close(NW_DL_ERR_CONNECT);
-    }
-    printf("[NWDL] TCP connected\r\n");
-
-    /* 4. 发 HTTP GET 请求 */
+    /* 4. 发 HTTP GET 请求（经 TLS 加密发送）
+     * 带 Authorization 头（如 params->auth_token 非空，如百度云 BOS 的临时 token） */
     char req[256];
     int req_len;
     if (params->auth_token && params->auth_token[0])
@@ -173,121 +416,75 @@ nw_dl_status_t NetworkDownloader_Fetch(const nw_dl_params_t *params)
     }
     if (req_len <= 0 || (size_t)req_len >= sizeof(req))
         return download_close(NW_DL_ERR_REQUEST);
-    err = netconn_write(conn, req, req_len, NETCONN_COPY);
-    if (err != ERR_OK)
+
+    int sent = HttpsTls_Send(&g_tls_session, (const uint8_t *)req, (size_t)req_len);
+    if (sent != req_len)
     {
-        printf("[NWDL] write request fail err=%d\r\n", (int)err);
-        return download_close(NW_DL_ERR_REQUEST);
+        printf("[NWDL] TLS send request fail\r\n");
+        return download_close(sent == -HTTPS_TLS_ERR_TIMEOUT ? NW_DL_ERR_TIMEOUT : NW_DL_ERR_REQUEST);
     }
 
-    /* 5. 收响应头（循环收直到找到 \r\n\r\n） */
-    static char hdr_buf[512] __attribute__((section(".bss.ccmram")));   /* 响应头缓冲 */
+    // 每收到完整一行就解析并释放空间，头结束后的残余字节仍按原顺序交给body。
+    nw_http_header_t header = {0};
     int hdr_len = 0;
-    int header_end_pos = -1;    /* \r\n\r\n 结束位置（body 起始在 hdr_buf 中的偏移） */
-    struct netbuf *nbuf = NULL;
-
-    /* body 残余：如果 header 和 body 在同一个 netbuf，保留 header 后面的 body 数据 */
-    static uint8_t body_residual[NW_DL_RX_BUF_SIZE] __attribute__((section(".bss.ccmram")));
-    uint32_t body_residual_len = 0;
-
-    while (header_end_pos < 0 && hdr_len < (int)sizeof(hdr_buf) - 1)
+    int header_end_pos = 0;
+    while (!header.complete)
     {
-        err = netconn_recv(conn, &nbuf);
-        if (err != ERR_OK)
-        {
-            printf("[NWDL] recv header fail err=%d\r\n", (int)err);
+        if (hdr_len >= (int)sizeof(g_header_buf) - 1)
             return download_close(NW_DL_ERR_RESPONSE);
-        }
-        void *data;
-        uint16_t dlen;
-        netbuf_data(nbuf, &data, &dlen);
-        int copy = dlen;
-        if (hdr_len + copy >= (int)sizeof(hdr_buf)) copy = sizeof(hdr_buf) - 1 - hdr_len;
-        memcpy(hdr_buf + hdr_len, data, copy);
-        hdr_len += copy;
-
-        /* 找 \r\n\r\n */
-        for (int i = 3; i < hdr_len; i++)
+        int got = HttpsTls_Recv(&g_tls_session, (uint8_t *)g_header_buf + hdr_len,
+                                 (size_t)(sizeof(g_header_buf) - 1 - hdr_len));
+        if (got <= 0)
         {
-            if (hdr_buf[i-3] == '\r' && hdr_buf[i-2] == '\n' &&
-                hdr_buf[i-1] == '\r' && hdr_buf[i] == '\n')
+            printf("[NWDL] TLS header incomplete: %d\r\n", got);
+            return download_close(got == -HTTPS_TLS_ERR_TIMEOUT ? NW_DL_ERR_TIMEOUT : NW_DL_ERR_RESPONSE);
+        }
+        hdr_len += got;
+        int line_start = 0;
+        for (int i = 1; i < hdr_len; ++i)
+        {
+            if (g_header_buf[i - 1] != '\r' || g_header_buf[i] != '\n') continue;
+            nw_dl_status_t result = parse_header_line(g_header_buf + line_start, i + 1 - line_start,
+                                                       params->total_size, &header);
+            if (result != NW_DL_OK)
             {
-                header_end_pos = i + 1;  /* body 起始偏移 */
+                printf("[NWDL] header fail: %s\r\n", NetworkDownloader_ErrorString(result));
+                return download_close(result);
+            }
+            line_start = i + 1;
+            if (header.complete)
+            {
+                header_end_pos = line_start;
                 break;
             }
         }
-
-        if (header_end_pos >= 0)
+        if (!header.complete && line_start != 0)
         {
-            /* header 后面的残余数据是 body 的开头 */
-            int residual_start = header_end_pos;  /* body 起始在 hdr_buf 中的偏移 */
-            /* 但残余可能不在 hdr_buf 里（如果 copy 被截断了），而是还在 netbuf 里 */
-            if (copy < dlen)
-            {
-                /* netbuf 里还有未拷贝的数据，是 body 的开头 */
-                uint16_t remain = dlen - copy;
-                if (remain > sizeof(body_residual)) remain = sizeof(body_residual);
-                memcpy(body_residual, (uint8_t *)data + copy, remain);
-                body_residual_len = remain;
-            }
-            else if (residual_start < hdr_len)
-            {
-                /* hdr_buf 里 header 后面还有 body 数据 */
-                int remain = hdr_len - residual_start;
-                if (remain > (int)sizeof(body_residual)) remain = sizeof(body_residual);
-                memcpy(body_residual, hdr_buf + residual_start, remain);
-                body_residual_len = (uint32_t)remain;
-                hdr_len = residual_start;  /* 截断 hdr_buf 到 header 结束 */
-            }
+            hdr_len -= line_start;
+            memmove(g_header_buf, g_header_buf + line_start, (size_t)hdr_len);
         }
+    }
+    uint32_t content_len = params->total_size;
 
-        netbuf_delete(nbuf);
-        nbuf = NULL;
-    }
-    hdr_buf[hdr_len] = '\0';
-
-    if (header_end_pos < 0)
-    {
-        printf("[NWDL] header incomplete\r\n");
-        return download_close(NW_DL_ERR_RESPONSE);
-    }
-
-    /* 6. 解析状态码和 Content-Length */
-    int status = parse_http_status(hdr_buf, hdr_len);
-    if (status != 200 && status != 206)
-    {
-        printf("[NWDL] HTTP status %d\r\n", status);
-        return download_close(NW_DL_ERR_HTTP_STATUS);
-    }
-    int32_t content_len = parse_content_length(hdr_buf, hdr_len);
-    if (content_len < 0)
-    {
-        printf("[NWDL] no Content-Length\r\n");
-        return download_close(NW_DL_ERR_NO_CONTENT_LEN);
-    }
-    if ((uint32_t)content_len != params->total_size)
-    {
-        printf("[NWDL] size mismatch: got %ld expected %u\r\n",
-               (long)content_len, (unsigned)params->total_size);
-        return download_close(NW_DL_ERR_SIZE_MISMATCH);
-    }
-    printf("[NWDL] HTTP %d, Content-Length=%ld\r\n", status, (long)content_len);
-
-    /* 7. 循环收 body，每 chunk_size 调回调 */
-    static uint8_t chunk_buf[NW_DL_RX_BUF_SIZE] __attribute__((section(".bss.ccmram")));  /* body 分块缓冲 */
+    /* 收 body：先处理 header 同包残余（header_end_pos..hdr_len 之间的 body 数据） */
     uint32_t offset = 0;
-    uint32_t chunk_accum = 0;   /* 当前 chunk 累积字节数 */
+    uint32_t chunk_accum = 0;
 
-    /* 先处理 header 同包带来的 body 残余 */
-    if (body_residual_len > 0)
+    uint32_t body_in_hdr = (uint32_t)(hdr_len - header_end_pos);
+    if (body_in_hdr > params->total_size)
+        return download_close(NW_DL_ERR_SIZE_MISMATCH);
+    uint32_t consumed = 0U;
+    while (consumed < body_in_hdr)
     {
-        uint32_t copy = body_residual_len;
-        if (copy > chunk_size) copy = chunk_size;
-        memcpy(chunk_buf, body_residual, copy);
-        chunk_accum = copy;
+        uint32_t copy = body_in_hdr - consumed;
+        uint32_t space = chunk_size - chunk_accum;
+        if (copy > space) copy = space;
+        memcpy(g_chunk_buf + chunk_accum, g_header_buf + header_end_pos + consumed, copy);
+        chunk_accum += copy;
+        consumed += copy;
         if (chunk_accum >= chunk_size || offset + chunk_accum >= (uint32_t)content_len)
         {
-            nw_dl_status_t cb_ret = params->cb(params->ctx, offset, chunk_buf, chunk_accum);
+            nw_dl_status_t cb_ret = params->cb(params->ctx, offset, g_chunk_buf, chunk_accum);
             if (cb_ret != NW_DL_OK)
             {
                 printf("[NWDL] callback error at residual offset=%u\r\n", (unsigned)offset);
@@ -298,65 +495,45 @@ nw_dl_status_t NetworkDownloader_Fetch(const nw_dl_params_t *params)
         }
     }
 
+    /* 8. 循环收剩余 body，按 chunk_size 分块回调 */
     while (offset < (uint32_t)content_len)
     {
-        err = netconn_recv(conn, &nbuf);
-        if (err != ERR_OK)
+        uint32_t space = chunk_size - chunk_accum;
+        uint32_t remaining = (uint32_t)content_len - offset - chunk_accum;
+        if (space > remaining) space = remaining;
+        int got = HttpsTls_Recv(&g_tls_session, g_chunk_buf + chunk_accum, space);
+        if (got < 0)
         {
-            if (err == ERR_CLSD || err == ERR_CONN) break;  /* 服务端关连接 */
-            printf("[NWDL] recv body fail err=%d at offset=%u\r\n", (int)err, (unsigned)offset);
-            return download_close(NW_DL_ERR_RECEIVE);
+            printf("[NWDL] TLS recv body fail at offset=%u\r\n", (unsigned)offset);
+            return download_close(got == -HTTPS_TLS_ERR_TIMEOUT ? NW_DL_ERR_TIMEOUT : NW_DL_ERR_RECEIVE);
         }
+        if (got == 0) break;  /* EOF：服务器关闭连接 */
 
-        /* 遍历 netbuf 的所有段（pbuf 链可能有多段） */
-        void *seg_data = NULL;
-        uint16_t seg_len = 0;
-
-        do {
-            /* 每段重新获取数据指针（netbuf_next 后 seg_data/seg_len 失效） */
-            netbuf_data(nbuf, &seg_data, &seg_len);
-            uint16_t seg_consumed = 0;
-            while (seg_consumed < seg_len && offset + chunk_accum < (uint32_t)content_len)
+        chunk_accum += (uint32_t)got;
+        /* 累积够一块或到文件末尾就回调写 Flash */
+        if (chunk_accum >= chunk_size || offset + chunk_accum >= (uint32_t)content_len)
+        {
+            nw_dl_status_t cb_ret = params->cb(params->ctx, offset, g_chunk_buf, chunk_accum);
+            if (cb_ret != NW_DL_OK)
             {
-                uint16_t avail = seg_len - seg_consumed;
-                uint32_t space = chunk_size - chunk_accum;
-                uint32_t copy = (avail < space) ? avail : space;
-
-                memcpy(chunk_buf + chunk_accum, (uint8_t *)seg_data + seg_consumed, copy);
-                chunk_accum += copy;
-                seg_consumed += (uint16_t)copy;
-
-                /* chunk 满或包结束 → 调回调 */
-                if (chunk_accum >= chunk_size || offset + chunk_accum >= (uint32_t)content_len)
-                {
-                    nw_dl_status_t cb_ret = params->cb(params->ctx, offset, chunk_buf, chunk_accum);
-                    if (cb_ret != NW_DL_OK)
-                    {
-                        printf("[NWDL] callback error at offset=%u\r\n", (unsigned)offset);
-                        netbuf_delete(nbuf);
-                        return download_close(NW_DL_ERR_CALLBACK);
-                    }
-                    offset += chunk_accum;
-                    chunk_accum = 0;
-                }
+                printf("[NWDL] callback error at offset=%u\r\n", (unsigned)offset);
+                return download_close(NW_DL_ERR_CALLBACK);
             }
-        } while (netbuf_next(nbuf) == ERR_OK);  /* 移到下一段，回 do 开头重新调 netbuf_data */
-
-        netbuf_delete(nbuf);
-        nbuf = NULL;
+            offset += chunk_accum;
+            chunk_accum = 0;
+        }
     }
 
-    /* 处理残余 */
+    /* 最后一块不足 chunk_size 也要回调 */
     if (chunk_accum > 0)
     {
-        nw_dl_status_t cb_ret = params->cb(params->ctx, offset, chunk_buf, chunk_accum);
+        nw_dl_status_t cb_ret = params->cb(params->ctx, offset, g_chunk_buf, chunk_accum);
         if (cb_ret != NW_DL_OK)
-        {
             return download_close(NW_DL_ERR_CALLBACK);
-        }
         offset += chunk_accum;
     }
 
+    /* 校验完整性：收到的总字节数必须等于 Content-Length */
     if (offset != (uint32_t)content_len)
     {
         printf("[NWDL] incomplete: got %u expected %ld\r\n", (unsigned)offset, (long)content_len);
@@ -369,6 +546,93 @@ nw_dl_status_t NetworkDownloader_Fetch(const nw_dl_params_t *params)
     return NW_DL_OK;
 }
 
+/* ===== HTTP 下载路径（netconn 明文） ===== */
+static nw_dl_status_t fetch_http(const nw_dl_params_t *params,
+                                 const char *host, uint16_t port,
+                                 const char *path, uint32_t chunk_size)
+{
+    nw_dl_status_t connected = download_connect(host, port);
+    if (connected != NW_DL_OK) return connected;
+    struct netconn *conn = g_download_conn;
+
+    /* 3. 发 HTTP GET（明文） */
+    char req[256];
+    int req_len;
+    if (params->auth_token && params->auth_token[0])
+    {
+        req_len = snprintf(req, sizeof(req),
+            "GET %s HTTP/1.1\r\nHost: %s\r\nAuthorization: %s\r\nConnection: close\r\n\r\n",
+            path, host, params->auth_token);
+    }
+    else
+    {
+        req_len = snprintf(req, sizeof(req),
+            "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n",
+            path, host);
+    }
+    if (req_len <= 0 || (size_t)req_len >= sizeof(req))
+        return download_close(NW_DL_ERR_REQUEST);
+    uint32_t wait_ms = download_remaining();
+    if (wait_ms > NW_DL_IO_TIMEOUT_MS) wait_ms = NW_DL_IO_TIMEOUT_MS;
+    netconn_set_sendtimeout(conn, wait_ms);
+    if (!download_wait(wait_ms)) return download_close(NW_DL_ERR_TIMEOUT);
+    err_t err = netconn_write(conn, req, req_len, NETCONN_COPY);
+    if (!Monitor_UpgradeProgress() || download_remaining() == 0U)
+        return download_close(NW_DL_ERR_TIMEOUT);
+    if (err != ERR_OK)
+    {
+        printf("[NWDL] write request fail err=%d\r\n", (int)err);
+        return download_close(NW_DL_ERR_REQUEST);
+    }
+
+    nw_dl_status_t result = receive_response(conn, params, chunk_size);
+    result = download_close(result);
+    if (result == NW_DL_OK)
+        printf("[NWDL] download complete: %u bytes\r\n", (unsigned)params->total_size);
+    return result;
+}
+
+/* ===== 入口：解析 URL，分发 HTTP / HTTPS =====
+ * 对外接口，由 network_upgrade.c 的升级任务调用。
+ * 根据 URL 协议前缀自动选择 HTTP 或 HTTPS 下载路径。
+ * chunk_size 默认 1016（受 Flash 写入单元限制）。 */
+nw_dl_status_t NetworkDownloader_Fetch(const nw_dl_params_t *params)
+{
+    char host[64];
+    uint16_t port;
+    const char *path;
+    bool is_https;
+
+    if (!params || !params->url || !params->cb) return NW_DL_ERR_URL;
+    if (params->total_size == 0U) return NW_DL_ERR_SIZE_MISMATCH;
+
+    g_timeout_ms = params->timeout_ms == 0U ? 120000U : params->timeout_ms;
+    if (g_timeout_ms > INT32_MAX) return NW_DL_ERR_TIMEOUT;
+    g_started_ms = HAL_GetTick();
+
+    /* 清理上次残留连接（防止上次下载失败后连接泄漏） */
+    if (download_close(NW_DL_OK) != NW_DL_OK) return NW_DL_ERR_INTERNAL;
+
+    /* chunk_size 限制：0=用默认，超 1016=截到 1016（Flash 写入块大小限制） */
+    uint32_t chunk_size = params->chunk_size;
+    if (chunk_size == 0 || chunk_size > 1016) chunk_size = 1016;
+
+    /* 解析 URL，确定协议/host/port/path */
+    if (parse_url(params->url, host, sizeof(host), &port, &path, &is_https) != 0)
+    {
+        printf("[NWDL] URL parse fail\r\n");
+        return NW_DL_ERR_URL;
+    }
+    printf("[NWDL] %s host=%s port=%u\r\n",
+           is_https ? "HTTPS" : "HTTP", host, (unsigned)port);
+
+    nw_dl_status_t result = is_https ? fetch_https(params, host, port, path, chunk_size)
+                                     : fetch_http(params, host, port, path, chunk_size);
+    // 最后一块的存储回调和连接释放也计入总期限，逾期不得返回下载成功。
+    return result == NW_DL_OK && download_remaining() == 0U ? NW_DL_ERR_TIMEOUT : result;
+}
+
+/* 错误码转可读字符串，用于日志输出 */
 const char *NetworkDownloader_ErrorString(nw_dl_status_t status)
 {
     switch (status)

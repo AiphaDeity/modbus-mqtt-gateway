@@ -18,9 +18,9 @@ typedef enum
   APP_UPGRADE_RESULT_ROLLED_BACK
 } AppUpgradeResult;
 
-// 自检完成后连续健康1s；从App入口起总预算30s，不把稳定窗口叠加到总期限外。
+// 自检完成后连续健康1s；含90s存储恢复，总预算120s，稳定窗口不叠加到期限外。
 #define APP_UPGRADE_STABLE_MS 1000U
-#define APP_UPGRADE_DEADLINE_MS 30000U
+#define APP_UPGRADE_DEADLINE_MS 120000U
 
 /*
  * 启动任务在创建业务任务前调用一次，now_ms为单调毫秒时基。
@@ -46,7 +46,7 @@ AppUpgradeResult App_UpgradeGetResult(void);
 /*
  * 仅监督任务调用，now_ms 为同一单调毫秒时基；platform_healthy 为平台检查，
  * product_healthy须来自明确的产品自检结果，不能用任务已创建/网络在线代替。
- * 平台与产品同时持续健康1s才请求确认；总计30s未确认则请求复位。
+ * 平台与产品同时持续健康1s才请求确认；总计120s未确认则请求复位。
  * 返回RESET后CanCommit仍为false，由监督任务写请求、执行屏障并软件复位。
  */
 AppUpgradeAction App_UpgradePoll(uint32_t now_ms, bool platform_healthy, bool product_healthy);

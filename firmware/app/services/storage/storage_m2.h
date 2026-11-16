@@ -18,21 +18,21 @@
 #define STORAGE_M2_WRITE_Q_DEPTH    8
 #define STORAGE_M2_FETCH_Q_DEPTH    1   /* 单在途协议：M2 发一个 fetch_req 等一个 fetch_resp，depth=1 够 */
 #define STORAGE_M2_ACK_Q_DEPTH      8
-#define STORAGE_M2_FETCH_BATCH_MAX  10
+#define STORAGE_M2_FETCH_BATCH_MAX  4
 
 /* 4.1 M2 → M3：写入一条待持久化记录（离线缓存）。值传递，put 即拷贝 */
 typedef struct {
     uint8_t  kind;            /* 1=telemetry 2=event */
     uint64_t seq;             /* M2 经 storage_seq_alloc 分配，单调递增 */
     uint64_t captured_at_ms;  /* Unix 毫秒；未校时 = 0 */
-    uint16_t payload_len;     /* ≤512 */
-    uint8_t  payload[512];    /* JSON 原文 */
+    uint16_t payload_len;     /* ≤RECORD_PAYLOAD_MAX */
+    uint8_t  payload[RECORD_PAYLOAD_MAX];    /* JSON 原文 */
 } storage_write_req_t;
 
 /* 4.2 M2 → M3：补传拉取请求 */
 typedef struct {
     uint32_t req_id;                /* M2 生成，匹配请求/应答 */
-    uint16_t max_count;             /* ≤10 */
+    uint16_t max_count;             /* ≤STORAGE_M2_FETCH_BATCH_MAX */
 } storage_fetch_req_t;
 
 /* 4.3 M3 → M2：补传数据应答（单在途，req_id 匹配） */
@@ -42,7 +42,7 @@ typedef struct {
     record_out_t records[STORAGE_M2_FETCH_BATCH_MAX];
 } storage_fetch_resp_t;
 
-/* 4.4 M2 → M3：上传成功回执（按 seq 水位删除，取本批最大 seq） */
+// 4.4 M2 → M3：仅提交已发送且逐条业务确认的连续批次前缀，不能取任意最大seq。
 typedef struct {
     uint64_t ack_upto_seq;
 } storage_ack_t;

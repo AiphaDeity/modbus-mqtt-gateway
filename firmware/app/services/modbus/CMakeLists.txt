@@ -5,6 +5,7 @@ set(MODBUS_SRCS
     ${CMAKE_CURRENT_SOURCE_DIR}/mb_api.c
     ${CMAKE_CURRENT_SOURCE_DIR}/mb_pointmap.c
     ${CMAKE_CURRENT_SOURCE_DIR}/mb_runtime.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/mb_fixed_points.c
 )
 
 add_library(modbus STATIC ${MODBUS_SRCS})
@@ -20,6 +21,7 @@ add_library(modbus STATIC ${MODBUS_SRCS})
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/UARTCallback.c)
 
 target_include_directories(modbus PUBLIC
+    ${CMAKE_CURRENT_LIST_DIR}/../../common
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/Config
 )

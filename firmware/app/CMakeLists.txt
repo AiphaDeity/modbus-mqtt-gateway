@@ -41,6 +41,9 @@ if(GATEWAY_ENABLE_M2)
 endif()
 add_subdirectory(bsp)
 add_subdirectory(integration)
+if(GATEWAY_ENABLE_M2)
+    add_subdirectory(services/mqtt)
+endif()
 add_subdirectory(services/modbus)
 add_subdirectory(services/storage)
 if(GATEWAY_ENABLE_M2)
@@ -51,6 +54,9 @@ endif()
 set(GATEWAY_APP_VECTOR_OFFSET "0x00000000" CACHE STRING "Application vector table offset")
 
 target_compile_definitions(STM32_Drivers PRIVATE USER_VECT_TAB_ADDRESS VECT_TAB_OFFSET=${GATEWAY_APP_VECTOR_OFFSET})
+
+# 保留生成的_sbrk边界检查，由现有内存模块记录C堆实际扩展峰值。
+target_link_options(${CMAKE_PROJECT_NAME} PRIVATE "LINKER:--wrap=_sbrk")
 
 
 # Link directories setup
@@ -73,9 +79,11 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/../shared/upgrade_trust.c
 )
 
-# 复用Boot同一版本的安全包算法；不引入Boot驱动、安装器或测试密钥。
-set(UPGRADE_MBEDTLS_DIR ${CMAKE_CURRENT_LIST_DIR}/../bootloader/third_party/mbedtls)
-set(UPGRADE_MBEDTLS_SOURCES
+# App与Boot使用同一份密码库，分别按各自配置裁剪。
+set(UPGRADE_MBEDTLS_DIR ${CMAKE_CURRENT_LIST_DIR}/../third_party/mbedtls)
+
+# 基础安全包源（升级验签 + TLS 共用）
+set(MBEDTLS_BASE_SOURCES
     ${UPGRADE_MBEDTLS_DIR}/library/sha256.c
     ${UPGRADE_MBEDTLS_DIR}/library/aes.c
     ${UPGRADE_MBEDTLS_DIR}/library/gcm.c
@@ -92,21 +100,74 @@ set(UPGRADE_MBEDTLS_SOURCES
     ${UPGRADE_MBEDTLS_DIR}/library/asn1write.c
     ${UPGRADE_MBEDTLS_DIR}/library/platform_util.c
 )
-target_sources(${CMAKE_PROJECT_NAME} PRIVATE ${UPGRADE_MBEDTLS_SOURCES})
-set_source_files_properties(
+
+# 升级验签源文件列表（用 upgrade_stage_mbedtls_config.h 或 TLS 配置编译）
+set(UPGRADE_SOURCE_FILES
     ${CMAKE_CURRENT_LIST_DIR}/services/upgrade/upgrade_tf.c
     ${CMAKE_CURRENT_LIST_DIR}/services/upgrade/upgrade_stage.c
     ${CMAKE_CURRENT_LIST_DIR}/services/upgrade/upgrade_stage_auth.c
     ${CMAKE_CURRENT_LIST_DIR}/../shared/upgrade_package.c
-    ${UPGRADE_MBEDTLS_SOURCES}
-    PROPERTIES COMPILE_DEFINITIONS MBEDTLS_CONFIG_FILE="upgrade_stage_mbedtls_config.h"
 )
+
+if(GATEWAY_ENABLE_M2)
+    # TLS固定输入区使用同版本库计算的完整缓冲长度，避免手工估计记录开销。
+    set_property(SOURCE ${CMAKE_CURRENT_LIST_DIR}/services/network_upgrade/https_tls.c
+        APPEND PROPERTY INCLUDE_DIRECTORIES ${UPGRADE_MBEDTLS_DIR}/library)
+    # ===== M2 启用：编译 TLS 客户端 =====
+    # 统一使用 https_tls_mbedtls_config.h（包含 upgrade_mbedtls_config.h + BLOCK_CIPHER_C + TLS 宏）
+    # 使 platform_util.c 的 mbedtls_platform_gmtime_r 等函数被编译（需 HAVE_TIME_DATE）
+    set(TLS_MBEDTLS_SOURCES
+        ${UPGRADE_MBEDTLS_DIR}/library/ssl_tls.c
+        ${UPGRADE_MBEDTLS_DIR}/library/ssl_tls12_client.c
+        ${UPGRADE_MBEDTLS_DIR}/library/ssl_client.c
+        ${UPGRADE_MBEDTLS_DIR}/library/ssl_msg.c
+        ${UPGRADE_MBEDTLS_DIR}/library/ssl_ciphersuites.c
+        ${UPGRADE_MBEDTLS_DIR}/library/x509.c
+        ${UPGRADE_MBEDTLS_DIR}/library/x509_crt.c
+        ${UPGRADE_MBEDTLS_DIR}/library/x509_crl.c
+        ${UPGRADE_MBEDTLS_DIR}/library/pk.c
+        ${UPGRADE_MBEDTLS_DIR}/library/pk_wrap.c
+        ${UPGRADE_MBEDTLS_DIR}/library/pkparse.c
+        ${UPGRADE_MBEDTLS_DIR}/library/pk_ecc.c
+        ${UPGRADE_MBEDTLS_DIR}/library/rsa.c
+        ${UPGRADE_MBEDTLS_DIR}/library/rsa_alt_helpers.c
+        ${UPGRADE_MBEDTLS_DIR}/library/cipher.c
+        ${UPGRADE_MBEDTLS_DIR}/library/cipher_wrap.c
+        ${UPGRADE_MBEDTLS_DIR}/library/entropy.c
+        ${UPGRADE_MBEDTLS_DIR}/library/ctr_drbg.c
+        ${UPGRADE_MBEDTLS_DIR}/library/ecdh.c
+        ${UPGRADE_MBEDTLS_DIR}/library/pem.c
+        ${UPGRADE_MBEDTLS_DIR}/library/base64.c
+        ${UPGRADE_MBEDTLS_DIR}/library/md.c
+        ${UPGRADE_MBEDTLS_DIR}/library/oid.c
+        ${UPGRADE_MBEDTLS_DIR}/library/platform.c
+    )
+    target_sources(${CMAKE_PROJECT_NAME} PRIVATE ${MBEDTLS_BASE_SOURCES} ${TLS_MBEDTLS_SOURCES})
+    # 统一 TLS 配置（基础 + TLS + 升级验签 + 下载器 + 桩）
+    set_source_files_properties(
+        ${MBEDTLS_BASE_SOURCES} ${TLS_MBEDTLS_SOURCES}
+        ${UPGRADE_SOURCE_FILES}
+        ${CMAKE_CURRENT_LIST_DIR}/services/network_upgrade/https_tls.c
+        ${CMAKE_CURRENT_LIST_DIR}/services/network_upgrade/https_tls_stubs.c
+        ${CMAKE_CURRENT_LIST_DIR}/services/network_upgrade/network_upgrade_downloader.c
+        PROPERTIES COMPILE_DEFINITIONS MBEDTLS_CONFIG_FILE="https_tls_mbedtls_config.h"
+    )
+else()
+    # ===== M2 禁用：仅升级验签，无 TLS =====
+    target_sources(${CMAKE_PROJECT_NAME} PRIVATE ${MBEDTLS_BASE_SOURCES})
+    set_source_files_properties(
+        ${MBEDTLS_BASE_SOURCES}
+        ${UPGRADE_SOURCE_FILES}
+        PROPERTIES COMPILE_DEFINITIONS MBEDTLS_CONFIG_FILE="upgrade_stage_mbedtls_config.h"
+    )
+endif()
 
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined include paths
     ${CMAKE_CURRENT_LIST_DIR}/common
     ${CMAKE_CURRENT_LIST_DIR}/services/upgrade
+    ${CMAKE_CURRENT_LIST_DIR}/../shared                # upgrade_mbedtls_config.h + https_tls_mbedtls_config.h
     ${UPGRADE_MBEDTLS_DIR}/include
 )
 

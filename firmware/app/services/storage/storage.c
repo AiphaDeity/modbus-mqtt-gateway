@@ -195,6 +195,7 @@ void Storage_Task(void *argument)
 #endif
 
     uint32_t last_floor_tick = HAL_GetTick() - STORAGE_TIMEFLOOR_STEP_SEC * 1000U;
+    uint32_t last_time_check_tick = HAL_GetTick();
     uint32_t last_cd_poll_tick = HAL_GetTick();
     uint32_t last_retry_tick = 0U;
     bool last_card_present = sdcard_physical_present();
@@ -204,6 +205,12 @@ void Storage_Task(void *argument)
             Monitor_ReportFatal(APP_MODULE_STORAGE);
             osThreadExit();
             return;
+        }
+
+        /* RTC校时或失效后同步更新就绪状态，沿用现有Storage任务和时间服务。 */
+        if ((uint32_t)(HAL_GetTick() - last_time_check_tick) >= 1000U) {
+            last_time_check_tick = HAL_GetTick();
+            App_SetResourceReady(APP_RESOURCE_TIME, storage_time_is_valid());
         }
 
         bool now_present = sdcard_physical_present();
