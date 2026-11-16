@@ -28,31 +28,57 @@ static mbedtls_entropy_context s_entropy;
 static mbedtls_ctr_drbg_context s_ctr_drbg;
 static uint8_t s_tls_input_buf[MBEDTLS_SSL_IN_BUFFER_LEN]
   __attribute__((section(".bss.ccmram"), aligned(8)));
-static bool s_tls_input_used;
+static uint8_t s_tls_output_buf[MBEDTLS_SSL_OUT_BUFFER_LEN]
+  __attribute__((section(".bss.ccmram"), aligned(8)));
+static uint8_t s_tls_buffers_used;
 
-// 仅TLS输入区使用固定CCM槽；其他密码对象继续由原C堆分配。
+// TLS收发区使用固定CCM槽；BIO经CPU复制，不把CCM地址交给网口DMA。
 static void *tls_calloc(size_t count, size_t size)
 {
-  if (count != 1U || size != sizeof(s_tls_input_buf)) return calloc(count, size);
+  uint8_t slot = 0U;
+  void *buffer = NULL;
+  if (count == 1U && size == sizeof(s_tls_input_buf))
+  {
+    slot = 1U;
+    buffer = s_tls_input_buf;
+  }
+  else if (count == 1U && size == sizeof(s_tls_output_buf))
+  {
+    slot = 2U;
+    buffer = s_tls_output_buf;
+  }
+  else
+  {
+    return calloc(count, size);
+  }
   taskENTER_CRITICAL();
-  bool available = !s_tls_input_used;
-  if (available) s_tls_input_used = true;
+  bool available = (s_tls_buffers_used & slot) == 0U;
+  if (available) s_tls_buffers_used |= slot;
   taskEXIT_CRITICAL();
   if (!available) return NULL;
-  memset(s_tls_input_buf, 0, sizeof(s_tls_input_buf));
-  return s_tls_input_buf;
+  memset(buffer, 0, size);
+  return buffer;
 }
 
-// 归还CCM输入槽，其他对象交回原C堆；mbedTLS在释放输入区前清零内容。
+// 分别归还CCM收发槽，其他密码对象仍交回原C堆。
 static void tls_free(void *pointer)
 {
-  if (pointer != s_tls_input_buf)
+  uint8_t slot;
+  if (pointer == s_tls_input_buf)
+  {
+    slot = 1U;
+  }
+  else if (pointer == s_tls_output_buf)
+  {
+    slot = 2U;
+  }
+  else
   {
     free(pointer);
     return;
   }
   taskENTER_CRITICAL();
-  s_tls_input_used = false;
+  s_tls_buffers_used &= (uint8_t)~slot;
   taskEXIT_CRITICAL();
 }
 

@@ -576,12 +576,14 @@ static nw_dl_status_t fetch_http(const nw_dl_params_t *params,
     if (wait_ms > NW_DL_IO_TIMEOUT_MS) wait_ms = NW_DL_IO_TIMEOUT_MS;
     netconn_set_sendtimeout(conn, wait_ms);
     if (!download_wait(wait_ms)) return download_close(NW_DL_ERR_TIMEOUT);
-    err_t err = netconn_write(conn, req, req_len, NETCONN_COPY);
+    size_t written = 0U;
+    err_t err = netconn_write_partly(conn, req, (size_t)req_len, NETCONN_COPY, &written);
     if (!Monitor_UpgradeProgress() || download_remaining() == 0U)
         return download_close(NW_DL_ERR_TIMEOUT);
-    if (err != ERR_OK)
+    if (err != ERR_OK || written != (size_t)req_len)
     {
-        printf("[NWDL] write request fail err=%d\r\n", (int)err);
+        printf("[NWDL] write request fail err=%d sent=%u/%u\r\n",
+               (int)err, (unsigned)written, (unsigned)req_len);
         return download_close(NW_DL_ERR_REQUEST);
     }
 

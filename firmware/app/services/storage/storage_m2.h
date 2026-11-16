@@ -15,10 +15,10 @@
  *     再发下一个
  */
 
-#define STORAGE_M2_WRITE_Q_DEPTH    8
+#define STORAGE_M2_WRITE_Q_DEPTH    4
 #define STORAGE_M2_FETCH_Q_DEPTH    1   /* 单在途协议：M2 发一个 fetch_req 等一个 fetch_resp，depth=1 够 */
 #define STORAGE_M2_ACK_Q_DEPTH      8
-#define STORAGE_M2_FETCH_BATCH_MAX  4
+#define STORAGE_M2_FETCH_BATCH_MAX  1
 
 /* 4.1 M2 → M3：写入一条待持久化记录（离线缓存）。值传递，put 即拷贝 */
 typedef struct {

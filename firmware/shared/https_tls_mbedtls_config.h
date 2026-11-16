@@ -1,10 +1,11 @@
 /*
  * HTTPS下载与升级认证共用的mbedTLS配置。
  *
- * 目标服务器：百度云 BOS bj.bcebos.com:443
- *   TLS1.2 / ECDHE-RSA-AES128-GCM-SHA256 / 单向服务器认证 / RSA-2048 / 必须 SNI
+ * 目标服务器：百度云 BOS modbus-mqtt-firmware.gz.bcebos.com:443
+ *   TLS1.2 / ECDHE-RSA-AES128-GCM-SHA256 / 单向服务器认证 / 必须 SNI
+ *   当前叶证书RSA-2048、中间CA RSA-4096；握手预算必须包含4096位验签临时分配。
  *
- * 输入6 KiB用于证书消息重组，输出2 KiB；输入区由TLS分配钩子放入CCM。
+ * 输入6 KiB用于证书消息重组，输出2 KiB；收发区由TLS分配钩子放入CCM。
  * 升级认证和TLS使用同一配置编译，保持共用密码对象布局一致。
  */
 #ifndef HTTPS_TLS_MBEDTLS_CONFIG_H

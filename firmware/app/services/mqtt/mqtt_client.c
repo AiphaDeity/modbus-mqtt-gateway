@@ -260,9 +260,13 @@ static err_t mqtt_write(const void *data, size_t size)  // 底层TCP发送：把
         g_connected = false;  // 登记失败置连接断开
         return ERR_ABRT;  // 返回中止错误
     }
-    err_t err = netconn_write(g_conn, data, size, NETCONN_COPY);  // 真正调LwIP发送，NETCONN_COPY表示拷到内部pbuf
-    if (!mqtt_health_progress())  // 发送后喂狗
-        err = ERR_ABRT;  // 喂狗失败改错误码为中止
+    size_t written = 0U;
+    err_t err = netconn_write_partly(g_conn, data, size, NETCONN_COPY, &written);
+    // 配置发送超时后可能只写出部分帧，不能继续在该连接上拼接下一帧。
+    if (err == ERR_OK && written != size)
+        err = ERR_TIMEOUT;
+    if (!mqtt_health_progress())  // 发送后报告任务进展
+        err = ERR_ABRT;  // 监督拒绝则中止
     if (err != ERR_OK)  // 发送没成功
         g_connected = false;  // 置连接断开，后面会触发重连
     return err;  // 返回发送结果

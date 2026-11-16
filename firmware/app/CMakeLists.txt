@@ -51,6 +51,14 @@ if(GATEWAY_ENABLE_M2)
     add_subdirectory(services/network_upgrade)
 endif()
 
+# 云端配置接入后需适配448KiB App区；仅优化配置解析和MQTT代码体积，保留调试信息。
+set_source_files_properties(
+    ${CMAKE_CURRENT_SOURCE_DIR}/services/config/config.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/services/config/mini_json.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/services/mqtt/mqtt_client.c
+    PROPERTIES COMPILE_OPTIONS "-Os"
+)
+
 # Configure the application vector table offset.
 set(GATEWAY_APP_VECTOR_OFFSET "0x00000000" CACHE STRING "Application vector table offset")
 
