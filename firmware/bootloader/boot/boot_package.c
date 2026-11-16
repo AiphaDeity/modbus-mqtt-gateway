@@ -31,7 +31,7 @@ static bool Checkpoint(void *context, uint32_t started_ms, uint32_t timeout_ms, 
 // 记录验签失败的库错误码；调试构建额外采集分段周期数。
 static void SignatureEvent(void *context, UpgradePackageSignatureEvent event, int result)
 {
-#if defined(DEBUG) || defined(BOOT_PACKAGE_RECEIVE_TEST)
+#if defined(DEBUG)
   Boot_PackageTiming *timing = context;
   switch (event)
   {

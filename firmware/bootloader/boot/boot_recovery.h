@@ -3,7 +3,13 @@
 
 #include "boot_install.h"
 #include "boot_upgrade_state.h"
-#include "boot_package_receive.h"
+
+typedef enum
+{
+  BOOT_RECEIVE_NO_REQUEST,
+  BOOT_RECEIVE_COMMAND,
+  BOOT_RECEIVE_PACKAGE
+} BootReceiveResult;
 
 // 升级日志区内另用12KiB：两份4KiB恢复记录和一个4KiB启动屏障，不与普通日志重叠。
 #define BOOT_RECOVERY_LOG_OFFSET UPGRADE_STATE_RECOVERY_OFFSET

@@ -90,18 +90,16 @@ build/BootSizeCheck/firmware/bootloader/bootloader.elf
 | 预设 | 用途 |
 | --- | --- |
 | AppDebug | 从 `0x08010000` 启动、由 Boot 管理的应用 |
-| BootSizeCheck | 不含启动密码自测和测试信任根的完整 Boot 路径 |
+| BootSizeCheck | 按体积优化的完整 Boot 路径 |
 | Debug / Release / AppFlashDebug | 从 `0x08000000` 独立启动的应用；Release 使用体积优化 |
-| BootDebug | 64 KiB Boot，保留调试信息及启动诊断 |
-| BootReceiveTest | 只读 Flash 一致性诊断，结束后停留 Boot，不接收升级包或跳转 App |
-| BootRecoveryTest | 使用本机测试夹具的串口收包和恢复验证 |
+| BootDebug | 64 KiB Boot，保留调试信息及认证耗时日志 |
 | M3Test | 禁用 M2 网络模块的独立 App 构建 |
 
 Boot、App及配套工具统一使用持久兼容号2，其他版本拒绝，不自动迁移旧日志。首次部署及M3对接约定见[升级模块说明](firmware/app/services/upgrade/README.md)。
 
 也可在仓库根目录的终端执行 `cube-cmake --preset AppDebug`，成功后执行 `cube-cmake --build --preset AppDebug`；构建 Boot 时将两条命令的预设都换为 `BootSizeCheck`。任一步报错时先处理错误，再继续。
 
-Boot 测试预设需要本机自备 `.local/upgrade-fixture/boot_test_keys.h`，该夹具不随仓库分发。普通 Boot/App 默认通过 `firmware/shared/upgrade_trust_flash.c` 读取 Boot 末尾预留区的信任记录；缺少有效记录时升级入口保持关闭。`GATEWAY_UPGRADE_TRUST_SOURCE` 可指定其他保护区实现，布局和部署边界见[升级模块说明](firmware/app/services/upgrade/README.md#信任资料工具与启用)。正常固件构建不依赖测试夹具。
+Boot/App 默认通过 `firmware/shared/upgrade_trust_flash.c` 读取 Boot 末尾预留区的信任记录；缺少有效记录时升级入口保持关闭。`GATEWAY_UPGRADE_TRUST_SOURCE` 可指定其他保护区实现，布局和部署边界见[升级模块说明](firmware/app/services/upgrade/README.md#信任资料工具与启用)。固件构建不依赖测试密钥夹具。
 
 调整目录或切换工具链后，如缓存仍引用旧路径，在命令面板执行 `CMake: Delete Build Directory and Reconfigure`，再执行生成。该操作清除所选构建目录，不影响源码。
 

@@ -56,7 +56,6 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../shared/upgrade_package.c
     ${CMAKE_CURRENT_SOURCE_DIR}/boot/boot_package_flash.c
     ${CMAKE_CURRENT_SOURCE_DIR}/boot/boot_upgrade_state.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/boot/boot_package_receive.c
     ${CMAKE_CURRENT_SOURCE_DIR}/boot/boot_recovery_receive.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../shared/upgrade_state.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../shared/upgrade_transaction.c
@@ -119,21 +118,3 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
     MBEDTLS_CONFIG_FILE=\"boot_mbedtls_config.h\"
 )
-
-# 串口收包自测显式启用测试密钥；测试密钥不进入 Git 或正式构建。
-option(BOOT_PACKAGE_RECEIVE_TEST "Enable local serial package receive test" OFF)
-option(BOOT_FLASH_READ_DIAGNOSTIC "Run read-only diagnostic instead of receiving packages" OFF)
-if(BOOT_FLASH_READ_DIAGNOSTIC AND NOT BOOT_PACKAGE_RECEIVE_TEST)
-    message(FATAL_ERROR "Read diagnostic requires the local BootReceiveTest build")
-endif()
-if(BOOT_PACKAGE_RECEIVE_TEST)
-    set(BOOT_TEST_KEYS_DIR "${CMAKE_SOURCE_DIR}/.local/upgrade-fixture")
-    if(NOT EXISTS "${BOOT_TEST_KEYS_DIR}/boot_test_keys.h")
-        message(FATAL_ERROR "Run .local/tools/export_test_keys.py before BootReceiveTest")
-    endif()
-    target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE "${BOOT_TEST_KEYS_DIR}")
-    target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE BOOT_PACKAGE_RECEIVE_TEST=1)
-    if(BOOT_FLASH_READ_DIAGNOSTIC)
-        target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE BOOT_FLASH_READ_DIAGNOSTIC=1)
-    endif()
-endif()
