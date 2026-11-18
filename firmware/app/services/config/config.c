@@ -557,7 +557,10 @@ bool AppConfig_RequestTfImport(void)
     return accepted;
 }
 
-/** @brief 关闭候选准入，未开始的保存明确取消；已开始的交由原任务结算。 */
+/*
+ * Config 的 pause 回调：关闭新候选准入，取消尚未开始的 TF 导入请求。
+ * 已开始的保存、存储 RPC 和文件操作仍由原 Config_Task 结算，返回成功不代表在途处理已结束。
+ */
 static UpgradeStageResult cfg_pause(void *context, uint32_t timeout_ms)
 {
     (void)context;
@@ -566,6 +569,7 @@ static UpgradeStageResult cfg_pause(void *context, uint32_t timeout_ms)
     s_paused = true;
     if (s_tf_requested)
     {
+        // 只撤销待处理请求，已经开始的事务身份由原任务保留并完成结算。
         s_tf_requested = false;
         s_last_result = APP_CONFIG_BUSY;
     }
@@ -574,7 +578,10 @@ static UpgradeStageResult cfg_pause(void *context, uint32_t timeout_ms)
     return ready ? UPGRADE_STAGE_OK : UPGRADE_STAGE_NOT_READY;
 }
 
-/** @brief 只在候选、RPC和不明提交均已结束时确认结算；超时不清状态。 */
+/*
+ * 等待原配置任务归还候选事务和 TF 文件租约，RPC、提交核对或关闭未完成时不能确认停稳。
+ * 只检查真实状态；超时不清占用，也不把未保存的结果当成已完成。
+ */
 static UpgradeStageResult cfg_settle(void *context, uint32_t timeout_ms)
 {
     (void)context;
@@ -590,7 +597,7 @@ static UpgradeStageResult cfg_settle(void *context, uint32_t timeout_ms)
     return UPGRADE_STAGE_TIMEOUT;
 }
 
-/** @brief 结算成功后撤销本地暂停，全局准入仍由升级协调器最后开放。 */
+// 结算成功后撤销 Config 本地暂停，统一变更入口仍由协调器在所有模块恢复后最后开放。
 static UpgradeStageResult cfg_resume(void *context, uint32_t timeout_ms)
 {
     UpgradeStageResult result = cfg_settle(context, timeout_ms);
@@ -750,6 +757,7 @@ static void cfg_import_tf(storage_config_message_t *message)
 AppModuleInitResult Config_Init(void)
 {
     if (s_initialized) return APP_MODULE_INIT_OK;
+    // sync 复用 cfg_settle 复核安全点；Config 不直接刷介质，后续由 Storage 所有者执行同步。
     const UpgradeQuiesceParticipant participant =
     {
         cfg_pause, cfg_settle, cfg_settle, cfg_resume, NULL

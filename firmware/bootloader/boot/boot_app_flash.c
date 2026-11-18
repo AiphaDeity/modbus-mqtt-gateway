@@ -19,7 +19,7 @@ static bool Boot_AppFlashRangeValid(uint32_t address, uint32_t len)
          (len != 0U) && (len <= FLASH_APP_END_ADDRESS - address);
 }
 
-// 检查 App 扇区范围，擦除后复查时限并记录耗时。
+// 安装器逐次调用以擦除 App 的单个扇区，仅允许 4～7；擦除后复查时限并记录耗时。
 bool Boot_AppFlashEraseSector(uint32_t sector)
 {
   if ((sector < FLASH_SECTOR_4) || (sector > FLASH_SECTOR_7)
@@ -58,9 +58,13 @@ bool Boot_AppFlashEraseSector(uint32_t sector)
   return (status == HAL_OK) && (lock_status == HAL_OK) && within_deadline;
 }
 
-// 按字写入 App 区，失败或完成后清理 Flash 缓存。
+/*
+ * 将安装器刷出的明文块按 32 位字写到片内 App，address 为绝对地址，len 单位 B。
+ * 只编程、不隐式擦除；完成或中途失败后锁回 Flash 并清理缓存，实际内容由上层继续读回检查。
+ */
 bool Boot_AppFlashProgram(uint32_t address, const uint8_t *data, uint32_t len)
 {
+  // 目标和长度须按 4 B 对齐，且整个区间落在 App；上层负责末尾 FF 填充及镜像认证。
   if ((data == NULL) || !Boot_AppFlashRangeValid(address, len) ||
       ((address & 3U) != 0U) || ((len & 3U) != 0U) || Boot_WatchdogFailed())
   {
@@ -101,7 +105,7 @@ bool Boot_AppFlashProgram(uint32_t address, const uint8_t *data, uint32_t len)
   return (status == HAL_OK) && (lock_status == HAL_OK) && within_deadline;
 }
 
-// 逐字节核对片内 App 与输入缓冲是否一致。
+// 同步逐字节比较本次片内写入与输入块，区别于包验签以及安装结束时的整镜像 SHA-256 检查。
 bool Boot_AppFlashVerify(uint32_t address, const uint8_t *data, uint32_t len)
 {
   if ((data == NULL) || !Boot_AppFlashRangeValid(address, len) || Boot_WatchdogFailed())

@@ -36,13 +36,13 @@ static const app_config_t s_default_config = {
     .mb_poll_interval_ms = 1000,
 
     /* MQTT 参数（M2） */
-    .mq_broker_host = "192.168.2.45",   /* 本地 mosquitto 默认（阿里云模式走宏不走这里） */
+    .mq_broker_host = "192.0.2.1",   /* 本地 mosquitto 默认（阿里云模式走宏不走这里） */
     .mq_broker_port = 1883,
-    .mq_client_id = "mb2mqtt_001",
+    .mq_client_id = "gateway-demo",
     .mq_username = "",
     .mq_password = "",
-    .mq_pub_topic = "mb2mqtt_001/telemetry",
-    .mq_sub_topic = "mb2mqtt_001/cmd",
+    .mq_pub_topic = "gateway-demo/telemetry",
+    .mq_sub_topic = "gateway-demo/cmd",
     .mq_report_interval_ms = 5000,
 };
 

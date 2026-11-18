@@ -138,7 +138,7 @@ bool Boot_CheckAppVector(void)
  */
 bool Boot_JumpToApp(void)
 {
-  // 保存最终交接所需的初始 MSP 和带 Thumb 标记的复位入口
+  // 1. 前两个向量分别给出 App 初始 MSP 和 Reset_Handler，保存后再清理 Boot 硬件。
   uint32_t initial_sp = *(volatile const uint32_t *)BOOT_APP_START_ADDRESS;
   uint32_t reset_vector = *(volatile const uint32_t *)(BOOT_APP_START_ADDRESS + 4U);
 
@@ -147,20 +147,22 @@ bool Boot_JumpToApp(void)
     return false;
   }
 
-  // 硬件清理可能依赖 HAL 滴答，必须在停止中断和 SysTick 之前执行
+  // 2. 先关闭串口并恢复时钟；清理可能等待 HAL 滴答，所以此时不能提前停 SysTick。
   if(!Boot_DeinitHardware())
   {
     return false;
   }
 
+  // 3. 硬件清理完成后，再屏蔽中断、停止滴答并清除挂起请求。
   Boot_StopInterrupts();
 
-  // VTOR 指向应用的整张向量表，不是 Reset_Handler 的入口地址
+  // 4. 把后续异常和中断的查表起点切到 App；VTOR 指向向量表，不是某个函数地址。
   SCB->VTOR = BOOT_APP_START_ADDRESS;
 
   __DSB();
   __ISB();
 
-  // 同步向量表设置后进行最终交接，内部切换 MSP 并跳入 Reset_Handler
+  // 5. Boot_EnterApp 切换栈并跳入 App Reset_Handler，成功后不再返回 Boot。
+  // App 启动文件完成运行环境初始化后才进入 App main，再由它启动 FreeRTOS。
   Boot_EnterApp(initial_sp, reset_vector);
 }

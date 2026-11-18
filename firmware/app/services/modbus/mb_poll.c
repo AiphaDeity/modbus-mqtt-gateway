@@ -24,16 +24,6 @@ mb_handle_t *mb_handle = NULL;
 extern UART_HandleTypeDef huart3;
 #define MODBUS_RS485_UART  &huart3
 
-/* 接收链路诊断计数（定义在 UARTCallback.c） */
-// extern volatile uint32_t mb_dbg_rx_bytes;
-// extern volatile uint32_t mb_dbg_uart_err;
-// extern volatile uint32_t mb_dbg_uart_err_cnt;
-
-/* ========= 测试用例入口（定义在 modbus_test.c）========= */
-extern void test_add_three_slaves(void);
-extern void test_read_snapshot(void);
-extern void test_parse_points(void);
-extern void test_write_operations(void);
 /* ========= 内部静态函数 ========= */
 
 /**
@@ -365,15 +355,7 @@ bool Modbus_LoadSlave(const modbus_t *config, const mb_point_t *points)
     return loaded;
 }
 
-/**
- * @brief Modbus Poll 任务入口（在 app_modules.c 里注册）
- *
- *  MB_TEST_MODE=1：配置 3 个读从站，正常运行真实 RS485 轮询状态机，
- *  启动 10 秒后再投递 4 号 FC05、5 号 FC06 两个写请求。
- *  MB_TEST_MODE=0：不加载测试配置，只运行正常轮询。
- */
-#define MB_TEST_MODE  0
-
+// 推进已加载从站的轮询状态机，并向监督任务报告进展。
 void vModbusPollTask(void *argument)
 {
     (void)argument;
@@ -383,20 +365,11 @@ void vModbusPollTask(void *argument)
         return;
     }
 
-#if MB_TEST_MODE
-    test_add_three_slaves();
-    MB_LOGI("=== Modbus TEST: 3 read slaves, FC05/FC06 writes after 10s ===");
-#endif
-
     for (;;)
     {
         mb_poll_slave();
         if (mb_handle->state == MB_STATE_IDLE) mb_runtime_poll_end();
         mb_runtime_report();
-
-#if MB_TEST_MODE
-        test_write_operations();   /* 内部保证只注入一次 */
-#endif
 
         if (mb_handle->idle_no_work)
         {

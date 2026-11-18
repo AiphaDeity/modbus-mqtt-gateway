@@ -70,12 +70,15 @@ def initialize_ledger(path, aes_key):
         database.commit()
 
 
-# 先持久递增密钥计数器，再返回 12 B nonce，失败不回收已消耗编号。
+# 在对应 AES 密钥的既有账本中预留 12 B nonce，先持久递增计数器，再交给本次加密使用。
+# 账本须持续保留且不能回滚；后续制包、自检或输出失败均不回收已消耗编号。
 def reserve_nonce(path, aes_key):
     validate_aes_key(aes_key)
+    # 1. 指纹只用于定位同一 AES 密钥的记录，不把密钥本身写入账本。
     fingerprint = hashlib.sha256(aes_key).digest()
     with open_ledger(path) as database:
         database.execute("PRAGMA synchronous=FULL")
+        # 2. 同一账本中的分配串行执行，读取本密钥已登记的前缀和下一个计数。
         database.execute("BEGIN IMMEDIATE")
         row = database.execute("SELECT prefix, next_counter FROM nonce_keys WHERE fingerprint=?",
                                 (fingerprint,)).fetchone()
@@ -84,13 +87,17 @@ def reserve_nonce(path, aes_key):
         prefix, counter = row
         if len(prefix) != 4 or not 0 <= counter < 0x7FFFFFFFFFFFFFFF:
             raise ValueError("nonce账本损坏或计数耗尽")
+        # 3. 必须先提交计数递增，不能等加密成功后才记录，否则失败重试可能重复使用 nonce。
         database.execute("UPDATE nonce_keys SET next_counter=? WHERE fingerprint=?", (counter + 1, fingerprint))
         database.commit()  # 先持久消耗，即使后续签名/输出失败也不回收nonce。
+        # 4. nonce = 4 B 随机前缀 + 8 B 大端计数；nonce 随包头公开，AES 密钥不进入包头。
         return prefix + struct.pack(">Q", counter)
 
 
+# 使用本次 App 字节快照和已预留 nonce，生成 M(包头)+S(签名)+C(密文)+T(GCM标签)。
 def make_package(firmware, signing_key, aes_key, nonce, *, firmware_version, persistence_version=2):
     """只返回加密包，不写出原始bin、私钥、AES密钥或解密明文。"""
+    # 1. 检查兼容号、固件长度、MSP/Thumb入口、偏移链接地址及密钥类型，再构造包头。
     if persistence_version != 2 or not 1 <= firmware_version <= 0xFFFFFFFF:
         raise ValueError("持久兼容版本或固件版本非法")
     if not 8 <= len(firmware) <= 448 * 1024:
@@ -102,23 +109,30 @@ def make_package(firmware, signing_key, aes_key, nonce, *, firmware_version, per
     if not isinstance(signing_key, ec.EllipticCurvePrivateKey) or signing_key.curve.name != "secp256r1":
         raise ValueError("签名私钥必须为ECDSA P-256")
     validate_aes_key(aes_key)
+    # nonce 的唯一性由调用方先通过账本预留保证；本函数只检查长度，不再次分配或回收。
     if len(nonce) != 12:
         raise ValueError("nonce须12 B")
     manifest = bytearray(128)
+    # 2. 固定 128 B 包头 M 与板端布局一致，明文保存元数据，后续同时参与 GCM 和签名认证。
     manifest[:8] = b"GWUPD001"
     struct.pack_into("<HH", manifest, 8, 2, 128)
     manifest[12:28] = b"F407-TEST".ljust(16, b"\x00")
     struct.pack_into("<IIIII", manifest, 28, firmware_version, 0x08010000, len(firmware), len(firmware), 1)
     manifest[48:60] = nonce
+    # H_image = SHA256(原 App.bin)，用于解密后明文和最终片内 App 的镜像身份核对。
     manifest[60:92] = hashlib.sha256(firmware).digest()
     manifest[92:108] = secrets.token_bytes(16)
     struct.pack_into("<IHH", manifest, 108, 1, persistence_version, 1)
     manifest = bytes(manifest)
+    # 3. App 正文做 AES-GCM 加密，返回 encrypted=C+T；整个原始包头 M 作为 AAD，不被加密。
     encrypted = AESGCM(aes_key).encrypt(nonce, firmware, manifest)
+    # 4. ECDSA(SHA256) 在库内对 M+C+T 散列并签名；签名字节 S 本身不在这个消息中。
+    # 此处直接传消息，不能先手动取 SHA-256 再用同一接口，否则会多散列一次。
     signature = signing_key.sign(manifest + encrypted, ec.ECDSA(hashes.SHA256()))
     r, s = utils.decode_dss_signature(signature)
+    # 5. 库返回 DER 签名，包内改用固定 32 B 大端 r + 32 B 大端 s，布局 M+S+C+T，总长 N+208 B。
     package = manifest + r.to_bytes(32, "big") + s.to_bytes(32, "big") + encrypted
-    # 输出前真实验签和解密自检；检查不产生明文文件或密钥转储。
+    # 6. 用公钥验证生成的签名，再认证解密并与同一份 App 字节快照比较；自检不输出明文或密钥。
     signing_key.public_key().verify(signature, manifest + encrypted, ec.ECDSA(hashes.SHA256()))
     if AESGCM(aes_key).decrypt(nonce, encrypted, manifest) != firmware:
         raise ValueError("制作后解密自检失败")
@@ -126,7 +140,7 @@ def make_package(firmware, signing_key, aes_key, nonce, *, firmware_version, per
 
 
 NOTICE_DOMAIN = b"GWOTA-NOTICE-V1\n"
-BOS_PREFIX = "https://modbus-mqtt-firmware.gz.bcebos.com/"
+BOS_PREFIX = "https://firmware.example.invalid/"
 
 
 # 共用原口令环境变量读取方式，私钥只在本机内存中解密。
@@ -171,11 +185,13 @@ def make_notification(package, signing_key, *, gateway_id, task_id, url, issued_
                                         ec.ECDSA(hashes.SHA256()))
     except InvalidSignature as error:
         raise ValueError("原包签名与本次签名私钥不匹配") from error
+    # sha256 绑定整个加密包，image_sha256 绑定最终明文镜像，供传输检查和启动结果分别关联。
     fields = dict(type="upgrade", task_id=task_id, gateway_id=gateway_id, version=str(firmware_version),
                   size=len(package), sha256=hashlib.sha256(package).hexdigest(),
                   image_sha256=package[60:92].hex(), url=url, token=token,
                   issued_at=issued_at, expires_at=issued_at + valid_for)
     body = json.dumps(fields, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+    # 域前缀区分通知签名和固件包签名；通知 JSON 的字段顺序及原始字节参与签名。
     signature = signing_key.sign(NOTICE_DOMAIN + body, ec.ECDSA(hashes.SHA256()))
     signing_key.public_key().verify(signature, NOTICE_DOMAIN + body, ec.ECDSA(hashes.SHA256()))
     r, sig_s = utils.decode_dss_signature(signature)
@@ -280,11 +296,15 @@ def main():
         return
     if args.output.exists():
         raise ValueError("输出已存在，禁止覆盖")
+    # 固件包分支先把原 App.bin 读成不可变字节快照，包头摘要、加密和自检都使用这一份内容。
     firmware = args.input.read_bytes()
     signing_key = load_signing_key(args.signing_key, args.signing_password_env)
+    # 先持久消耗 nonce 再制作包，之后即使自检或写文件失败也不回滚账本。
     nonce = reserve_nonce(args.nonce_ledger, aes_key)
     package = make_package(firmware, signing_key, aes_key, nonce,
                            persistence_version=args.persistence_version, firmware_version=args.firmware_version)
+    # 自检成功后才独占创建输出并 write/flush/fsync；输出失败也不回滚已消耗的 nonce。
+    # 完整制好的原包可以重复传输；重新执行加密制包时仍须预留新的 nonce。
     with args.output.open("xb") as target:
         target.write(package)
         target.flush()

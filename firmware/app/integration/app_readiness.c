@@ -4,6 +4,7 @@
 #include "event_groups.h"
 #include "cmsis_os2.h"
 
+// 事件位只通知资源可用性；资源数据、互斥访问和操作结果仍由所属模块提供。
 static StaticEventGroup_t readiness_control_block;
 static osEventFlagsId_t readiness_events;
 
@@ -33,6 +34,7 @@ bool App_ReadinessInit(void)
     return false;
   }
 
+  // 此时只建立初始为零的通知位，不探测硬件，也不把任何业务资源标为可用。
   readiness_events = osEventFlagsNew(&readiness_attributes);
   return readiness_events != NULL;
 }
@@ -42,6 +44,7 @@ bool App_SetResourceReady(AppResource resource, bool ready)
 {
   uint32_t bits = (uint32_t)resource;
 
+  // 每次只能报告自己负责的一个资源；单位置位的掩码与自身减一相与应为零。
   if ((readiness_events == NULL) || !App_ResourcesValid(bits) ||
       ((bits & (bits - 1U)) != 0U))
   {
@@ -55,6 +58,7 @@ bool App_SetResourceReady(AppResource resource, bool ready)
   }
   else
   {
+    // 资源失效时撤销就绪状态，后续依赖方重新等待；已开始的 I/O 仍按所属接口返回值处理。
     result = osEventFlagsClear(readiness_events, bits);
   }
 
@@ -115,6 +119,8 @@ AppWaitResult App_WaitResources(uint32_t required_resources, uint32_t timeout_ms
     return APP_WAIT_INVALID_ARGUMENT;
   }
 
+  // 多个任务可以等待同一资源，唤醒一个调用方后不消费就绪位。
+  // 返回 READY 只是满足过这组条件，不能保证后续 I/O 期间资源持续可用。
   uint32_t result = osEventFlagsWait(readiness_events, required_resources,
                                     osFlagsWaitAll | osFlagsNoClear, (uint32_t)ticks);
   if ((result & osFlagsError) == 0U)

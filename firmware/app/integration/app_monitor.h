@@ -14,13 +14,15 @@ void Monitor_StartupComplete(void);
 
 /*
  * 任务上下文报告产品自检结果，失效时立即报告 false。
- * 未报告健康时不确认试运行；该结果不能替代各模块的进展和门控检查。
+ * 属于可选的额外产品约束；未调用时仍由全部必需模块的自检决定产品就绪。
+ * 一旦报告 false 就阻止健康确认，报告 true 也不能替代模块进展及自检检查。
  */
 void Monitor_ReportProductHealth(bool healthy);
 
 /*
  * 任务所有者登记进展间隔和单次等待上限，单位 ms，均须为 1～0x7FFFFFFF。
  * 未登记的关键模块不能通过试运行；登记后超时会锁存故障并停止喂狗。
+ * 以下登记、进展和等待接口只更新监督状态，不直接刷新 IWDG；单次等待须另行显式声明。
  */
 bool Monitor_RegisterHealth(AppModuleId module, uint32_t progress_ms, uint32_t max_wait_ms);
 /*
@@ -28,7 +30,7 @@ bool Monitor_RegisterHealth(AppModuleId module, uint32_t progress_ms, uint32_t m
  * 合法离线降级可通过自检；已超时的模块不能靠迟到报告恢复喂狗资格。
  */
 bool Monitor_ReportProgress(AppModuleId module, bool self_test_passed);
-// 声明一次有界等待，timeout_ms 不得超过登记上限；等待中不能重复调用续期。
+// 声明一次有界等待，timeout_ms 单位 ms，不得超过登记上限；等待中或已超期时不能借此续期。
 bool Monitor_BeginWait(AppModuleId module, uint32_t timeout_ms);
 // 任务上下文锁存不可恢复故障；普通断网、无卡等业务状态不通过此接口上报。
 void Monitor_ReportFatal(AppModuleId module);

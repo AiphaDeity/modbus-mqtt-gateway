@@ -10,8 +10,11 @@
 bool storage_runtime_init(void);
 bool storage_runtime_start(void);
 void storage_runtime_finish(bool ready, bool healthy);
+// 存储所有者设置本阶段总期限，timeout_ms 单位 ms；监督另留返回裕量，失败时停止当前操作。
 bool storage_runtime_wait(uint32_t timeout_ms);
+// 一轮实际工作完成后报告进展和当前自检，结束已声明等待；不直接刷新 IWDG。
 void storage_runtime_report(void);
+// 所有者在实际 I/O 完成后报告进展并声明下一段有界等待，不改变 I/O 总期限。
 void storage_runtime_checkpoint(void);
 void storage_runtime_process(void);
 

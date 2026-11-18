@@ -12,6 +12,7 @@
 #define RECOVERY_RECEIVE_TIMEOUT_MS 180000U
 #define RECOVERY_REQUEST_WINDOW_MS 10000U
 
+// 单帧接收工作区；解码出的 payload 借用此缓冲，Handle 必须在缓冲复用前同步处理完。
 static uint8_t receive_buffer[MAINT_FRAME_OVERHEAD + MAINT_FRAME_PAYLOAD_MAX];
 static uint16_t receive_size;
 static uint32_t partial_started_ms;
@@ -20,13 +21,13 @@ static maint_frame_t last_request;
 static struct
 {
   bool active;
-  uint32_t id;
+  uint32_t id; // 从持久恢复事务号派生，重启后旧 CHUNK 不能认领新会话。
   uint32_t begin_request_id;
   uint32_t slot;
-  uint32_t total;
-  uint32_t offset;
+  uint32_t total; // 预期加密包总长度，单位 B。
+  uint32_t offset; // 已新增写入的连续字节数，重复块只核对，不推进。
   uint32_t started_ms;
-  uint32_t progress_ms;
+  uint32_t progress_ms; // 最后新增数据的 HAL 时刻，查询和重复请求不会续期。
   bool allow_unknown;
 } session;
 
@@ -81,6 +82,7 @@ static bool ParseArguments(const maint_frame_t *frame, RecoveryArguments *args)
       uint32_t index = 0U;
       while (index < 5U && (strlen(names[index]) != (size_t)(p - key)
              || memcmp(key, names[index], (size_t)(p - key)) != 0)) index++;
+      // 位图同时记录字段是否出现；重复同名字段也拒绝，避免前后值含义不一致。
       if (index == 5U || (args->present & (1U << index)) != 0U) return false;
       p++;
       SkipSpace(&p, end);
@@ -159,7 +161,10 @@ static const char *StorageError(Boot_UpgradeResult result)
   }
 }
 
-// INFO/STATUS只读查询，未配置密钥时也可诊断，不能据此绕过认证。
+/*
+ * INFO/STATUS 只读返回普通日志、独立恢复日志、事务高水位和本轮 RAM 收包进度。
+ * 未配置密钥时仍可诊断；查询不建恢复事务、不擦 Flash，保护槽还须在 BEGIN 执行时重新核对。
+ */
 static void ReplyInfo(const maint_frame_t *request)
 {
   Boot_UpgradeState normal;
@@ -197,7 +202,11 @@ static bool ReplyProgress(const maint_frame_t *request)
   return Reply(request, "OK", NULL, fields);
 }
 
-// 显式首次初始化或准备恢复槽；同一BEGIN重复请求不再擦槽。
+/*
+ * 处理 BEGIN：显式首次初始化单独走初始化分支，普通恢复则先建立屏障/RECEIVING 再擦选定槽。
+ * 本函数建立 RAM 收包会话并返回起始偏移，不认证整包，也不擦写片内 App。
+ * 活动会话内只有请求号和参数均相同的重复 BEGIN 才复用当前进度，不重新擦槽。
+ */
 static BootReceiveResult Begin(const maint_frame_t *request, const RecoveryArguments *args,
                                const uint8_t *public_key, const uint8_t *aes_key)
 {
@@ -226,6 +235,7 @@ static BootReceiveResult Begin(const maint_frame_t *request, const RecoveryArgum
   if (public_key == NULL || aes_key == NULL) return Reject(request, "E_AUTH");
   if (session.id != 0U && session.begin_request_id == request->request_id)
     return Reject(request, "E_EXPIRED");
+  // 1. 内层检查保护槽并先写恢复屏障及 RECEIVING；成功后才有资格擦除所选候选槽。
   Boot_UpgradeResult result = Boot_RecoveryBegin(args->slot, args->total_len,
                                                 args->allow_unknown != 0U);
   if (result != BOOT_UPGRADE_OK) return Reject(request, StorageError(result));
@@ -235,6 +245,7 @@ static BootReceiveResult Begin(const maint_frame_t *request, const RecoveryArgum
   if (result != BOOT_UPGRADE_OK) return Reject(request, StorageError(result));
   if (receiving.tx_id == 0U || receiving.tx_id > UINT32_MAX)
     return Reject(request, "E_CAPACITY");
+  // 2. 在固定期限内擦除指定外部包槽，保留可信旧槽和片内 App；此时尚不接受 CHUNK。
   uint32_t address = args->slot == 1U ? FLASH_PART_FW_A_BASE : FLASH_PART_FW_B_BASE;
   uint32_t started_ms = HAL_GetTick();
   for (uint32_t offset = 0U; offset < FLASH_PART_FW_A_END - FLASH_PART_FW_A_BASE; offset += 4096U)
@@ -244,6 +255,7 @@ static BootReceiveResult Begin(const maint_frame_t *request, const RecoveryArgum
         || !Boot_WatchdogProgress(started_ms, RECOVERY_ERASE_TIMEOUT_MS))
       return Reject(request, Boot_WatchdogFailed() ? "E_TIMEOUT" : "E_STORAGE");
   }
+  // 3. 全槽擦除成功才发布 RAM 会话；电脑收到 session_id 和 next_offset=0 后开始传块。
   session.id = (uint32_t)receiving.tx_id;
   session.begin_request_id = request->request_id;
   session.slot = args->slot;
@@ -257,14 +269,18 @@ static BootReceiveResult Begin(const maint_frame_t *request, const RecoveryArgum
   return BOOT_RECEIVE_COMMAND;
 }
 
-// CHUNK前8B为小端会话号和偏移，其余1～1016B为原始加密包字节。
+// 从 CHUNK 载荷读取一个小端 32 位字段，前两个字段依次为会话号和包内字节偏移。
 static uint32_t Read32(const uint8_t *data)
 {
   return (uint32_t)data[0] | ((uint32_t)data[1] << 8U)
        | ((uint32_t)data[2] << 16U) | ((uint32_t)data[3] << 24U);
 }
 
-// 顺序写入跨页块；重复块逐段读回匹配，不重复编程、不续期。
+/*
+ * 接收当前会话的原始 .gwp 字节；前 8 B 为会话号和包内偏移，其余为 1～1016 B 数据。
+ * 连续新块按 Flash 页边界拆分并写入读回；完全位于已写范围的重复块只比较，不编程或续期。
+ * payload 借用本次串口帧缓冲，仅在同步处理期间使用；本阶段不解密、不覆盖片内 App。
+ */
 static BootReceiveResult Chunk(const maint_frame_t *request)
 {
   if (request->payload_len < 9U) return Reject(request, "E_RANGE");
@@ -281,6 +297,7 @@ static BootReceiveResult Chunk(const maint_frame_t *request)
   uint8_t check[256];
   for (uint32_t done = 0U; done < length;)
   {
+    // 页编程不能跨 256 B 边界，串口块可跨页，因此逐段拆分后再访问 Flash。
     uint32_t count = 256U - ((address + done) % 256U);
     if (count > length - done) count = length - done;
     if (!Boot_WatchdogCheck(session.started_ms, RECOVERY_RECEIVE_TIMEOUT_MS))
@@ -288,6 +305,7 @@ static BootReceiveResult Chunk(const maint_frame_t *request)
       session.active = false;
       return Reject(request, "E_TIMEOUT");
     }
+    // 新块经 Boot_FlashRecoveryProgram 校验写权限、编程并读回；重复块直接读取已有数据比较。
     HAL_StatusTypeDef result = duplicate
         ? Boot_FlashRead(address + done, check, (uint16_t)count)
         : Boot_FlashRecoveryProgram(address + done, data + done, (uint16_t)count);
@@ -307,6 +325,7 @@ static BootReceiveResult Chunk(const maint_frame_t *request)
   }
   if (!duplicate)
   {
+    // 全块持久读回一致后才推进 RAM 进度；恢复日志仍为 RECEIVING，尚未提交 READY。
     session.offset += length;
     session.progress_ms = HAL_GetTick();
   }
@@ -314,11 +333,15 @@ static BootReceiveResult Chunk(const maint_frame_t *request)
   return BOOT_RECEIVE_COMMAND;
 }
 
-// 完整认证及READY持久提交后才交回main安装；ACCEPTED不表示新App已确认。
+/*
+ * 在 Boot 内分发维护命令，不进入 App 的 Entry/Stage 或 Storage 任务。
+ * FINISH 先核对收齐，再认证并持久 READY，回复 ACCEPTED 后把安装工作交回 main。
+ */
 static BootReceiveResult Handle(const maint_frame_t *request,
                                 const uint8_t *public_key, const uint8_t *aes_key)
 {
   if (request->flags != 0U) return BOOT_RECEIVE_COMMAND;
+  // 0x01/0x02 查询，0x16 请求复位重判，0x30 BEGIN，0x31 CHUNK，0x32 FINISH。
   if (request->opcode == 0x31U) return Chunk(request);
   if (request->opcode != 0x01U && request->opcode != 0x02U && request->opcode != 0x16U
       && request->opcode != 0x30U && request->opcode != 0x32U)
@@ -331,10 +354,12 @@ static BootReceiveResult Handle(const maint_frame_t *request,
     if (args.present != ARG_SESSION) return Reject(request, "E_REQUIRED");
     if (!session.active || args.session_id != session.id) return Reject(request, "E_MODE");
     if (session.offset != session.total) return Reject(request, "E_RANGE");
+    // 收齐只表示具备认证前提；失败后仍保留独立恢复记录和屏障，不能按已收字节直接启动。
     session.active = false;
     Boot_UpgradeResult result = Boot_RecoveryAccept(public_key, aes_key);
     if (result != BOOT_UPGRADE_OK)
       return Reject(request, result == BOOT_UPGRADE_INVALID ? "E_AUTH" : StorageError(result));
+    // 同一 FINISH 的第一条应答：只报告 READY 已落盘；main 完成安装后还会回复第二条阶段结果。
     (void)Reply(request, "ACCEPTED", NULL, ",\"phase\":\"READY\"");
     last_request = *request;
     last_request.payload = NULL;
@@ -351,7 +376,10 @@ static BootReceiveResult Handle(const maint_frame_t *request,
   return BOOT_RECEIVE_COMMAND;
 }
 
-// 安装器只运行一次；回显FINISH的请求号，试运行开始不等于产品健康确认。
+/*
+ * Boot main 执行本次恢复安装后调用，使用原 FINISH 请求号发送第二条应答。
+ * OK/TRIAL 表示片内安装检查完成且试运行机会已登记；最终交接及 App 健康确认尚在后续。
+ */
 void Boot_RecoveryReplyResult(Boot_InstallResult result)
 {
   char fields[96];
@@ -361,7 +389,11 @@ void Boot_RecoveryReplyResult(Boot_InstallResult result)
               result == BOOT_INSTALL_TRIAL_STARTED ? NULL : "E_STORAGE", fields);
 }
 
-// 固定10s请求窗口；半帧2s、收包30s无新增数据和180s总期限均不因重复输入续期。
+/*
+ * Boot main 在维护窗口同步调用，USART2 逐字节收帧，解码成功后 Handle 在缓冲复用前处理完。
+ * 每次调用使用固定 10 s 窗口；半帧 2 s、收包无新增数据 30 s 及总期限 180 s 另行检查。
+ * 返回命令/超时后仍由 main 判断是否驻留维护，不能把窗口结束当作恢复事务已完成。
+ */
 BootReceiveResult Boot_RecoveryReceive(const uint8_t *public_key, const uint8_t *aes_key)
 {
   uint32_t window_ms = HAL_GetTick();
@@ -374,6 +406,7 @@ BootReceiveResult Boot_RecoveryReceive(const uint8_t *public_key, const uint8_t 
         || (uint32_t)(now_ms - session.started_ms) >= RECOVERY_RECEIVE_TIMEOUT_MS))
     {
       (void)Boot_WatchdogCheck(session.started_ms, RECOVERY_RECEIVE_TIMEOUT_MS);
+      // 只终止 RAM 会话并丢弃半帧，持久屏障和半包保留，不能按偏移自动续传。
       session.active = false;
       receive_size = 0U;
       return BOOT_RECEIVE_COMMAND;
@@ -382,6 +415,7 @@ BootReceiveResult Boot_RecoveryReceive(const uint8_t *public_key, const uint8_t 
       receive_size = 0U;
     if ((uint32_t)(now_ms - window_ms) >= RECOVERY_REQUEST_WINDOW_MS)
       return traffic || session.active ? BOOT_RECEIVE_COMMAND : BOOT_RECEIVE_NO_REQUEST;
+    // 完整帧才分发命令；MORE 保留半帧，格式/CRC 错误仅丢掉解码器确认可消费的前缀。
     if (receive_size != 0U)
     {
       maint_frame_t request;
@@ -394,6 +428,7 @@ BootReceiveResult Boot_RecoveryReceive(const uint8_t *public_key, const uint8_t 
         receive_size = 0U;
         return result;
       }
+      // 错帧只丢解码器明确消费的前缀，保留后续字节重新寻找合法帧头。
       if (consumed != 0U)
       {
         receive_size -= consumed;
@@ -401,6 +436,7 @@ BootReceiveResult Boot_RecoveryReceive(const uint8_t *public_key, const uint8_t 
         continue;
       }
     }
+    // 本次只接收一个字节，下一轮重新尝试解码；USART1 日志不参与维护帧收发。
     uint32_t before_ms = HAL_GetTick();
     HAL_StatusTypeDef status = HAL_UART_Receive(&huart2, receive_buffer + receive_size, 1U, 50U);
     if (status != HAL_OK && status != HAL_TIMEOUT) { receive_size = 0U; return BOOT_RECEIVE_COMMAND; }

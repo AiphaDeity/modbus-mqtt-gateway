@@ -20,6 +20,7 @@ def encode_frame(opcode, request_id, payload):
 class RecoveryLink:
     """单次串口连接的帧缓存和请求关联，不自动重试擦写操作。"""
 
+    # 每次打开串口建立独立的请求号和半帧缓存，不沿用上次连接的待收响应。
     def __init__(self, port):
         self.port = port
         self.request_id = secrets.randbelow(0xFFFFFFFE) + 1
@@ -140,16 +141,18 @@ def read_package(path, persistence_version=2):
     return package
 
 
-# 核对保护状态，经BEGIN/CHUNK/FINISH发送同一安全包；设备仍执行完整认证。
+# 经 INFO 核对保护状态，再串行 BEGIN/CHUNK/FINISH；设备执行认证和安装，工具不直接写 Flash。
 def recover(link, package, slot, allow_unknown=False, persistence_version=2):
     if slot not in ("A", "B"):
         raise ValueError("恢复槽只能为 A 或 B")
+    # 1. 主机只检查输入格式；签名、GCM、明文摘要和向量仍由 Boot 从实际收包槽核验。
     check_package(package, persistence_version)
     status = query_status(link)
     if status["normal"] == 5 or status["recovery"] == 5:
         raise RuntimeError("现有日志版本不支持，普通恢复不能隐式迁移或清除它")
     if status["normal"] == 2 or status["recovery"] == 2:
         raise RuntimeError("元数据读取失败，禁止擦写")
+    # 2. 工具先检查一次保护槽，Boot 处理 BEGIN 时还会重新核对，不能仅相信电脑快照。
     selected = 1 if slot == "A" else 2
     if status["protected"] == selected:
         raise RuntimeError(f"槽 {slot} 是可信已确认包，禁止覆盖")
@@ -158,6 +161,7 @@ def recover(link, package, slot, allow_unknown=False, persistence_version=2):
     start = 0x180000 if selected == 1 else 0x280000
     print(f"恢复擦写槽 {slot}：[0x{start:06X}, 0x{start + 0x100000:06X})。")
     print("恢复元数据使用 [0x382000, 0x385000)，健康确认后才重建普通日志。")
+    # 3. BEGIN 成功只表示已建立恢复事务并擦好槽，可从偏移 0 收包，尚不是 FINISH 后的 READY。
     ready = link.request(0x30, {"slot": selected, "total_len": len(package),
                                "allow_unknown_state": bool(allow_unknown)}, 360)
     session_id = ready.get("session_id")
@@ -165,16 +169,21 @@ def recover(link, package, slot, allow_unknown=False, persistence_version=2):
             or ready.get("slot") != selected or ready.get("total_len") != len(package)
             or ready.get("next_offset") != 0):
         raise RuntimeError("设备目标槽、会话或长度与请求不符")
+    # 4. 每块收到会话号及下一偏移的匹配应答后才发送下一块；超时不自动重试擦写。
+    # 此处按 256 B 发块是工具的分块选择，设备协议允许最多 1016 B，并在设备端处理跨页。
     for offset in range(0, len(package), 256):
         chunk = package[offset:offset + 256]
         response = link.request(0x31, struct.pack("<II", session_id, offset) + chunk, 5)
         if (response["status"] != "OK" or response.get("session_id") != session_id
                 or response.get("next_offset") != offset + len(chunk)):
             raise RuntimeError("设备会话或写入进度不符")
+    # 5. FINISH 只发送一次，后面两次 wait 都等待同一操作码和请求号，不能再发送一次 FINISH。
     request_id = link.send(0x32, {"session_id": session_id})
+    # 第一条 ACCEPTED/READY 证明收包认证及安装依据已提交；第二条才报告安装登记为 TRIAL。
     accepted = link.wait(0x32, request_id, 210)
     if accepted["status"] != "ACCEPTED" or accepted.get("phase") != "READY":
         raise RuntimeError("设备没有确认安全包已持久提交")
+    # 6. OK/TRIAL 仍不是产品确认完成；实际 App 启动、健康复位和恢复日志收尾由设备后续完成。
     result = link.wait(0x32, request_id, 480)
     if result["status"] != "OK" or result.get("install_result") != 1 or result.get("phase") != "TRIAL":
         raise RuntimeError("安装未进入首次试运行")
@@ -204,6 +213,7 @@ def main():
 
     print("连接USART2维护口：USB转串口RX接PD5、TX接PD6，共地，使用3.3V电平。")
     print("关闭维护口串口监视器；工具独占该口，打开后复位设备。USART1只输出日志。")
+    # 维护口由工具独占；USART1 的独立监视器可继续看实际启动和健康确认日志。
     with serial.Serial(args.port, 115200, timeout=0.1, write_timeout=3) as port:
         link = RecoveryLink(port)
         if package is not None:

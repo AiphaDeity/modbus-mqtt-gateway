@@ -5,10 +5,10 @@
 
 用法:
     python tools/baidu_pub.py '{"slave":2,"func":6,"addr":0,"val":100}'
-    python tools/baidu_pub.py '{"slave":1,"func":5,"addr":0,"val":1}' --topic $iot/stm32_gw_01/user/commands
-    python tools/baidu_pub.py --topic $iot/stm32_gw_01/user/acks "任意消息"
+    python tools/baidu_pub.py '{"slave":1,"func":5,"addr":0,"val":1}' --topic $iot/gateway-demo/user/commands
+    python tools/baidu_pub.py --topic $iot/gateway-demo/user/acks "任意消息"
 
-默认 topic = $iot/stm32_gw_01/user/commands（M2 下行命令 topic）
+默认 topic = $iot/gateway-demo/user/commands（M2 下行命令 topic）
 默认 qos  = 0
 
 原理:
@@ -28,8 +28,8 @@ import urllib.error
 
 # ===== 设备三元组（从 firmware/app/services/mqtt/mqtt_client.c 抄过来，保持一致）=====
 # ⚠️ git commit 前改成 "xxxxxxx" 占位符
-IOTCORE_ID    = "aeklwww"
-DEVICE_KEY    = "stm32_gw_01"
+IOTCORE_ID    = "YOUR_IOTCORE_ID"
+DEVICE_KEY    = "gateway-demo"
 DEVICE_SECRET = "YOUR_DEVICE_SECRET"    # 占位符，测试时替换为真实密钥
 REGION        = "gz"                       # 广州地域，和实例一致
 

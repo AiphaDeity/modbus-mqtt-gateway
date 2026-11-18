@@ -2,6 +2,10 @@
 
 #include <string.h>
 
+/*
+ * 事务号高水位与升级记录分开持久保存；先写入新高水位，再把编号交给调用方。
+ * 后续升级失败也不回收已预留编号，避免重启后旧会话误匹配新事务。
+ */
 #define RECORD_SIZE 128U
 #define COMMIT_OFFSET 256U
 #define SECTOR_SIZE 4096U
@@ -132,6 +136,7 @@ static UpgradeStateResult Commit(const UpgradeTransactionStorage *storage,
   Write32(data + 16U, (uint32_t)state->last_allocated);
   Write32(data + 20U, (uint32_t)(state->last_allocated >> 32U));
   Write32(data + 124U, Crc(data));
+  // 目标是另一个副本，旧有效副本保留；正文完成后才写独立页的 TXMT 标记。
   if ((erase && !storage->erase(storage->context, Address(target)))
       || !storage->program(storage->context, Address(target), data, sizeof(data))
       || !storage->program(storage->context, Address(target) + COMMIT_OFFSET,
@@ -195,6 +200,7 @@ UpgradeStateResult UpgradeTransaction_Reserve(const UpgradeTransactionStorage *s
   }
   state.generation++;
   state.last_allocated++;
+  // selected ^ 1 在两个副本间切换；不得先擦掉唯一有效的当前副本。
   result = Commit(storage, &state, selected ^ 1U, true);
   if (result == UPGRADE_STATE_OK)
   {

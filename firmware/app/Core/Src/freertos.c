@@ -26,7 +26,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "app_entry.h"
-#include <stdio.h>      /* ★排障用：hook 里直接 printf 报线索 */
+#include <stdio.h> // 异常回调及断言日志使用 printf。
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -47,6 +47,8 @@ typedef StaticTask_t osStaticThreadDef_t;
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN Variables */
+
+// defaultTask 是一次性启动任务；各业务任务由它调用的 App_Entry 统一装配和创建。
 
 /* USER CODE END Variables */
 /* Definitions for defaultTask */
@@ -76,10 +78,11 @@ void vApplicationStackOverflowHook(xTaskHandle xTask, signed char *pcTaskName);
 void vApplicationMallocFailedHook(void);
 
 /* USER CODE BEGIN 4 */
+// 内核检测到任务栈溢出时记录任务名，再进入全局错误处理。
 void vApplicationStackOverflowHook(xTaskHandle xTask, signed char *pcTaskName)
 {
   (void)xTask;
-  /* ★排障：先打印是哪个任务爆栈，再进 Error_Handler（原来的实现直接进死循环，啥也看不到） */
+  // 尽量保留触发任务的名字；进入 Error_Handler 后不再继续调度正常业务。
   printf("\r\n[HOOK] STACK OVERFLOW task=%s\r\n", (pcTaskName != NULL) ? (char *)pcTaskName : "?");
   Error_Handler();
    /* Run time stack overflow checking is performed if
@@ -89,6 +92,7 @@ void vApplicationStackOverflowHook(xTaskHandle xTask, signed char *pcTaskName)
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN 5 */
+// RTOS 堆分配失败时记录剩余容量，再进入错误处理；此处不是 newlib C 堆的失败回调。
 void vApplicationMallocFailedHook(void)
 {
   /* 分配失败时保留剩余堆大小。 */
@@ -114,6 +118,7 @@ void vApplicationMallocFailedHook(void)
   */
 void MX_FREERTOS_Init(void) {
   /* USER CODE BEGIN Init */
+  // App main 已完成 osKernelInitialize，这里只允许在内核就绪、尚未开始调度时创建启动任务。
   if (osKernelGetState() != osKernelReady)
   {
   Error_Handler();
@@ -142,6 +147,8 @@ void MX_FREERTOS_Init(void) {
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
+  // 上方将 StartDefaultTask 函数地址登记为入口，并未在这里直接调用它。
+  // osThreadNew 只建立启动任务对象；main 调用 osKernelStart 后，调度器才会执行该入口。
   if (defaultTaskHandle == NULL)
   {
   Error_Handler();
@@ -155,16 +162,16 @@ void MX_FREERTOS_Init(void) {
 }
 
 /* USER CODE BEGIN Header_StartDefaultTask */
-/**
-  * @brief  Function implementing the defaultTask thread.
-  * @param  argument: Not used
-  * @retval None
-  */
+/*
+ * defaultTask 首次被调度时执行，承接 App main 启动调度器后的控制流。
+ * argument 转交 App_Entry；装配成功后由 App_Entry 退出本任务，正常不返回此处。
+ */
 /* USER CODE END Header_StartDefaultTask */
 void StartDefaultTask(void *argument)
 {
   /* USER CODE BEGIN StartDefaultTask */
   
+  // 从这里进入 app_entry.c：先准备升级身份及监督，再初始化资源并创建业务任务。
   App_Entry(argument);
 
   // 应用任务入口意外返回时进入错误处理

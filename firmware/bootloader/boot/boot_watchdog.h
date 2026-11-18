@@ -19,6 +19,7 @@ bool Boot_WatchdogCheck(uint32_t started_ms, uint32_t timeout_ms);
 
 /*
  * 仅在成功完成一项实际进展后调用，先检查固定期限，再决定是否喂狗。
+ * started_ms 不因本次报告而重置；不可用反复调用本接口代替完成工作。
  * IWDG尚未启动时只检查期限；HAL tick未前进时不会重复刷新IWDG。
  * 返回false表示本次监督已失败，调用方须停止操作。
  */
@@ -47,6 +48,7 @@ bool Boot_WatchdogEnableCycleCounter(void);
  * 公钥65B、AES密钥32B由可信映射提供，调用期间有效且不变。
  * 无可信记录、状态错误、认证失败或镜像不匹配均返回false，禁止跳转。
  * 调用前main须已启动IWDG；未启狗或监督失败均拒绝，本函数不补启或重新配置。
+ * true 仅表示本次交接检查通过，后续跳转及 App 初始化期间仍由同一个 IWDG 计数。
  */
 bool Boot_WatchdogPrepareApp(const uint8_t *public_key, const uint8_t *aes_key);
 

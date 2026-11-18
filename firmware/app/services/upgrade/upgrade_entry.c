@@ -7,10 +7,14 @@
 
 #include <string.h>
 
+/*
+ * 网络和 TF 共用一个入口；先核对来源授权，再交给 Stage 推进接收状态。
+ * owner 用来源和 epoch 区分一次操作，session_id 则由 Stage 分配，三者须匹配。
+ */
 static UpgradeEntryPolicy policy;
 static bool policy_bound;
-static bool entry_busy;
-static bool owned;
+static bool entry_busy; // 只覆盖当前接口调用，长操作期间拒绝其他修改请求。
+static bool owned; // 跨接口保留会话归属，不因一次 Write 返回就解除。
 static UpgradeEntryPeer owner;
 static uint32_t owner_session;
 // 连接断开即锁存，包括Stage尚未分配会话号的BEGIN准备期。
@@ -63,7 +67,8 @@ static bool SameOwner(const UpgradeEntryPeer *peer, uint32_t session_id)
   return SamePeer(peer) && (session_id == owner_session) && (session_id != 0U);
 }
 
-// 成功后由调用方Release；失败在这里释放，不能再调用Stage修改接口。
+// 每次 Write/Finish 等操作都复查当前授权和 source/epoch/session 归属，Begin 成功不是永久许可。
+// 成功后由调用方 Release；失败在这里释放，不能再调用 Stage 修改接口。
 static UpgradeStageResult TakeSession(const UpgradeEntryPeer *peer, uint32_t session_id)
 {
   UpgradeStageResult result = Take();
@@ -256,7 +261,10 @@ UpgradeStageResult UpgradeEntry_Disconnect(const UpgradeEntryPeer *peer)
   return Release(result);
 }
 
-// 校验权限并清理旧会话，再建立当前操作的接收会话。
+/*
+ * TF 或网络执行任务调用的接收入口：先校验来源授权，再请求 Stage 建立候选会话。
+ * Begin → Write → Finish → Reboot 共用本次 peer/session；Entry 管归属，Stage 管进度和提交。
+ */
 UpgradeStageResult UpgradeEntry_Begin(const UpgradeEntryPeer *peer, const char *path,
                                       uint32_t total_size, const uint8_t *sha256, uint32_t *session_id)
 {
@@ -275,6 +283,7 @@ UpgradeStageResult UpgradeEntry_Begin(const UpgradeEntryPeer *peer, const char *
     return Release(UPGRADE_STAGE_MODE);
   }
   bool tf = peer->source == UPGRADE_STAGE_SOURCE_TF;
+  // TF 必须来自固定文件，网络由下载器提供字节流，所以网络 path 必须为 NULL。
   if ((tf && ((path == NULL) || (strcmp(path, UPGRADE_TF_PATH) != 0))) || (!tf && (path != NULL)))
   {
     return Release(UPGRADE_STAGE_INVALID);
@@ -291,6 +300,7 @@ UpgradeStageResult UpgradeEntry_Begin(const UpgradeEntryPeer *peer, const char *
     SetOwner(NULL, 0U);
     return Release(UPGRADE_STAGE_MODE);
   }
+  // 权限及旧会话清理通过后才进入 Stage；Stage 经后端准备候选槽，并输出新的会话号。
   result = UpgradeStage_Begin(peer->source, total_size, sha256, session_id);
   if (result == UPGRADE_STAGE_OK)
   {
@@ -341,10 +351,15 @@ UpgradeStageResult UpgradeEntry_Write(const UpgradeEntryPeer *peer, uint32_t ses
   {
     return result;
   }
+  // 输入数据只在同步调用期间借给 Stage；它写入并核对完成后，传输任务才能复用本块缓冲。
   return Release(UpgradeStage_Write(session_id, offset, data, size));
 }
 
-// 核对归属后完成认证和 READY 提交。
+/*
+ * TF 或网络收齐包后调用：UpgradeStage_Finish 只认证到 VERIFIED。
+ * 随后由 UpgradeStage_Commit 暂停业务并提交 READY。
+ * 两步之间重新检查来源许可；OK 表示候选安装请求已持久化，不能据此宣称 App 已安装或转正。
+ */
 UpgradeStageResult UpgradeEntry_Finish(const UpgradeEntryPeer *peer, uint32_t session_id)
 {
   UpgradeStageResult result = TakeSession(peer, session_id);
@@ -358,6 +373,7 @@ UpgradeStageResult UpgradeEntry_Finish(const UpgradeEntryPeer *peer, uint32_t se
   {
     if (status.phase == UPGRADE_STAGE_STAGING)
     {
+      // 先完成整包认证；VERIFIED 只表示认证成功，尚未持久提交 READY。
       result = UpgradeStage_Finish(session_id);
     }
     if (result == UPGRADE_STAGE_OK)
@@ -370,6 +386,7 @@ UpgradeStageResult UpgradeEntry_Finish(const UpgradeEntryPeer *peer, uint32_t se
       }
       else
       {
+        // Commit 才执行业务暂停、在途结算及 READY 提交；不明确结果不能按失败重发。
         result = UpgradeStage_Commit(session_id);
       }
     }

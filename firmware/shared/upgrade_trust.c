@@ -2,6 +2,7 @@
 
 #include <stddef.h>
 
+// 只保存平台置备资料的只读映射，不复制密钥到升级包或配置文件。
 static UpgradeTrustKeys trusted;
 static bool bound;
 
@@ -18,17 +19,17 @@ __attribute__((weak)) bool UpgradeTrust_ReadPlatform(UpgradeTrustKeys *keys)
   return false;
 }
 
-// 读取并绑定平台密钥映射，已有绑定时直接返回。
+// Boot main 和 App 启动装配取得平台信任资料时调用，读取并校验映射后才允许后续按编号查询。
 bool UpgradeTrust_Initialize(void)
 {
-  // 已绑定时直接返回
+  // 1. 本次运行已经绑定则复用映射，不重新读取或改变可信密钥。
   if (bound)
   {
     return true;
   }
-  // 准备一个局部结构体 keys
+  // 2. 局部结构体只接收编号和只读指针，实际密钥仍保留在平台置备区。
   UpgradeTrustKeys keys = {0};
-  // 从 Boot 预留区读取并检查平台资料，读取成功，才会保存映射
+  // 3. ReadPlatform 在当前工程校验 Boot 预留记录，成功后 Bind 保存映射；任一步失败都返回 false。
   return UpgradeTrust_ReadPlatform(&keys) && UpgradeTrust_Bind(&keys);
 }
 
@@ -40,6 +41,7 @@ bool UpgradeTrust_Bind(const UpgradeTrustKeys *keys)
   {
     return false;
   }
+  // 结构体复制的是指针，底层存储及所指资料须在整个运行期间保持有效且不变。
   trusted = *keys;
   bound = true;
   return true;
@@ -61,10 +63,12 @@ bool UpgradeTrust_Get(uint32_t signing_key_id, uint32_t decrypt_key_id,
   }
   *public_key = NULL;
   *aes_key = NULL;
+  // 初始化未成功或包要求的编号不匹配时，输出保持空指针，由调用方关闭本次升级处理。
   if (!bound || (trusted.signing_key_id != signing_key_id) || (trusted.decrypt_key_id != decrypt_key_id))
   {
     return false;
   }
+  // 成功只交付只读指针；这里不生成密钥，也不把密钥内容写进日志或升级包。
   *public_key = trusted.public_key;
   *aes_key = trusted.aes_key;
   return true;

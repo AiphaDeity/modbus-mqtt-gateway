@@ -16,6 +16,7 @@
 #include <string.h>
 #include <stdio.h>
 
+// 每遍读文件独立限时；按键时间均为 ms，长按松开才产生一次导入请求。
 #define TF_PASS_TIMEOUT_MS 180000U
 #define TF_CLOSE_TIMEOUT_MS 3000U
 #define TF_KEY_DEBOUNCE_MS 40U
@@ -25,11 +26,12 @@ typedef struct
 {
   bool sample;
   bool down;
-  bool armed;
+  bool armed; // 已观察到稳定释放，才允许接受下一次长按，避免上电按住直接触发。
   uint32_t changed_ms;
   uint32_t pressed_ms;
 } TfButton;
 
+// TF 文件由存储任务持有；升级任务仅借助 open/read/close 回调操作文件租约。
 static UpgradeTfSource source;
 static bool bound;
 static bool busy;
@@ -37,6 +39,7 @@ static bool file_open;
 static bool cancelled;
 static UpgradeEntryPeer active_peer;
 static uint32_t active_session;
+// 单块工作区在同步 read/Write 返回后复用，整个升级包不会驻留 RAM。
 static uint8_t data[UPGRADE_STAGE_MAX_CHUNK_SIZE] __attribute__((aligned(8)));
 static bool initialized;
 static bool button_authorized;
@@ -220,7 +223,8 @@ static UpgradeStageResult ReadBlock(uint32_t offset, uint32_t size, uint32_t sta
   return (result == UPGRADE_STAGE_OK) && Cancelled() ? UPGRADE_STAGE_MODE : result;
 }
 
-// 第一遍计算整包传输摘要；第二遍复制后再读回核对，拒绝两遍之间发生变化的文件。
+// 第一遍用单块缓冲顺序读取完整 .gwp 计算传输 SHA-256，不整包缓存到 RAM，也不在这里认证固件。
+// 摘要覆盖包头、签名、密文和标签；第二遍写入后，由 Stage 从候选槽重算并比较。
 static UpgradeStageResult HashFile(uint32_t size, uint8_t *digest)
 {
   mbedtls_sha256_context hash;
@@ -246,7 +250,7 @@ static UpgradeStageResult HashFile(uint32_t size, uint8_t *digest)
   return result;
 }
 
-// 逐块读取固定文件并写入升级会话，沿用本遍总期限。
+// 第二遍从包内偏移 0 开始读取，每块经 Entry 同步写入并核对；失败即停止，沿用本遍总期限。
 static UpgradeStageResult CopyFile(const UpgradeEntryPeer *peer, uint32_t session_id, uint32_t size)
 {
   uint32_t started_ms = HAL_GetTick();
@@ -264,14 +268,20 @@ static UpgradeStageResult CopyFile(const UpgradeEntryPeer *peer, uint32_t sessio
     {
       return result;
     }
+    // Entry 成功才说明本块已通过下层写入和读回，随后才读取下一块并复用 data。
     offset += count;
   }
   return UPGRADE_STAGE_OK;
 }
 
-// 取得文件租约，先算摘要再复制，关闭文件后完成认证提交。
+/*
+ * 由 TF 升级任务同步导入固定 /firmware.gwp：第一遍取摘要，第二遍写候选槽，再认证和提交。
+ * 文件 open/read/close 均经 source 回调交给 Storage_Task，本任务不直接调用 FatFs。
+ * output 分别保留主结果、会话号和关闭/取消错误；OK 表示 READY 已提交，安装发生在复位之后。
+ */
 UpgradeStageResult UpgradeTf_Import(const UpgradeEntryPeer *peer, const char *path, UpgradeTfResult *output)
 {
+  // 1. 检查输出、固定路径、来源身份和执行上下文，拒绝无权限或不适合运行慢操作的调用。
   if (output == NULL)
   {
     return UPGRADE_STAGE_INVALID;
@@ -294,6 +304,7 @@ UpgradeStageResult UpgradeTf_Import(const UpgradeEntryPeer *peer, const char *pa
   {
     return output->result;
   }
+  // 2. 独占本次文件导入；源文件服务已绑定和候选接收服务可用须分别检查。
   taskENTER_CRITICAL();
   bool ready = bound;
   bool already_busy = busy;
@@ -322,6 +333,7 @@ UpgradeStageResult UpgradeTf_Import(const UpgradeEntryPeer *peer, const char *pa
     uint8_t digest[32] = {0};
     if (output->result == UPGRADE_STAGE_OK)
     {
+      // 3. 通过存储任务打开固定文件并取得总长度，整个导入期间沿用这份文件租约。
       file_open = true; // open失败也可能取得租约，必须尝试幂等close。
       uint32_t started_ms = HAL_GetTick();
       if (!Monitor_UpgradeWait(TF_CLOSE_TIMEOUT_MS))
@@ -348,10 +360,12 @@ UpgradeStageResult UpgradeTf_Import(const UpgradeEntryPeer *peer, const char *pa
     }
     if (output->result == UPGRADE_STAGE_OK)
     {
+      // 4. 第一遍取得文件总摘要，供随后从候选 Flash 读回的完整包比较，防止两遍内容变化。
       output->result = HashFile(size, digest);
     }
     if ((output->result == UPGRADE_STAGE_OK) && !Cancelled())
     {
+      // 5. 把文件总长和传输摘要交给统一入口，准备候选槽并取得本次会话号。
       output->result = UpgradeEntry_Begin(peer, UPGRADE_TF_PATH, size, digest, &output->session_id);
       taskENTER_CRITICAL();
       active_session = output->session_id;
@@ -363,8 +377,10 @@ UpgradeStageResult UpgradeTf_Import(const UpgradeEntryPeer *peer, const char *pa
     }
     if (output->result == UPGRADE_STAGE_OK)
     {
+      // 6. 第二遍逐块重新读文件，经 Entry → Stage → 存储队列写入候选槽。
       output->result = CopyFile(peer, output->session_id, size);
     }
+    // 7. 在暂停及提交之前释放 TF 文件租约，避免存储同步等待升级任务自己持有的文件。
     output->close_error = CloseFile();
     if ((output->result == UPGRADE_STAGE_OK) && (output->close_error != UPGRADE_STAGE_OK))
     {
@@ -372,6 +388,7 @@ UpgradeStageResult UpgradeTf_Import(const UpgradeEntryPeer *peer, const char *pa
     }
     if (output->result == UPGRADE_STAGE_OK)
     {
+      // 8. Entry 的 Finish 完成整包认证、业务暂停和 READY 提交，不在这里安装片内 App。
       // Finish 失败时保留其阶段；VERIFIED 或提交不明时，由接收服务决定后续清理。
       output->result = UpgradeEntry_Finish(peer, output->session_id);
     }
@@ -414,6 +431,7 @@ static void ImportFromButton(void)
 {
   UpgradeStageStatus status;
   UpgradeMessage identity;
+  // 试运行期间不接受下一包，先保留已确认旧包供回退；正常身份还须能与持久状态核对。
   if (!App_UpgradeCanCommit() || !App_UpgradeGetBootIdentity(&identity))
   {
     printf("TF upgrade rejected: normal Boot identity required\r\n");
@@ -459,6 +477,7 @@ static void ImportFromButton(void)
     printf("TF import rejected: probe=%u files=%lu\r\n", (unsigned)probe, (unsigned long)files.total_len);
     return;
   }
+  // 同一按键也可导入配置；两种固定文件同时存在时上方已经拒绝，不能猜用户意图。
   if (files.total_len == STORAGE_TF_CONFIG_FILE)
   {
     printf("TF config request: accepted=%u\r\n", AppConfig_RequestTfImport() ? 1U : 0U);
@@ -485,6 +504,7 @@ static void ImportFromButton(void)
   button_epoch++;
   button_authorized = true;
   taskEXIT_CRITICAL();
+  // 本次实体按键只授权本轮 epoch，所有 Begin/Write/Finish 使用同一来源身份。
   const UpgradeEntryPeer peer = {UPGRADE_STAGE_SOURCE_TF, button_epoch};
   UpgradeTfResult output;
   printf("TF upgrade begin: epoch=%lu\r\n", (unsigned long)peer.epoch);
@@ -504,7 +524,8 @@ static void ImportFromButton(void)
          (unsigned)output.close_error, (unsigned)output.abort_error);
 }
 
-// 每20ms检测PA0；导入期间不接收按键请求，结束后必须先释放再重新长按。
+// 装配创建的 TF 任务每 20 ms 检测 PA0；长按稳定松开后转入 ImportFromButton 检查并导入。
+// 导入同步执行，期间不再处理按键；结束后必须先释放再重新长按。
 void UpgradeTf_Task(void *argument)
 {
   (void)argument;

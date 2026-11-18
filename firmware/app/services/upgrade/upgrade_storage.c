@@ -10,13 +10,17 @@
 
 #include <string.h>
 
+/*
+ * 将 Stage 同步调用转换为值拷贝队列请求；仅存储任务执行 FatFs 和外部 Flash 操作。
+ * user_session 属于 Stage，storage_session 属于存储服务，不能混用或只凭槽号认领应答。
+ */
 typedef struct
 {
   osMessageQueueId_t requests;
   osMessageQueueId_t responses;
   bool bound;
-  bool begin_sent;
-  bool commit_sent;
+  bool begin_sent; // BEGIN 已入队，超时也可能已建立租约，清理时仍需向存储端核对。
+  bool commit_sent; // READY 提交已入队，未确认结果前禁止再次发送提交。
   bool source_read;
   uint32_t next_request_id;
   uint32_t user_session;
@@ -28,8 +32,8 @@ typedef struct
   uint32_t started_ms;
   uint32_t timeout_ms;
   UpgradeStageResult io_error;
-  UpgradeStateRecord baseline;
-  UpgradeStateRecord ready;
+  UpgradeStateRecord baseline; // 准备时取得的可信普通记录，供后端执行前复核。
+  UpgradeStateRecord ready; // 本次期望落盘的完整 READY 记录，供独立读回比较。
   UpgradeStorageRequest request;
   UpgradeStorageResponse response;
 } StorageContext;
@@ -149,6 +153,7 @@ static UpgradeStageResult AwaitResponse(bool *enqueued)
   {
     return UPGRADE_STAGE_TIMEOUT;
   }
+  // 消息按值进入队列，调用者缓冲不借给存储任务；超时不代表服务端操作已撤销。
   osStatus_t status = osMessageQueuePut(storage.requests, &storage.request, 0U, WaitTicks(remaining));
   if (status != osOK)
   {
@@ -368,7 +373,11 @@ static UpgradeStageResult Keys(void *context, uint32_t signing_key_id, uint32_t 
        ? UPGRADE_STAGE_OK : UPGRADE_STAGE_AUTH;
 }
 
-// 认证已确认恢复源并复核启动身份，预留事务后准备候选槽。
+/*
+ * UpgradeStage_Begin 经 backend.prepare 进入这里，先证明旧包可用于回退，再准备新候选槽。
+ * 候选槽按持久保护视图选择；传输方只提供包长，不能指定擦写 A 或 B。
+ * 输出 Stage 使用的槽号和持久事务号，存储会话号另存于适配器，不能与上层 session_id 混用。
+ */
 static UpgradeStageResult Prepare(void *context, uint32_t session_id, uint32_t total_size,
                                     UpgradeStagePrepared *prepared, uint32_t timeout_ms)
 {
@@ -384,6 +393,7 @@ static UpgradeStageResult Prepare(void *context, uint32_t session_id, uint32_t t
   storage.total_size = total_size;
   storage.written = 0U;
   StartOperation(timeout_ms);
+  // 1. 通过存储队列读取保护状态，核对 Boot 交接身份与仍然有效的已确认基线。
   UpgradeStateProtection protection;
   UpgradeStageResult result = LoadProtection(&protection);
   if (result != UPGRADE_STAGE_OK)
@@ -402,10 +412,11 @@ static UpgradeStageResult Prepare(void *context, uint32_t session_id, uint32_t t
   {
     return UPGRADE_STAGE_MODE;
   }
+  // Boot 交接身份必须仍匹配持久已确认记录，防止基于过期视图挑选可擦槽。
   storage.baseline = protection.normal;
   storage.slot = (protection.writable_slots & UPGRADE_STATE_SLOT_A_MASK) != 0U ? 1U : 2U;
 
-  // 先认证回退源，再请求擦除候选槽；日志 CRC 不能替代包认证。
+  // 2. 先认证回退源，再请求擦除候选槽；日志 CRC 不能替代包认证。
   storage.source_read = true;
   UpgradePackageImage image;
   result = UpgradeStage_Authenticate(&backend, NULL, 0U, storage.baseline.confirmed.size,
@@ -419,6 +430,7 @@ static UpgradeStageResult Prepare(void *context, uint32_t session_id, uint32_t t
   {
     return UPGRADE_STAGE_INTEGRITY;
   }
+  // 3. 持久预留新的事务号，断电或准备失败也不能把已经消耗的事务号拿来复用。
   Request(UPGRADE_STORAGE_RESERVE_TX);
   result = Exchange(NULL);
   if (result != UPGRADE_STAGE_OK)
@@ -430,9 +442,11 @@ static UpgradeStageResult Prepare(void *context, uint32_t session_id, uint32_t t
   {
     return UPGRADE_STAGE_INTEGRITY;
   }
+  // 4. 把选槽和预期基线发给存储端；存储端执行时再次复核，通过后才实际擦除候选槽。
   Request(UPGRADE_STORAGE_BEGIN);
   storage.request.pkg_len = total_size;
   storage.request.tx_id = storage.tx_id;
+  // Stage 使用 1/A、2/B，队列协议使用 0/A、1/B，跨边界时显式转换。
   storage.request.slot = (uint8_t)(storage.slot - 1U);
   ExpectBaseline();
   result = Exchange(&storage.begin_sent);
@@ -450,7 +464,11 @@ static UpgradeStageResult Prepare(void *context, uint32_t session_id, uint32_t t
   return UPGRADE_STAGE_OK;
 }
 
-// 将输入分成存储页大小的请求，逐块确认写入偏移。
+/*
+ * Stage 的 backend.write 适配：将一次最多 1016 B 输入拆成每条最多 256 B 的存储 RPC。
+ * 这是队列消息的数据容量，Flash 页边界仍由存储侧驱动处理；1016 B 会拆成 256+256+256+248 B。
+ * 每条都按值复制并等待对应应答；任一失败立即返回，不把入队成功当作写入成功。
+ */
 static UpgradeStageResult Write(void *context, uint32_t session_id, uint32_t offset,
                                   const uint8_t *data, uint32_t size, uint32_t timeout_ms)
 {
@@ -475,12 +493,14 @@ static UpgradeStageResult Write(void *context, uint32_t session_id, uint32_t off
     storage.request.tx_id = storage.tx_id;
     storage.request.offset = offset + done;
     storage.request.len = (uint16_t)count;
+    // 先复制到请求自带数组；Exchange 再把整条消息入队，不向存储任务借出调用方指针。
     memcpy(storage.request.data, data + done, count);
     UpgradeStageResult result = Exchange(NULL);
     if (result != UPGRADE_STAGE_OK)
     {
       return result;
     }
+    // 存储端写入并读回后返回累计 written；必须恰好到达本次请求末尾才推进下一小块。
     if (storage.response.written != offset + done + count)
     {
       return UPGRADE_STAGE_INTEGRITY;
@@ -531,7 +551,11 @@ static bool SameReady(const UpgradeStateRecord *a, const UpgradeStateRecord *b)
       && UpgradeState_PackageEqual(&a->candidate, &b->candidate);
 }
 
-// 提交候选 READY 并读回核对，提交不明时仅解析现有记录。
+/*
+ * Stage 的 backend.commit 适配：提交候选 READY 并读回完整持久身份，返回状态与错误码分别判断。
+ * 尚未入队可明确 NOT_WRITTEN；已入队而结果未核实则保持 UNKNOWN，不能凭超时断言未写。
+ * 已发送提交后的调用只读解析：目标 READY 完整匹配为 WRITTEN，原完整基线仍在才为 NOT_WRITTEN。
+ */
 static UpgradeStageResult Commit(void *context, uint32_t session_id,
                                    const UpgradeStatePackage *candidate, bool resolve_only,
                                    UpgradeStageCommitState *state, uint32_t timeout_ms)
@@ -552,6 +576,7 @@ static UpgradeStageResult Commit(void *context, uint32_t session_id,
   }
   if (storage.commit_sent)
   {
+    // 提交只发一次；本次 LoadProtection 同样经 Storage 队列，元数据读取排在原提交操作之后。
     if ((protection.recovery_result == UPGRADE_STATE_EMPTY)
         && SameReady(&protection.normal, &storage.ready))
     {
@@ -563,7 +588,7 @@ static UpgradeStageResult Commit(void *context, uint32_t session_id,
     {
       return UPGRADE_STAGE_INTEGRITY;
     }
-    // 元数据读请求排在原提交之后；看到原完整基线才可判定未写，不盲目重发。
+    // 新 READY 不匹配时仍须证明原完整基线未变；读错误、身份冲突或恢复屏障都不能判为未提交。
     *state = UPGRADE_COMMIT_NOT_WRITTEN;
     return UPGRADE_STAGE_STORAGE;
   }
@@ -577,6 +602,7 @@ static UpgradeStageResult Commit(void *context, uint32_t session_id,
   {
     return UPGRADE_STAGE_MODE;
   }
+  // 保留已确认旧包，只替换候选描述；序号递增并关联已预留的持久事务号。
   storage.ready = storage.baseline;
   storage.ready.sequence++;
   storage.ready.phase = UPGRADE_STATE_READY;
@@ -595,6 +621,7 @@ static UpgradeStageResult Commit(void *context, uint32_t session_id,
   {
     return UPGRADE_STAGE_INTEGRITY;
   }
+  // commit_sent 只表示请求已入队；即使等待超时或收到失败应答，也先按 UNKNOWN 交给后续只读核对。
   result = Exchange(&storage.commit_sent);
   *state = storage.commit_sent ? UPGRADE_COMMIT_UNKNOWN : UPGRADE_COMMIT_NOT_WRITTEN;
   if (result == UPGRADE_STAGE_OK)
@@ -627,11 +654,13 @@ static UpgradeStageResult ReadBootState(void *context, UpgradeStateProtection *s
   return LoadProtection(state);
 }
 
+// Stage 调用此函数表，Prepare/Write/Read/Commit 再把升级操作转成存储请求和应答。
 static const UpgradeStageBackend backend = {Prepare, Write, Read, Keys, Close, Commit, ReadBootState};
 
 // 检查基线、协议尺寸、真实队列及密钥，接入升级后端。
 UpgradeStageResult UpgradeStorage_Bind(const UpgradeStorageBinding *binding)
 {
+  // 存储侧提供已经建立的队列；此处只校验并绑定，不另建存储任务或直接访问 Flash。
   if ((binding == NULL) || (binding->requests == NULL) || (binding->responses == NULL))
   {
     return UPGRADE_STAGE_INVALID;
@@ -651,8 +680,10 @@ UpgradeStageResult UpgradeStorage_Bind(const UpgradeStorageBinding *binding)
   {
     return UPGRADE_STAGE_NOT_READY;
   }
+  // 请求队列交给存储任务消费，应答队列供升级执行任务等待；消息按值拷贝。
   storage.requests = binding->requests;
   storage.responses = binding->responses;
+  // 把上面的函数表交给 Stage，接通 Entry → Stage → 存储队列 → 存储任务这条链。
   UpgradeStageResult result = UpgradeStage_Bind(&backend, NULL);
   storage.bound = result == UPGRADE_STAGE_OK;
   return result;

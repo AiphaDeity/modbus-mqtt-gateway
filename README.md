@@ -85,15 +85,12 @@ build/AppDebug/firmware/app/modbus-mqtt-gateway.elf
 build/BootSizeCheck/firmware/bootloader/bootloader.elf
 ```
 
-日常使用 `AppDebug` 和 `BootSizeCheck`。其余预设用于独立调试或专项测试，按需生成；删除构建目录不会删除预设。统一从仓库根目录选择并构建，不使用子工程的 CubeMX 默认预设：
+统一从仓库根目录构建，仅保留配套的 `AppDebug` 和 `BootSizeCheck` 两个预设：
 
 | 预设 | 用途 |
 | --- | --- |
 | AppDebug | 从 `0x08010000` 启动、由 Boot 管理的应用 |
 | BootSizeCheck | 按体积优化的完整 Boot 路径 |
-| Debug / Release / AppFlashDebug | 从 `0x08000000` 独立启动的应用；Release 使用体积优化 |
-| BootDebug | 64 KiB Boot，保留调试信息及认证耗时日志 |
-| M3Test | 禁用 M2 网络模块的独立 App 构建 |
 
 Boot、App及配套工具统一使用持久兼容号2，其他版本拒绝，不自动迁移旧日志。首次部署及M3对接约定见[升级模块说明](firmware/app/services/upgrade/README.md)。
 
@@ -101,9 +98,11 @@ Boot、App及配套工具统一使用持久兼容号2，其他版本拒绝，不
 
 Boot/App 默认通过 `firmware/shared/upgrade_trust_flash.c` 读取 Boot 末尾预留区的信任记录；缺少有效记录时升级入口保持关闭。`GATEWAY_UPGRADE_TRUST_SOURCE` 可指定其他保护区实现，布局和部署边界见[升级模块说明](firmware/app/services/upgrade/README.md#信任资料工具与启用)。固件构建不依赖测试密钥夹具。
 
+仓库内的云实例、设备标识、Broker 地址和固件下载前缀均为占位示例，联网部署前须填写本机配置，真实地址与凭据不得提交。MQTT 配置位于 `firmware/app/services/mqtt/mqtt_client.c` 和 `firmware/app/common/app_config.c`，PC 工具的配置需与设备一致。固件的 `NW_UPG_BOS_PREFIX` 与 `tools/package_upgrade.py` 的 `BOS_PREFIX` 必须同步配置；默认的 `example.invalid` 下载地址仅作示例。
+
 调整目录或切换工具链后，如缓存仍引用旧路径，在命令面板执行 `CMake: Delete Build Directory and Reconfigure`，再执行生成。该操作清除所选构建目录，不影响源码。
 
-App 和 Boot 的 CubeMX 配置分别为 `firmware/app/modbus-mqtt-gateway.ioc`、`firmware/bootloader/bootloader.ioc`，生成位置保持在各自工程目录，并保留 USER CODE。自有业务源码放在 `services/`、`integration/` 或 `bootloader/boot/`，生成文件中只保留必要接入。重新生成后检查构建配置差异，再从仓库根目录构建。
+App 和 Boot 的 CubeMX 配置分别为 `firmware/app/modbus-mqtt-gateway.ioc`、`firmware/bootloader/bootloader.ioc`，生成位置保持在各自工程目录，并保留 USER CODE。自有业务源码放在 `services/`、`integration/` 或 `bootloader/boot/`，生成文件中只保留必要接入。重新生成后检查构建配置差异；若生成了子目录 `CMakePresets.json`，删除这些重复入口，仍从仓库根目录构建。
 
 独立应用使用 `STM32F407xx_FLASH.ld`；AppDebug 使用 `STM32F407xx_APP.ld`，与 Boot 共同保留普通 SRAM 首 64 B 作为复位邮箱。堆、存储任务栈和监督任务栈使用普通 SRAM；其余业务栈的放置以 `integration/app_modules.c` 为准，CCM 中的缓冲不能交给 DMA。
 

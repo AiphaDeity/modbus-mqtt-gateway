@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "gateway_id": "mb2mqtt_001",
+  "gateway_id": "gateway-demo",
   "command_id": "cmd_0001",
   "issued_at_ms": 1793318600000,
   "expires_at_ms": 1793318900000,

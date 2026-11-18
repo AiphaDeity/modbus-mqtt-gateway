@@ -21,7 +21,6 @@
 #include "storage_upgrade_q.h"
 #include "storage_upgrade_tf.h"
 #include "upgrade_storage.h"
-#include "m3_selftest.h"
 
 #include "cmsis_os2.h"
 
@@ -84,7 +83,10 @@ void EXTI3_IRQHandler(void)
     HAL_GPIO_EXTI_IRQHandler(SD_CARD_DET_Pin);
 }
 
-/* 创建队列和基础资源；耗时控制日志恢复由Storage_Task执行。 */
+/*
+ * 由 App_ModulesInit 在启动任务中调用，创建队列、互斥锁并初始化基础驱动，不创建存储任务。
+ * 成功仅表示完成基础装配；持久状态恢复和运行状态报告留给随后创建的 Storage_Task。
+ */
 AppModuleInitResult Storage_Init(void)
 {
     /* 先创建升级通道，初始化失败不能留下没有消费者的空句柄。 */
@@ -125,7 +127,7 @@ AppModuleInitResult Storage_Init(void)
     // PD3 EXTI 热插拔：让插拔事件在任何时候都能被捕获
     sdcard_detect_exti_init();
 
-    /* 持久数据恢复及必要初始化全部留在Storage_Task。 */
+    // Flash 和 TF 的实际可用性在任务中继续检查，不能用这里的 INIT_OK 代替存储服务就绪。
     return APP_MODULE_INIT_OK;
 }
 
@@ -140,10 +142,14 @@ static bool sdcard_physical_present(void)
     return (HAL_GPIO_ReadPin(SD_CARD_DET_GPIO_Port, SD_CARD_DET_Pin) == GPIO_PIN_RESET);
 }
 
-/* 存储所有者：恢复业务状态并处理记录、升级和TF文件请求。 */
+/*
+ * 由装配表经 App_ModuleTaskEntry 调度进入，作为运行期存储所有者访问介质。
+ * 先恢复业务状态、报告资源条件，再持续处理记录、升级和 TF 文件请求。
+ */
 void Storage_Task(void *argument)
 {
     (void)argument;
+    // 1. 登记当前任务为存储所有者，建立受监督的恢复阶段；失败时报告致命故障并退出。
     if (!storage_runtime_start()) {
         Monitor_ReportFatal(APP_MODULE_STORAGE);
         osThreadExit();
@@ -152,7 +158,8 @@ void Storage_Task(void *argument)
     storage_upgrade_init(s_flash_ok);
     storage_m2_init();
 
-    /* 正常启动允许首次配置；试运行仅恢复，不写空白高水位或时间下界。 */
+    // 2. 恢复序列、身份、配置、时间下界和控制日志，尚未对其他模块发布资源就绪。
+    // 正常启动允许首次配置；试运行仅恢复，不写空白高水位或时间下界。
     bool bootstrap_write = storage_mutation_begin();
     bool seq_ok = s_flash_ok && storage_seq_init() == HAL_OK;
     bool identity_ok = s_flash_ok && storage_identity_init() == HAL_OK;
@@ -161,6 +168,7 @@ void Storage_Task(void *argument)
     s_log_ok = s_flash_ok && storage_ctrllog_init() == HAL_OK;
     if (bootstrap_write) storage_mutation_end();
 
+    // 3. 检查 TF 记录恢复结果及序号一致性，分别得出核心可用性和本轮恢复健康结果。
     HAL_StatusTypeDef tf_check = storage_record_restore();
     /* 序号元数据丢失或倒退时，不能从初始值重新发号覆盖既有记录。 */
     uint64_t high_watermark = storage_seq_get_high_watermark();
@@ -170,8 +178,10 @@ void Storage_Task(void *argument)
                    s_floor_ok && s_log_ok && storage_m2_settled();
     printf("[M3] restore flash=%u seq=%u id=%u cfg=%u floor=%u log=%u tf=%u\r\n",
            s_flash_ok, seq_ok, identity_ok, config_ok, s_floor_ok, s_log_ok, (unsigned)tf_check);
+    // runtime_finish 保存准入/健康状态并向 Monitor 报告进展，不等同于给所有资源置位。
     storage_runtime_finish(core_ok, core_ok && tf_check == HAL_OK);
 
+    // 4. 核心恢复通过后绑定升级请求/响应队列，实际读写仍由本任务消费请求完成。
     if (core_ok) {
         const UpgradeStorageBinding binding = {
             storage_upgrade_req_queue(), storage_upgrade_rsp_queue(), UPGRADE_STORAGE_PROTOCOL_VERSION
@@ -180,19 +190,11 @@ void Storage_Task(void *argument)
         if (st != UPGRADE_STAGE_OK) printf("[UPGQ] bind not ready result=%d\r\n", (int)st);
     }
     storage_upgrade_tf_bind();
+    // 当前 STORAGE 和 CONTROL_STATE 两项就绪位都按 core_ok 发布。
+    // TF 是否已挂载仍需查询记录服务的实际状态，TIME 则独立依据时间服务判断。
     App_SetResourceReady(APP_RESOURCE_STORAGE, core_ok);
     App_SetResourceReady(APP_RESOURCE_TIME, storage_time_is_valid());
     App_SetResourceReady(APP_RESOURCE_CONTROL_STATE, core_ok);
-
-#if M3_SELFTEST_ENABLE
-    /* 写入诊断只允许显式打开且通过正常启动门控，不参与产品健康判定。 */
-    if (storage_mutation_begin()) {
-        (void)storage_runtime_wait(20000U);
-        m3_selftest_run();
-        storage_mutation_end();
-        storage_runtime_report();
-    }
-#endif
 
     uint32_t last_floor_tick = HAL_GetTick() - STORAGE_TIMEFLOOR_STEP_SEC * 1000U;
     uint32_t last_time_check_tick = HAL_GetTick();
@@ -200,6 +202,7 @@ void Storage_Task(void *argument)
     uint32_t last_retry_tick = 0U;
     bool last_card_present = sdcard_physical_present();
 
+    // 5. 进入持续服务阶段；卡检测、时间检查、业务维护和请求队列在同一所有者任务中推进。
     for (;;) {
         if (!storage_runtime_wait(5000U)) {
             Monitor_ReportFatal(APP_MODULE_STORAGE);
@@ -261,10 +264,12 @@ void Storage_Task(void *argument)
             storage_mutation_end();
         }
 
-        /* 暂停不停止升级/文件/结算队列，避免等待自己的消费者造成死锁。 */
+        // 新业务暂停后仍按原顺序处理升级、文件和结算/同步请求，让消费者能完成收尾及 READY 写入。
+        // 不能把暂停实现为挂起 Storage_Task，否则升级任务会一直等不到这些服务的真实应答。
         storage_upgrade_q_process(1U);
         storage_upgrade_tf_process();
         storage_runtime_process();
+        // 一轮工作后报告真实进展和存储健康，最终是否喂狗由 Monitor 汇总决定。
         storage_runtime_report();
         osDelay(1U);
     }

@@ -30,6 +30,7 @@ Boot_UpgradeResult Boot_UpgradeLoad(Boot_UpgradeState *state);
 
 /*
  * 保存可信调用方提供的状态，自动分配序号；不保存指针，不自动重试。
+ * 新序号只编码到持久记录，不修改 const 入参；成功后需要最新身份时重新调用 Load。
  * 调用方须先完整认证所引用包；首次登记 confirmed 还须比对当前已确认 App。
  * CRC 仅检测意外损坏，不提供防恶意改写或反降级保护。
  * 返回失败时新记录仍可能已提交，必须重新 Load 后决策，不能沿用旧内存状态。

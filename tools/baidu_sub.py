@@ -5,16 +5,16 @@
 
 用法:
     python tools/baidu_sub.py                          # 订阅 telemetry
-    python tools/baidu_sub.py --topic $iot/stm32_gw_01/user/commands
+    python tools/baidu_sub.py --topic $iot/gateway-demo/user/commands
     python tools/baidu_sub.py --all                    # 订阅 telemetry+commands+ota+acks
     python tools/baidu_sub.py --raw                    # 原始 hex 显示（不解析 JSON）
     python tools/baidu_sub.py --host xxx.iot.gz.baidubce.com --port 1883
 
-默认订阅: $iot/stm32_gw_01/user/telemetry
+默认订阅: $iot/gateway-demo/user/telemetry
 
 ⚠️ 重要警告:
     百度云同一设备身份只允许一个 MQTT 连接！
-    本脚本用 stm32_gw_01 身份连接，会把板子踢下线。
+    本脚本用 gateway-demo 身份连接，会把板子踢下线。
     - 板子被踢后不再发遥测，PC 收不到数据
     - 想看板子发的数据，请用 --all 订阅所有 topic，板子重连的间隙可能抓到数据
     - 最可靠的方式：停板子 → PC 连 → 用 baidu_pub.py 往 telemetry topic 发测试消息 → PC 接收验证
@@ -29,10 +29,10 @@ import json
 import time
 import datetime
 
-# ===== 设备三元组（用 pc_observer 身份，不影响板子的 stm32_gw_01 连接）=====
+# ===== 设备三元组（用 observer-demo 身份，不影响板子的 gateway-demo 连接）=====
 # ⚠️ git commit 前改成 "YOUR_DEVICE_SECRET" 占位符
-IOTCORE_ID    = "aeklwww"
-DEVICE_KEY    = "pc_observer"
+IOTCORE_ID    = "YOUR_IOTCORE_ID"
+DEVICE_KEY    = "observer-demo"
 DEVICE_SECRET = "YOUR_DEVICE_SECRET"    # 占位符，测试时替换为真实密钥
 REGION        = "gz"
 

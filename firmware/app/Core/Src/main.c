@@ -77,6 +77,9 @@ int main(void)
 
   /* USER CODE BEGIN 1 */
 
+  // Boot_JumpToApp 先进入 App Reset_Handler；启动文件完成数据段和 C 运行环境初始化后到达这里。
+  // App 主流程：接管 IWDG → 初始化外设 → 建立 RTOS 启动任务 → 调度 App_Entry 装配业务。
+
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -85,6 +88,9 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
+  // 1. HAL 时基建立后立即接管仍在运行的 IWDG，再执行后面的时钟和外设初始化。
+  // DEBUG 时允许调试暂停冻结计数；正常运行仍须由后续 Monitor 按健康条件喂狗。
+  // 这里重配和重装的是 Boot 留下的同一个 IWDG；早期初始化完成后，刷新资格交给监督任务。
 #if defined(DEBUG)
   if (!Watchdog_Start(true))
 #else
@@ -101,6 +107,9 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
+
+  // 2. 时钟配置完成，下面建立 App 所需的外设接口；模块业务尚未开始运行。
+  // MX_ETH_Init/MX_FATFS_Init 是底层初始化，实际网络及存储恢复由后续任务处理。
 
   /* USER CODE END SysInit */
 
@@ -121,6 +130,7 @@ int main(void)
   printf("WDG BUDGET app peripherals elapsed_ms=%lu\r\n",
          (unsigned long)(HAL_GetTick() - watchdog_peripherals_started_ms));
   printf("Gateway boot V133\r\n");
+  // Boot 管理启动时已消费并清除复位标志，这里的全零标志不能单独排除 IWDG 复位。
   uint32_t reset_flags = RCC->CSR;
   printf("[BOOT] reset: POR=%d BOR=%d PIN=%d SW=%d IWDG=%d WWDG=%d LPWR=%d CSR=0x%08lX\r\n",
          (reset_flags & RCC_CSR_PORRSTF) ? 1 : 0, (reset_flags & RCC_CSR_BORRSTF) ? 1 : 0,
@@ -128,7 +138,9 @@ int main(void)
          (reset_flags & RCC_CSR_IWDGRSTF) ? 1 : 0, (reset_flags & RCC_CSR_WWDGRSTF) ? 1 : 0,
          (reset_flags & RCC_CSR_LPWRRSTF) ? 1 : 0, (unsigned long)reset_flags);
   __HAL_RCC_CLEAR_RESET_FLAGS();
-  // 网卡在线程上下文初始化；内核由下方生成代码初始化一次。
+  // 3. 接下来 osKernelInitialize 建立内核，MX_FREERTOS_Init 创建 defaultTask，尚未执行任务体。
+  // 4. osKernelStart 开始调度，defaultTask 的 StartDefaultTask 再调用 App_Entry 装配业务。
+  // 正常执行会转到 freertos.c 的启动任务，不再回到 main 的 while 循环。
   /* USER CODE END 2 */
 
   /* Init scheduler */

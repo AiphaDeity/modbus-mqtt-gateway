@@ -110,7 +110,10 @@ static DRESULT tf_disk_write(BYTE lun, const BYTE *buf, DWORD sector, UINT count
     return RES_WRPRT;
 }
 
-/* 在单一存储所有者内临时替换磁盘读回调；返回前恢复生成驱动，不改生成代码。 */
+/*
+ * Storage_Task 经 tf_handle 进入实际 FatFs open/read/close，不在 TF 升级任务中操作文件。
+ * 临时替换磁盘读回调以沿用本次期限；返回前恢复生成驱动，不改生成代码。
+ */
 static FRESULT tf_file_io(const tf_req_t *req, uint8_t *data, UINT *actual, uint32_t *files)
 {
     if (disk.drv[0] == NULL || disk.is_initialized[0] == 0U) return FR_NOT_READY;
@@ -351,7 +354,10 @@ bool storage_upgrade_tf_init(void)
     return s_req_q != NULL && s_rsp_q != NULL;
 }
 
-/* 文件服务已能处理真实请求后才绑定；卡缺失由open按降级结果报告。 */
+/*
+ * Storage_Task 将文件队列客户端回调绑定给 UpgradeTf；调用回调只发请求并等待存储端处理。
+ * 绑定成功不表示已有 TF 卡或文件，卡缺失仍由 open 报告实际结果。
+ */
 void storage_upgrade_tf_bind(void)
 {
     if (s_bound || s_req_q == NULL || s_rsp_q == NULL) return;
@@ -361,7 +367,10 @@ void storage_upgrade_tf_bind(void)
     else printf("[UPGTF] bind failed result=%d\r\n", (int)st);
 }
 
-/* 值拷贝应答不引用FIL或DMA缓冲，深度1满时替换迟到应答。 */
+/*
+ * Storage_Task 循环消费 TF 文件请求，在本任务内执行后发送值拷贝应答。
+ * 应答不引用 FIL 或 DMA 缓冲；深度 1 队列满时替换迟到应答，由客户端核对请求身份。
+ */
 void storage_upgrade_tf_process(void)
 {
     if (s_req_q == NULL || s_rsp_q == NULL) return;

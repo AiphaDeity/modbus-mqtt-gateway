@@ -333,17 +333,17 @@ static void cleanup_attempt(const UpgradeEntryPeer *peer)
     s_cleanup_pending = !closed;
 }
 
-/* ===== 下载回调：调 UpgradeEntry_Write =====
- * 由 NetworkDownloader_Fetch 每收到一块数据时回调。
- * offset = 当前块在整个文件中的字节偏移
- * data/len = 当前块数据（≤1016B）
- * 回调里调 M4 的 UpgradeEntry_Write 把数据写入 Flash。 */
+/*
+ * 下载器在 NetworkUpgrade_Task 中同步回调，将包内字节偏移和最多 1016 B 数据交给统一入口。
+ * data 属于下载器，仅在本次回调期间借用；返回 OK 后下载器会推进偏移并复用缓冲。
+ * Entry/Stage 经存储队列完成写入和读回，回调及下载器都不直接操作 Flash 驱动。
+ */
 static nw_dl_status_t download_chunk_callback(void *ctx_, uint32_t offset,
                                               const uint8_t *data, uint32_t len)
 {
     nw_download_ctx_t *ctx = (nw_download_ctx_t *)ctx_;
 
-    /* 调 M4 接口写入 Flash（UpgradeEntry_Write 内部处理 Flash 写入 + 偏移校验） */
+    // 沿用 Begin 的来源和会话号；下层全部写入、读回成功后才向下载器报告本块完成。
     UpgradeStageResult ret = UpgradeEntry_Write(ctx->peer, ctx->session_id,
                                                 offset, data, len);
     if (ret != UPGRADE_STAGE_OK)
@@ -372,12 +372,16 @@ static nw_dl_status_t download_chunk_callback(void *ctx_, uint32_t offset,
 /* 仅表示已请求暂停；停稳结果须查询两个任务的实际确认。 */
 static volatile bool s_quiesced = false;
 
+// 查询是否已发出网络暂停请求；实际停稳还须分别取得 MQTT 和 Telemetry 的任务确认。
 bool NetworkUpgrade_IsQuiesced(void)
 {
     return s_quiesced;
 }
 
-/* 原子关闭两个任务的业务入口，每次请求撤销旧确认。 */
+/*
+ * Network 的 pause 回调：向 MQTT 和 Telemetry 同时请求停止新业务，每次请求撤销旧确认。
+ * 返回成功只表示请求已登记；原任务继续处理保活、升级状态或已接纳的收尾，停稳由 settle 确认。
+ */
 static UpgradeStageResult quiesce_pause(void *ctx, uint32_t timeout_ms)
 {
     (void)ctx;
@@ -399,6 +403,7 @@ static UpgradeStageResult quiesce_settle(void *ctx, uint32_t timeout_ms)
     while ((uint32_t)(HAL_GetTick() - started_ms) < timeout_ms)
     {
         if (!s_quiesced) return UPGRADE_STAGE_MODE;
+        // MQTT 须自己到达安全点且发送锁可用，Telemetry 须退出当前采集/投递；本回调不替它们置确认。
         bool mqtt_paused = MqttClient_IsPaused();
         bool telemetry_paused = Telemetry_IsPaused();
         if (mqtt_paused && telemetry_paused) return UPGRADE_STAGE_OK;
@@ -429,6 +434,7 @@ static UpgradeStageResult quiesce_resume(void *ctx, uint32_t timeout_ms)
     return UPGRADE_STAGE_OK;
 }
 
+// NetworkUpgrade_Init 登记此表；sync 复查停稳，实际持久数据同步交给后续 Storage 阶段。
 static const UpgradeQuiesceParticipant s_quiesce_participant =
 {
     .pause = quiesce_pause,
@@ -525,7 +531,11 @@ rejected:
     return result;
 }
 
-/* 在原网络升级任务中登记监督，串行执行下载、认证与启动结果上报。 */
+/*
+ * 装配创建的网络升级任务：等待通知 → 核验许可 → Begin → 流式下载/Write → Finish → 复位。
+ * MQTT 任务只提交待验通知，耗时的验签、RTC 读取、HTTPS 和候选包认证均在本任务推进。
+ * Finish 成功仅表示 READY 已持久化，安装及最终确认结果在后续 Boot/App 启动链中产生。
+ */
 void NetworkUpgrade_Task(void *argument)
 {
     (void)argument;
@@ -571,10 +581,12 @@ void NetworkUpgrade_Task(void *argument)
         }
         if (!s_pending_req.valid) continue;
 
+        // 1. 取走 MQTT 已解析的通知快照；Notify 受理成功还不代表已获得升级许可。
         nw_upgrade_request_t req;
         memcpy(&req, &s_pending_req, sizeof(req));
         s_pending_req.valid = false;
 
+        // 2. 核对 UTC 有效期和通知签名，验签后再读时间，确认仍有效才发布本轮授权。
         if (!Monitor_UpgradeWait(3000U)) return;
         uint32_t utc = storage_get_unix_time();
         if (!Monitor_UpgradeProgress()) return;
@@ -620,11 +632,12 @@ void NetworkUpgrade_Task(void *argument)
             .epoch = epoch,
         };
 
-        /* ① Begin */
+        // 3. 固定本轮网络 peer/epoch，经统一入口准备候选槽并取得 session_id。
         uint32_t session_id = 0;
         s_phase = 1;
         report_status(req.task_id, "downloading", NULL);
 
+        // 长度和整包传输摘要已由签名通知提供；网络不使用 TF 文件路径，所以传 NULL。
         UpgradeStageResult ret = UpgradeEntry_Begin(&peer, NULL, req.size,
                                                     req.sha256, &session_id);
         if (ret != UPGRADE_STAGE_OK)
@@ -637,8 +650,8 @@ void NetworkUpgrade_Task(void *argument)
         }
         printf("[NWUPG] Begin OK: session=%u epoch=%u\r\n", (unsigned)session_id, (unsigned)epoch);
 
-        /* ② 下载（回调里调 Write 写 Flash）
-         * 构造下载参数：URL + auth_token + 回调 + chunk_size */
+        // 4. 按剩余授权期限下载，收到一块就同步交给 Write，避免将整包保存在 RAM。
+        // dl_ctx 在 Fetch 及其全部回调返回前有效，不留给后台任务异步引用。
         nw_download_ctx_t dl_ctx =
         {
             .peer = &peer,
@@ -676,8 +689,8 @@ void NetworkUpgrade_Task(void *argument)
             continue;
         }
 
-        /* ③ Finish：M4 校验 SHA256 + 签名 → 提交 READY 状态 → 暂停业务
-         * Finish 成功 = 固件已完整写入 Flash 且校验通过，可以重启了 */
+        // 5. 下载完成只表示所有块已交给接收链；通知验签不能替代实际候选包的认证。
+        // UpgradeEntry_Finish 先认证到 VERIFIED，再暂停业务、结算同步并提交 READY，顺序不能倒置。
         s_phase = 2;
         report_status(req.task_id, "verifying", NULL);
 
@@ -697,10 +710,9 @@ void NetworkUpgrade_Task(void *argument)
         report_status(req.task_id, "ready", NULL);
         osDelay(1000);   /* 给云端 1s 收到 status 的时间 */
 
-        /* ④ Reboot：M4 重启设备
-         * 重启后 Boot 核验新固件：通过 → 启动新 App → 上报 trial/confirmed
-         *                          失败 → 回滚旧固件 → 上报 rolled_back
-         * Reboot 成功不会返回（设备已重启），返回则说明失败 */
+        // 6. READY 已持久化后请求软件复位；Boot 后续负责重新认证、安装和试运行状态处理。
+        // 新 App 健康确认及 Boot 持久转正后才产生 confirmed 结果，不能以本次下载成功代替。
+        // Reboot 成功不会返回；Stage 的周期 Poll 也提供 READY 后延迟复位兜底。
         s_phase = 4;
         report_status(req.task_id, "rebooting", NULL);
         ret = UpgradeEntry_Reboot(&peer, session_id);

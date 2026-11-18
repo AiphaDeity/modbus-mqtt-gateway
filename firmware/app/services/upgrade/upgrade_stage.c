@@ -13,6 +13,10 @@
 
 #include <string.h>
 
+/*
+ * 管理一份候选包的接收状态，不直接驱动 Flash；实际读写交给已绑定的存储后端。
+ * 状态顺序为 STAGING、VERIFIED、QUIESCING、REBOOT_PENDING；最后一阶段才允许复位。
+ */
 static bool initialized;
 static bool operation_busy;
 static bool backend_ready;
@@ -20,11 +24,11 @@ static bool storage_open;
 // 仅针对已发布会话；Entry另行锁存连接断线，覆盖尚无会话号的准备期。
 static bool cancel_requested;
 static uint32_t allocated_session_id;
-static uint32_t last_progress_ms;
-static uint32_t commit_started_ms;
+static uint32_t last_progress_ms; // 仅新增且读回正确的数据块推进无进展期限，单位 ms。
+static uint32_t commit_started_ms; // 暂停及提交共用的固定起点，查询不会续期。
 static uint32_t reboot_pending_ms;
 static UpgradePackageImage verified_image;
-static uint8_t expected_sha256[UPGRADE_STAGE_SHA256_SIZE];
+static uint8_t expected_sha256[UPGRADE_STAGE_SHA256_SIZE]; // 整个加密包的摘要，区别于明文镜像摘要。
 static UpgradeStageBackend backend;
 static void *backend_context;
 // session仅由占有operation_busy的任务修改；查询只读取临界区内发布的快照。
@@ -186,6 +190,7 @@ static UpgradeStageResult CheckSession(uint32_t session_id)
 // 比较整块的持久读回；追加和重复块共用，不靠CRC或最后一块缓存判断相同。
 static UpgradeStageResult ReadMatches(uint32_t offset, const uint8_t *expected, uint32_t size)
 {
+  // 后端写成功后还要独立读回，不使用发送缓存或存储端应答中的 written 代替实际内容。
   uint32_t compared = 0U;
   while (compared < size)
   {
@@ -331,6 +336,7 @@ UpgradeStageResult UpgradeStage_ReadBootState(UpgradeStateProtection *state, uin
 UpgradeStageResult UpgradeStage_Begin(UpgradeStageSource source, uint32_t total_size,
                                      const uint8_t *package_sha256, uint32_t *session_id)
 {
+  // Entry 已校验来源；本层继续检查运行模式、已有会话及存储后端，检查通过才准备候选槽。
   if (session_id == NULL)
   {
     return UPGRADE_STAGE_INVALID;
@@ -356,6 +362,7 @@ UpgradeStageResult UpgradeStage_Begin(UpgradeStageSource source, uint32_t total_
   {
     return ReleaseOperation(UPGRADE_STAGE_MODE);
   }
+  // 试运行期间不能开启下一次升级；暂停提交期间也不允许建立新写入会话。
   if (!UpgradeQuiesce_AllowsMutation())
   {
     return ReleaseOperation(UPGRADE_STAGE_MODE);
@@ -392,6 +399,7 @@ UpgradeStageResult UpgradeStage_Begin(UpgradeStageSource source, uint32_t total_
   storage_open = true;
   uint32_t started_ms = HAL_GetTick();
   UpgradeStagePrepared prepared = {0};
+  // 后端先认证可信旧源并核对保护状态，再选择候选槽；传输方不能指定覆盖保护槽。
   result = backend.prepare(backend_context, session.session_id, total_size, &prepared,
                             UPGRADE_STAGE_PREPARE_TIMEOUT_MS);
   session.slot = prepared.slot;
@@ -422,7 +430,11 @@ UpgradeStageResult UpgradeStage_Begin(UpgradeStageSource source, uint32_t total_
   return ReleaseOperation(UPGRADE_STAGE_OK);
 }
 
-// 写入连续块或核对重复块，持久读回一致后才推进偏移。
+/*
+ * 由 Entry 校验来源归属后调用，接收包内字节偏移 offset 和 1～1016 B 的同步输入。
+ * 连续块先写再独立读回；完全位于已确认范围的重复块只比较，不能跨越当前写入尾部。
+ * 返回前完成对 data 的访问；只有新增且持久读回一致的数据才推进偏移和进展期限。
+ */
 UpgradeStageResult UpgradeStage_Write(uint32_t session_id, uint32_t offset,
                                      const uint8_t *data, uint32_t size)
 {
@@ -448,11 +460,13 @@ UpgradeStageResult UpgradeStage_Write(uint32_t session_id, uint32_t offset,
   {
     return ReleaseOperation(UPGRADE_STAGE_MODE);
   }
+  // 1. 拒绝跳写、越过包尾，以及一部分重复、一部分新增的交叠块。
   if ((offset > session.next_offset) || (size > session.total_size - offset)
       || ((offset < session.next_offset) && (size > session.next_offset - offset)))
   {
     return ReleaseOperation(UPGRADE_STAGE_OFFSET);
   }
+  // 2. 当前尾部才是追加；完全落在已写区的重复块只读回比对，不再次编程。
   bool append = (offset == session.next_offset);
   if (append)
   {
@@ -469,6 +483,7 @@ UpgradeStageResult UpgradeStage_Write(uint32_t session_id, uint32_t offset,
   }
   if (result == UPGRADE_STAGE_OK)
   {
+    // 3. 上层每块都重新经 backend.read 读取候选槽，核对通过后才报告接收进展。
     result = ReadMatches(offset, data, size);
   }
   uint32_t completed_ms = HAL_GetTick();
@@ -486,13 +501,18 @@ UpgradeStageResult UpgradeStage_Write(uint32_t session_id, uint32_t offset,
   }
   if (append)
   {
+    // 4. 只有新增数据持久读回一致才推进偏移和时间，重复请求不能维持一个停滞会话。
     session.next_offset += size;
     last_progress_ms = completed_ms;
   }
   return ReleaseOperation(UPGRADE_STAGE_OK);
 }
 
-// 从实际存储重新读取整包，传输摘要覆盖签名字节，与Boot的验签摘要范围不同。
+/*
+ * 从候选 Flash 偏移 0 重读完整包，计算 H_package=SHA256(M+S+C+T)，与 Begin 提供的摘要比较。
+ * TF 的预期值来自第一遍读文件，网络预期值来自已授权通知；本检查不代替固件包签名认证。
+ * 这里包含 S；后续公共认证重算的 H_sign=SHA256(M+C+T) 则跳过 S，两者不能混用。
+ */
 static UpgradeStageResult CheckPackageHash(uint32_t started_ms)
 {
   mbedtls_sha256_context hash;
@@ -573,7 +593,10 @@ UpgradeStageResult UpgradeStage_Finish(uint32_t session_id)
   {
     return ReleaseOperation(UPGRADE_STAGE_OFFSET);
   }
+  // 字节收齐只是认证前提；后续仍须从实际 Flash 核对传输摘要并认证包内容。
   uint32_t started_ms = HAL_GetTick();
+  // 从外部 Flash 读实际包：先核对传输摘要，再检查签名、GCM、明文摘要和向量。
+  // 存储读取走 backend.read → upgrade_storage.c 的队列适配，升级任务不直接操作介质。
   result = CheckPackageHash(started_ms);
   uint32_t remaining = RemainingMs(started_ms, UPGRADE_STAGE_VERIFY_TIMEOUT_MS);
   if (remaining == 0U)
@@ -582,6 +605,7 @@ UpgradeStageResult UpgradeStage_Finish(uint32_t session_id)
   }
   if (result == UPGRADE_STAGE_OK)
   {
+    // 完整传输一致后再用可信密钥检查来源和解密结果，不能凭一个匹配的普通摘要接受固件。
     result = UpgradeStage_Authenticate(&backend, backend_context, session_id,
                                         session.total_size, started_ms, &verified_image);
     if (RemainingMs(started_ms, UPGRADE_STAGE_VERIFY_TIMEOUT_MS) == 0U)
@@ -593,6 +617,7 @@ UpgradeStageResult UpgradeStage_Finish(uint32_t session_id)
   {
     return ReleaseOperation(FailSession(result));
   }
+  // 此时尚未暂停业务，也未写入 READY；由 Entry 随后调用 Commit。
   session.phase = UPGRADE_STAGE_VERIFIED;
   return ReleaseOperation(UPGRADE_STAGE_OK);
 }
@@ -672,7 +697,11 @@ UpgradeStageResult UpgradeStage_Abort(uint32_t session_id)
   return ReleaseOperation(UPGRADE_STAGE_OK);
 }
 
-// 暂停业务并提交 READY，提交不明时只读核对结果。
+/*
+ * Entry 在包已 VERIFIED 后调用：暂停新业务、结算在途操作并同步，再请求持久 READY。
+ * 此处只提交安装意图；待系统复位后，Boot 才重新认证并将候选包安装到片内 App 区。
+ * 提交不明时保留 QUIESCING 和业务门控，后续调用只读核对，不重复擦写或擅自恢复业务。
+ */
 UpgradeStageResult UpgradeStage_Commit(uint32_t session_id)
 {
   if (!UpgradeStage_ExecutorAllowed())
@@ -692,6 +721,7 @@ UpgradeStageResult UpgradeStage_Commit(uint32_t session_id)
   {
     return ReleaseOperation(UPGRADE_STAGE_OK);
   }
+  // 首次提交后再进入 QUIESCING 只解析结果，不重做暂停流程，也不重发 READY 写入。
   bool resolve_only = session.phase == UPGRADE_STAGE_QUIESCING;
   if (!resolve_only && (session.phase != UPGRADE_STAGE_VERIFIED))
   {
@@ -721,6 +751,8 @@ UpgradeStageResult UpgradeStage_Commit(uint32_t session_id)
     }
     commit_started_ms = HAL_GetTick();
     PublishStatus();
+    // 当前 Commit 内部先调用 Run 暂停、结算和同步各模块，成功后下方 backend.commit 才持久提交。
+    // 各模块回调的具体顺序在 upgrade_quiesce.c，Run 本身不写候选 READY 记录。
     result = UpgradeQuiesce_Run(commit_started_ms, UPGRADE_STAGE_COMMIT_TIMEOUT_MS);
   }
   uint32_t remaining = RemainingMs(commit_started_ms, UPGRADE_STAGE_COMMIT_TIMEOUT_MS);
@@ -730,6 +762,7 @@ UpgradeStageResult UpgradeStage_Commit(uint32_t session_id)
   }
   if (result == UPGRADE_STAGE_OK)
   {
+    // 持久记录关联槽、包长和已认证的 H_image；Boot 据此重验包和片内 App，不把 H_package 当镜像身份。
     UpgradeStatePackage candidate = {session.slot, session.total_size, {0}};
     memcpy(candidate.digest, verified_image.digest, sizeof(candidate.digest));
     // 原提交到期后的调用只准只读解析，另给3s诊断窗口，不续期或重发写操作。
@@ -738,6 +771,7 @@ UpgradeStageResult UpgradeStage_Commit(uint32_t session_id)
                               &session.commit_state, resolve_only ? 3000U : remaining);
     if (session.commit_state == UPGRADE_COMMIT_WRITTEN)
     {
+      // READY 已读回核实：按实际持久结果进入等待复位，下一次 Boot_InstallRun 才负责片内安装。
       session.phase = UPGRADE_STAGE_REBOOT_PENDING;
       reboot_pending_ms = HAL_GetTick();
       return ReleaseOperation(UPGRADE_STAGE_OK);
@@ -748,7 +782,7 @@ UpgradeStageResult UpgradeStage_Commit(uint32_t session_id)
       {
         session.error = result == UPGRADE_STAGE_OK ? UPGRADE_STAGE_INTERNAL : result;
       }
-      // 不明提交不能恢复业务、清占用或开始另一包，留QUIESCING供显式解析。
+      // 错误码可能只是应答超时；UNKNOWN 仍保留 QUIESCING，不能恢复业务、清占用或开始另一包。
       return ReleaseOperation(session.error);
     }
     if (result == UPGRADE_STAGE_OK)
@@ -756,6 +790,7 @@ UpgradeStageResult UpgradeStage_Commit(uint32_t session_id)
       result = UPGRADE_STAGE_INTERNAL;
     }
   }
+  // 只有明确未提交，或还没有进入持久提交操作，才走失败恢复；超时本身不能作为恢复依据。
   session.resume_error = UpgradeQuiesce_Resume(UPGRADE_STAGE_IDLE_TIMEOUT_MS);
   return ReleaseOperation(FailSession(result));
 }

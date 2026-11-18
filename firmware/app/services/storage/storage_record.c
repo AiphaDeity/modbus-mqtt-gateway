@@ -876,11 +876,15 @@ HAL_StatusTypeDef storage_record_restore(void)
     return valid && !storage_runtime_expired() ? HAL_OK : HAL_ERROR;
 }
 
-/* 已暂停生产且没有在途变更后，刷文件及环状态；缺卡且无对象可正常降级。 */
+/*
+ * 存储所有者在业务维护或升级静默阶段同步记录：有打开的段文件则 f_sync，有脏环状态则持久提交。
+ * 升级调用前须已停生产并结算；无文件且无脏状态时可直接成功，实际同步错误或超时不得伪造成功。
+ */
 HAL_StatusTypeDef storage_record_sync(void)
 {
     if (!storage_runtime_is_owner()) return HAL_BUSY;
     if (s_sync_failed) return HAL_ERROR;
+    // 先完成当前段文件同步，再检查期限并保存环元数据；两步的返回结果都参与最终同步判定。
     if (s_file_open && f_sync(&s_cur_file) != FR_OK) return HAL_ERROR;
     if (storage_runtime_expired()) return HAL_TIMEOUT;
     if (s_state_dirty) return state_store_now();

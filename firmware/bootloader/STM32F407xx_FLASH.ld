@@ -55,11 +55,9 @@ ENTRY(Reset_Handler)
 /* Specify the memory areas */
 MEMORY
 {
-/* 普通SRAM首64B保留为Boot/App复位邮箱；不进入.data/.bss和堆栈。 */
 MAILBOX (rw)   : ORIGIN = 0x20000000, LENGTH = 64
 RAM (xrw)      : ORIGIN = 0x20000040, LENGTH = 128K - 64
 CCMRAM (xrw)      : ORIGIN = 0x10000000, LENGTH = 64K
-/* Boot末尾128 B独立置备信任记录，不进入通用ELF/bin。 */
 FLASH (rx)      : ORIGIN = 0x08000000, LENGTH = 64K - 128
 TRUST (r)       : ORIGIN = 0x0800FF80, LENGTH = 128
 }

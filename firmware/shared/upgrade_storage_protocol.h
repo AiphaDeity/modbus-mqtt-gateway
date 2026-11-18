@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #define UPGRADE_STORAGE_PROTOCOL_VERSION 2U
+// 每条请求/应答携带的数据上限，单位 B；含身份、偏移等字段的完整消息更大，尺寸由下方断言核对。
 #define UPGRADE_STORAGE_CHUNK_SIZE 256U
 
 typedef enum
@@ -33,6 +34,7 @@ typedef enum
 } UpgradeStorageResult;
 
 // 原生值拷贝消息，非网络/Flash编码；槽0/A、1/B，未用字段清零，不携带指针。
+// 入队时 data 数组随整条消息复制，发送方缓冲后续复用不改变队列中已经交出的请求。
 typedef struct
 {
   uint32_t req_id;
