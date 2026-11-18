@@ -17,17 +17,18 @@
 #include "network_upgrade.h"
 #endif
 
-#define STORAGE_STACK_SIZE_BYTES (6U * 1024U)  /* FatFs + storage_record，M3 说 8K 实测后可降 6K */
+// 以下容量单位均为 B；只描述当前分配，运行余量由 Monitor 单独检查。
+#define STORAGE_STACK_SIZE_BYTES (6U * 1024U) // 覆盖 FatFs 和记录恢复等调用链。
 #define CONFIG_STACK_SIZE_BYTES  (2U * 1024U) // 为从站和点位嵌套解析及存储RPC保留栈余量。
 #define MODBUS_STACK_SIZE_BYTES  (2U * 1024U)
-#define MQTT_STACK_SIZE_BYTES    (6U * 1024U)   /* netconn + snprintf 调用链深，4K 实测溢出 */
-#define TELEMETRY_STACK_SIZE_BYTES (2560U)       /* snprintf + printf 栈开销大，2.5K */
+#define MQTT_STACK_SIZE_BYTES    (6U * 1024U) // 覆盖 netconn、报文编码及格式化调用链。
+#define TELEMETRY_STACK_SIZE_BYTES (2560U) // 容纳遥测编码及格式化时的局部工作区。
 #define MONITOR_STACK_SIZE_BYTES (2U * 1024U) // 监督任务使用 2 KiB 栈。
 #define UPGRADE_STACK_SIZE_BYTES (6U * 1024U)
 
 typedef AppModuleInitResult (*AppModuleInitFn)(void);
 
-/* M1 的 Modbus_Init 是 void(void)，包装成 AppModuleInitResult 返回 */
+// 将无返回值的 Modbus 初始化适配到统一模块结果接口。
 static AppModuleInitResult modbus_init_wrapper(void);
 
 typedef struct
@@ -115,7 +116,7 @@ static const osThreadAttr_t telemetry_attributes =
   .cb_size = sizeof(telemetry_control_block),
   .stack_mem = telemetry_stack,
   .stack_size = sizeof(telemetry_stack),
-  .priority = osPriorityNormal    /* ★原 BelowNormal(16) 被 MQTT/Storage(24) 饿死，改 Normal */
+  .priority = osPriorityNormal // 与网络、存储同级，任务主动阻塞后让出执行机会。
 };
 
 static const osThreadAttr_t monitor_attributes =
@@ -153,26 +154,32 @@ static const osThreadAttr_t network_upgrade_attributes =
 /*
  * init/task 必须成对绑定；均为 NULL 表示未接入，只绑定一个视为错误。
  * 监督任务提前创建；其余任务在基础初始化完成后，经统一入口创建。
+ * App_ModulesInit 调每项 init，App_ModulesStart 用其 attributes 创建任务，再经包装入口调用 task。
+ * 表中保存的是函数地址；各任务执行后按优先级、等待条件和就绪状态调度，不按表顺序轮流执行。
  */
 static AppModuleSlot module_slots[APP_MODULE_COUNT] =
 {
   [APP_MODULE_STORAGE] =
   {
+    // 基础队列和驱动初始化后，由任务恢复持久状态并统一处理存储请求。
     .init = Storage_Init, .task = Storage_Task, .attributes = &storage_attributes,
     .result = APP_MODULE_INIT_NOT_READY, .task_state = APP_MODULE_TASK_NOT_STARTED
   },
   [APP_MODULE_CONFIG] =
   {
+    // 配置任务负责加载、处理配置并协调生效，实际介质操作交给 Storage。
     .init = Config_Init, .task = Config_Task, .attributes = &config_attributes,
     .result = APP_MODULE_INIT_NOT_READY, .task_state = APP_MODULE_TASK_NOT_STARTED
   },
   [APP_MODULE_MODBUS] =
   {
+    // 统一初始化结果接口后，采集和控制由 Modbus 轮询任务执行。
     .init = modbus_init_wrapper, .task = vModbusPollTask, .attributes = &modbus_attributes,
     .result = APP_MODULE_INIT_NOT_READY, .task_state = APP_MODULE_TASK_NOT_STARTED
   },
   [APP_MODULE_MQTT] =
   {
+    // MQTT 任务维持云端会话并处理消息收发。
 #if GATEWAY_ENABLE_M2
     .init = MqttClient_Init, .task = MqttClient_Task, .attributes = &mqtt_attributes,
 #else
@@ -182,6 +189,7 @@ static AppModuleSlot module_slots[APP_MODULE_COUNT] =
   },
   [APP_MODULE_TELEMETRY] =
   {
+    // 遥测任务读取采集快照并组织上报请求，不在装配阶段发送数据。
 #if GATEWAY_ENABLE_M2
     .init = Telemetry_Init, .task = Telemetry_Task, .attributes = &telemetry_attributes,
 #else
@@ -191,16 +199,19 @@ static AppModuleSlot module_slots[APP_MODULE_COUNT] =
   },
   [APP_MODULE_MONITOR] =
   {
+    // 提前运行监督任务，检查启动装配、模块进展及堆栈余量，再决定喂狗和试运行确认。
     .init = Monitor_Init, .task = Monitor_Task, .attributes = &monitor_attributes,
     .result = APP_MODULE_INIT_NOT_READY, .task_state = APP_MODULE_TASK_NOT_STARTED
   },
   [APP_MODULE_UPGRADE] =
   {
+    // TF 升级任务接收按键触发，通过统一升级入口导入候选包。
     .init = UpgradeTf_Init, .task = UpgradeTf_Task, .attributes = &upgrade_attributes,
     .result = APP_MODULE_INIT_NOT_READY, .task_state = APP_MODULE_TASK_NOT_STARTED
   },
   [APP_MODULE_NETWORK_UPGRADE] =
   {
+    // 网络升级任务处理通知授权和固件下载，候选包仍交给统一入口认证与提交。
 #if GATEWAY_ENABLE_M2
     .init = NetworkUpgrade_Init, .task = NetworkUpgrade_Task, .attributes = &network_upgrade_attributes,
 #else
@@ -210,6 +221,7 @@ static AppModuleSlot module_slots[APP_MODULE_COUNT] =
   }
 };
 
+// 先初始化 Modbus，再用实际运行资源状态给出装配结果。
 static AppModuleInitResult modbus_init_wrapper(void)
 {
   Modbus_Init();
@@ -220,13 +232,15 @@ static bool modules_initialized;
 static bool modules_started;
 
 /*
- * 转调模块任务，业务参数为 NULL；意外返回时记录错误并停止该任务。
+ * 转调装配表中的业务任务，业务参数为 NULL；意外返回时记故障并进入全局错误处理。
  * argument 指向运行期间有效的静态模块槽。
  */
 static void App_ModuleTaskEntry(void *argument)
 {
   AppModuleSlot *slot = argument;
 
+  // 例如 Storage 槽的 argument 指向静态槽，slot->task(NULL) 再进入 Storage_Task(NULL)。
+  // 正常业务任务持续运行或自行退出；若直接返回，则下面锁存装配故障并进入错误处理。
   slot->task(NULL);
   slot->task_state = APP_MODULE_TASK_RETURNED;
   Error_Handler();
@@ -238,6 +252,7 @@ static void App_ModuleTaskEntry(void *argument)
  */
 void App_MonitorStart(void)
 {
+  // 从同一张装配表取出 Monitor 项，提前创建后，后面的批量 Init/Start 会跳过它。
   AppModuleSlot *slot = &module_slots[APP_MODULE_MONITOR];
   if (slot->task_state == APP_MODULE_TASK_STARTED)
   {
@@ -254,6 +269,8 @@ void App_MonitorStart(void)
     Error_Handler();
     return;
   }
+  // 这里的 init 是 Monitor_Init；先建立监督状态，再创建经包装入口执行 Monitor_Task 的任务。
+  // 解锁后 Monitor 可先于当前启动任务继续执行，从而监督后面的网络和模块初始化。
   slot->result = slot->init();
   if (slot->result != APP_MODULE_INIT_OK)
   {
@@ -316,6 +333,7 @@ void App_ModulesInit(void)
       continue;
     }
 
+    // 此处调用初始化接口而非业务任务体；基础错误先记在槽中，由 Start 在建任务前统一拦截。
     AppModuleInitResult result = slot->init();
 
     printf("[MOD] module[%u] init=%d state=%d\r\n", i, (int)result, (int)slot->task_state);
@@ -324,6 +342,7 @@ void App_ModulesInit(void)
     {
       case APP_MODULE_INIT_OK:
       case APP_MODULE_INIT_NOT_READY:
+        // NOT_READY 允许创建任务去等待业务条件，例如存储恢复或网络就绪。
         slot->result = result;
         slot->task_state = APP_MODULE_TASK_NOT_STARTED;
         break;
@@ -336,6 +355,7 @@ void App_ModulesInit(void)
     }
   }
 
+  // 仅表示整张表的初始化检查已完成，失败项仍保留在各槽内，不会被此标记覆盖。
   modules_initialized = true;
 }
 
@@ -373,7 +393,7 @@ void App_ModulesStart(void)
     }
   }
 
-  // 所有任务创建完成前不让高优先级任务抢先运行；中断仍然可用
+  // 批量创建期间暂停任务切换，先补齐全部槽状态；中断仍然可用，已创建的 Monitor 也暂不调度。
   if (osKernelLock() < 0)
   {
     Error_Handler();
@@ -390,6 +410,7 @@ void App_ModulesStart(void)
       continue;
     }
 
+    // 任务先进入统一包装入口，slot 作为参数交给它，再由包装入口转调对应业务函数。
     slot->task_handle = osThreadNew(App_ModuleTaskEntry, slot, slot->attributes);
     if (slot->task_handle == NULL)
     {
@@ -402,6 +423,8 @@ void App_ModulesStart(void)
     slot->task_state = APP_MODULE_TASK_STARTED;
   }
 
+  // 解锁后业务任务即可运行，甚至可能先于本函数返回；不必等 App_Entry 的装配完成通知。
+  // modules_started 只表示批量创建完成，资源恢复和业务自检仍由各任务报告。
   modules_started = true;
   if (osKernelUnlock() < 0)
   {

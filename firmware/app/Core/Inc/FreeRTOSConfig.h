@@ -170,6 +170,12 @@ standard names. */
 
 /* USER CODE BEGIN Defines */
 /* Section where parameter definitions can be added (for instance, to override default ones in FreeRTOS.h) */
+/*
+ * Modbus 帧结束和请求超时依赖软件定时器，服务任务需优先于普通业务（24）和轮询任务（32）。
+ * 定时器回调必须保持简短且不能阻塞。
+ */
+#undef configTIMER_TASK_PRIORITY
+#define configTIMER_TASK_PRIORITY                ( 33 )
 /* USER CODE END Defines */
 
 #endif /* FREERTOS_CONFIG_H */

@@ -4,7 +4,7 @@
  * 实现流程：URL解析 → DNS → TCP连接 → [TLS握手] → HTTP GET → 收响应头 → 循环收body → 回调
  * 每块 ≤1016B（UPGRADE_STAGE_MAX_CHUNK_SIZE），回调里调 UpgradeEntry_Write。
  *
- * http://使用netconn；https://在同一连接上完成TLS认证与加密。
+ * http://firmware.example.invalid/firmware.gwp
  */
 #include "network_upgrade_downloader.h"
 
@@ -148,8 +148,8 @@ static nw_dl_status_t download_connect(const char *host, uint16_t port)
 /* ===== URL 解析 =====
  * 支持 http:// 和 https://
  * 返回 0=成功，-1=格式错误
- * url 例：http://abc.baidubce.com:8080/fw/firmware.gwp
- *       https://abc.bcebos.com/firmware.gwp
+ * url 例：http://firmware.example.invalid/firmware.gwp
+ *       https://firmware.example.invalid/firmware.gwp
  *
  * 解析后输出：
  *   host     - 域名或 IP（不含端口和路径）
@@ -265,7 +265,8 @@ static nw_dl_status_t parse_header_line(char *line, int len, uint32_t expected,
     return NW_DL_OK;
 }
 
-// 连续消费所有netbuf段；头结束后的字节直接进入原分块缓冲，不另存残余副本。
+// 在升级任务内连续消费所有 netbuf 段；头结束后的字节进入原分块缓冲，不另存残余副本。
+// 回调成功才累计完成偏移并复用缓冲，回调失败即结束本次下载，不继续接收下一块。
 static nw_dl_status_t receive_response(struct netconn *conn, const nw_dl_params_t *params,
                                        uint32_t chunk_size)
 {
@@ -367,9 +368,10 @@ static nw_dl_status_t receive_response(struct netconn *conn, const nw_dl_params_
     return result;
 }
 
-/* ===== HTTPS 下载路径（mbedTLS） =====
+/*
+ * HTTPS 下载路径（mbedTLS）。
  * 流程：DNS → TCP → TLS握手 → GET → 收头 → 收body → 回调
- * TLS 给出平字节流，头和 body 都直接 recv 到缓冲。
+ * TLS 解开的只是传输层，body 仍为 .gwp 包字节；固件包解密与认证由后续 Stage 执行。
  *
  * 与 fetch_http 的区别仅在第 3 步多了 TLS 握手，收发用 HttpsTls_Send/Recv 替代 netconn_write/recv。
  */
@@ -495,7 +497,7 @@ static nw_dl_status_t fetch_https(const nw_dl_params_t *params,
         }
     }
 
-    /* 8. 循环收剩余 body，按 chunk_size 分块回调 */
+    // 循环收剩余 body，按 chunk_size 分块同步回调；输入缓冲保留到 Entry 完成写入和读回后再复用。
     while (offset < (uint32_t)content_len)
     {
         uint32_t space = chunk_size - chunk_accum;
@@ -533,7 +535,7 @@ static nw_dl_status_t fetch_https(const nw_dl_params_t *params,
         offset += chunk_accum;
     }
 
-    /* 校验完整性：收到的总字节数必须等于 Content-Length */
+    // 这里只检查下载字节数和回调是否完整；整包 SHA-256、签名、GCM 和明文检查在 UpgradeStage_Finish。
     if (offset != (uint32_t)content_len)
     {
         printf("[NWDL] incomplete: got %u expected %ld\r\n", (unsigned)offset, (long)content_len);
@@ -594,10 +596,13 @@ static nw_dl_status_t fetch_http(const nw_dl_params_t *params,
     return result;
 }
 
-/* ===== 入口：解析 URL，分发 HTTP / HTTPS =====
+/*
+ * 下载入口：解析 URL，分发 HTTP / HTTPS。
  * 对外接口，由 network_upgrade.c 的升级任务调用。
  * 根据 URL 协议前缀自动选择 HTTP 或 HTTPS 下载路径。
- * chunk_size 默认 1016（受 Flash 写入单元限制）。 */
+ * chunk_size 默认最多 1016 B，对应 Entry/Stage 接口上限，不是 Flash 页大小。
+ * 本函数及全部数据回调同步结束后返回；OK 只表示收包和回调完成，尚未完成固件认证或安装。
+ */
 nw_dl_status_t NetworkDownloader_Fetch(const nw_dl_params_t *params)
 {
     char host[64];
@@ -615,7 +620,7 @@ nw_dl_status_t NetworkDownloader_Fetch(const nw_dl_params_t *params)
     /* 清理上次残留连接（防止上次下载失败后连接泄漏） */
     if (download_close(NW_DL_OK) != NW_DL_OK) return NW_DL_ERR_INTERNAL;
 
-    /* chunk_size 限制：0=用默认，超 1016=截到 1016（Flash 写入块大小限制） */
+    // 0 使用默认块长，超过 1016 B 则限制到接收接口上限；存储适配器还会拆成最多 256 B 的 RPC。
     uint32_t chunk_size = params->chunk_size;
     if (chunk_size == 0 || chunk_size > 1016) chunk_size = 1016;
 

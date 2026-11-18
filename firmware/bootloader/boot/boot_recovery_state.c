@@ -32,13 +32,17 @@ Boot_UpgradeResult Boot_RecoveryLoad(Boot_RecoveryState *state)
   return UpgradeRecovery_Load(Boot_FlashReadMetadata, NULL, state);
 }
 
-// 校验恢复状态转换，写入另一副本并提交。
+/*
+ * 在有效恢复屏障下保存独立恢复记录，校验阶段转换并交替写入日志双副本。
+ * 新 sequence 编入持久记录，不回写 const 入参；后续交接或确认须重新加载最新身份。
+ */
 Boot_UpgradeResult Boot_RecoverySave(const Boot_RecoveryState *state)
 {
   if ((state == NULL) || !UpgradeRecovery_RecordValid(state))
   {
     return BOOT_UPGRADE_INVALID;
   }
+  // 屏障必须已经有效，不能单独写一条恢复记录就假设设备进入了恢复模式。
   uint8_t barrier = 0U;
   if (Boot_FlashRead(BARRIER_BASE, &barrier, 1U) != HAL_OK)
   {
@@ -71,12 +75,14 @@ Boot_UpgradeResult Boot_RecoverySave(const Boot_RecoveryState *state)
   {
     return BOOT_UPGRADE_INVALID;
   }
+  // 先更新另一副本正文，最后写独立提交标记；完整提交前仍以原有效副本判断恢复进展。
   if ((Boot_FlashRecoveryJournalErase(address) != HAL_OK)
       || (Boot_FlashRecoveryJournalProgram(address, data, sizeof(data)) != HAL_OK)
       || (Boot_FlashRecoveryJournalProgram(address + COMMIT_OFFSET, commit, sizeof(commit)) != HAL_OK))
   {
     return BOOT_UPGRADE_IO_ERROR;
   }
+  // 写命令成功后重新读取并比较所有身份字段，不能只依据 HAL 返回值接受新阶段。
   Boot_RecoveryState check;
   uint32_t check_selected = 0U;
   result = LoadRecords(&check, &check_selected);
@@ -93,7 +99,10 @@ Boot_UpgradeResult Boot_RecoverySave(const Boot_RecoveryState *state)
   return BOOT_UPGRADE_OK;
 }
 
-// 保护已有可信源后建立屏障和新的恢复接收事务。
+/*
+ * 串口 BEGIN 的持久准备步骤：保护可信旧源、预留新事务号、写启动屏障，再保存 RECEIVING。
+ * 仅建立指定槽的恢复写入资格，不在这里擦包槽；实际擦除由外层接收流程执行。
+ */
 Boot_UpgradeResult Boot_RecoveryBegin(uint32_t slot, uint32_t package_size, bool allow_unknown)
 {
   Boot_RecoveryState next = {0};
@@ -105,6 +114,8 @@ Boot_UpgradeResult Boot_RecoveryBegin(uint32_t slot, uint32_t package_size, bool
   {
     return BOOT_UPGRADE_INVALID;
   }
+  // 1. 读取普通记录，拒绝读失败/未知版本，并保护已有 confirmed 槽。
+  // allow_unknown 只允许显式处理损坏元数据，不能绕过 I/O 错误或可信旧包保护。
   Boot_UpgradeState normal;
   Boot_UpgradeResult normal_result = Boot_UpgradeLoad(&normal);
   if ((normal_result == BOOT_UPGRADE_IO_ERROR) || (normal_result == BOOT_UPGRADE_UNSUPPORTED)
@@ -116,6 +127,7 @@ Boot_UpgradeResult Boot_RecoveryBegin(uint32_t slot, uint32_t package_size, bool
   {
     return BOOT_UPGRADE_INVALID;
   }
+  // 2. 直接查旧恢复记录，即使先前屏障已清，也不能覆盖尚未被另一可信旧包替代的恢复源。
   Boot_RecoveryState previous;
   uint32_t selected = 0U;
   Boot_UpgradeResult result = LoadRecords(&previous, &selected);
@@ -133,20 +145,21 @@ Boot_UpgradeResult Boot_RecoveryBegin(uint32_t slot, uint32_t package_size, bool
     // 没有另一份可信旧包时，不能覆盖唯一已确认的恢复源；仍可显式选择另一槽重新恢复。
     return BOOT_UPGRADE_INVALID;
   }
-  // 指定槽连基本读取都失败时停止，不通过擦除来绕过读取故障。
+  // 3. 指定槽连基本读取都失败时停止，不通过擦除来绕过读取故障。
   uint32_t slot_address = (slot == 1U) ? FLASH_PART_FW_A_BASE : FLASH_PART_FW_B_BASE;
   uint8_t probe[16];
   if (Boot_FlashRead(slot_address, probe, sizeof(probe)) != HAL_OK)
   {
     return BOOT_UPGRADE_IO_ERROR;
   }
+  // 4. 先持久预留新事务号；即使后续建立屏障失败，这个编号也不能回收复用。
   next.operation = UPGRADE_OPERATION_RECOVERY;
   Boot_UpgradeResult reserved = Boot_UpgradeReserveTransaction(&next.tx_id);
   if (reserved != BOOT_UPGRADE_OK)
   {
     return reserved;
   }
-  // 屏障先落盘，后面即使修复日志中断，也不能把空白记录当作可正常启动。
+  // 5. 屏障先落盘，后面即使修复日志中断，也不能把空白记录当作可正常启动。
   const uint8_t active = 0U;
   if (Boot_FlashRecoveryJournalProgram(BARRIER_BASE, &active, 1U) != HAL_OK)
   {
@@ -160,6 +173,7 @@ Boot_UpgradeResult Boot_RecoveryBegin(uint32_t slot, uint32_t package_size, bool
       return BOOT_UPGRADE_IO_ERROR;
     }
   }
+  // 6. 保存新 RECEIVING 记录，外层重新 Load 取得事务号后，才允许擦槽并发布 RAM 会话。
   return Boot_RecoverySave(&next);
 }
 

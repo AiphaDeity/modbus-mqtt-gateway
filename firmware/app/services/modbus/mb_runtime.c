@@ -38,7 +38,10 @@ static bool mb_is_write(uint8_t func)
            func == MB_FC_WRITE_MULTIPLE_COILS || func == MB_FC_WRITE_MULTIPLE_REGISTERS;
 }
 
-/** @brief 检查队列、在途处理及UART发送均已结束；调用方持短临界区。 */
+/*
+ * 在短临界区内核对 Modbus 停稳：Poll/Master/配置作业结束，请求队列及控制结果均已结算。
+ * 还须协议状态回到空闲且 UART 发送完成，不能只看队列为空就允许后续安装。
+ */
 static bool mb_runtime_settled(void)
 {
     return s_ready && !s_faulted && !s_poll_active && !s_master_active &&
@@ -50,7 +53,7 @@ static bool mb_runtime_settled(void)
            hModbusMaster.port->gState == HAL_UART_STATE_READY;
 }
 
-/** @brief 先关新请求入口；结算阶段由原任务完成在途处理。 */
+// Modbus 的 pause 回调只关闭新请求入口，已经接纳的作业和结果仍由原 Poll/Master 任务结算。
 static UpgradeStageResult mb_runtime_pause(void *context, uint32_t timeout_ms)
 {
     (void)context;
@@ -64,7 +67,10 @@ static UpgradeStageResult mb_runtime_pause(void *context, uint32_t timeout_ms)
     return ready ? UPGRADE_STAGE_OK : UPGRADE_STAGE_NOT_READY;
 }
 
-/** @brief 等待队列明确结算，超时保持暂停；不复位队列或中断已发送的写。 */
+/*
+ * 等待 mb_runtime_settled 确认队列、在途和结果全部收尾，故障或超时均保留暂停状态。
+ * 不复位队列，不中断已发出的控制写，也不能把结果尚未归还的操作当成完成。
+ */
 static UpgradeStageResult mb_runtime_settle(void *context, uint32_t timeout_ms)
 {
     (void)context;
@@ -82,7 +88,7 @@ static UpgradeStageResult mb_runtime_settle(void *context, uint32_t timeout_ms)
     return UPGRADE_STAGE_TIMEOUT;
 }
 
-/** @brief Modbus不持有介质；确认结果已交还且总线空闲后才允许同步完成。 */
+// Modbus 不持有介质，sync 复用结算检查，复核总线及结果交接安全点，不执行文件同步。
 static UpgradeStageResult mb_runtime_sync(void *context, uint32_t timeout_ms)
 {
     return mb_runtime_settle(context, timeout_ms);
@@ -114,6 +120,7 @@ bool mb_runtime_init(void)
     const UpgradeQuiesceParticipant participant = {
         mb_runtime_pause, mb_runtime_settle, mb_runtime_sync, mb_runtime_resume, NULL
     };
+    // 绑定的是现有任务的四个协作入口，协调器调用这些回调，不另建 Modbus 静默任务。
     s_started_tick = HAL_GetTick();
     s_ready = UpgradeQuiesce_Bind(UPGRADE_QUIESCE_MODBUS, &participant) == UPGRADE_STAGE_OK;
     return s_ready;
@@ -235,6 +242,7 @@ HAL_StatusTypeDef mb_runtime_transmit(modbusHandler_t *handler)
     bool write = mb_is_write(handler->u8Buffer[FUNC]);
     bool write_pending = !write || (mb_handle != NULL && mb_handle->waiting_is_write &&
                          mb_handle->pending_write != NULL && mb_write_pending(mb_handle->pending_write));
+    // 写请求即使已入队，真正启动 UART 前仍复查统一门控；本地 pause 后也停止新的读请求发送。
     bool allowed = handler == &hModbusMaster && s_ready && !s_faulted && !s_paused &&
                    mb_runtime_configured_slave(handler->u8Buffer[0]) &&
                    s_cfg_active == 0U &&

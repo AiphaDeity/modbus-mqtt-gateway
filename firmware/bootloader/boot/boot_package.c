@@ -6,10 +6,10 @@
 
 typedef struct
 {
-  uint32_t started_ms;
-  uint32_t step_cycles;
-  uint32_t max_cycles;
-  uint32_t steps;
+  uint32_t started_ms; // 验签开始的 HAL 时刻，单位 ms。
+  uint32_t step_cycles; // 本分段开始的 DWT 周期计数，用无符号差值计算耗时。
+  uint32_t max_cycles; // 各验签分段的最大周期数，不代表整个认证总耗时。
+  uint32_t steps; // 本次验签已完成的分段数。
   bool cycles_available;
 } Boot_PackageTiming;
 
@@ -76,6 +76,7 @@ static void SignatureEvent(void *context, UpgradePackageSignatureEvent event, in
 static void InitOperation(UpgradePackageOperation *operation, UpgradePackagePlatform *platform,
                            Boot_PackageTiming *timing)
 {
+  // 公共密码代码不直接访问 Boot 外设，通过时基和检查点回调接受本阶段监督。
   platform->context = timing;
   platform->now_ms = NowMs;
   platform->checkpoint = Checkpoint;
@@ -137,7 +138,11 @@ bool Boot_PackageVerify(Boot_PackageRead read, void *context, size_t package_siz
                                 public_key, aes_key, firmware_size);
 }
 
-// 在 Boot 监督下认证并二次解密输出固件。
+/*
+ * Boot_InstallImage 通过本函数把源包接入公共密码流程，read/read_context 指向外部 Flash 包源。
+ * 先完整认证，再次分块解密并同步调用 write；安装场景下 write 即 WritePlaintext。
+ * 本函数返回后，安装器还须刷出尾块并核对片内实际镜像，不能仅凭回调曾执行过就放行。
+ */
 bool Boot_PackageDecrypt(Boot_PackageRead read, void *read_context, size_t package_size,
                          const uint8_t *public_key, const uint8_t *aes_key,
                          Boot_PackageWrite write, void *write_context)
@@ -156,7 +161,7 @@ bool Boot_PackageDecrypt(Boot_PackageRead read, void *read_context, size_t packa
   return ok;
 }
 
-// 在 Boot 主线程认证包及向量，沿用固定期限和分段进展监督。
+// 在 Boot 主线程只读认证包及向量，沿用固定期限和分段进展监督；向量收集回调不写片内 App。
 bool Boot_PackageVerifyImage(Boot_PackageRead read, void *context, size_t package_size,
                               const uint8_t *public_key, const uint8_t *aes_key,
                               UpgradePackageImage *image)

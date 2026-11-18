@@ -6,6 +6,7 @@
 #include "upgrade_state.h"
 
 #define UPGRADE_STAGE_SHA256_SIZE 32U
+// Entry/Stage 每次接收的最大字节数，不是 Flash 页大小；队列后端会继续拆成最多 256 B 请求。
 #define UPGRADE_STAGE_MAX_CHUNK_SIZE 1016U
 // 包开销208 B，明文至少包含8 B向量；App区为448 KiB。
 #define UPGRADE_STAGE_MIN_PACKAGE_SIZE 216U
@@ -13,8 +14,9 @@
 #define UPGRADE_STAGE_IDLE_TIMEOUT_MS 30000U
 #define UPGRADE_STAGE_PREPARE_TIMEOUT_MS 300000U
 #define UPGRADE_STAGE_VERIFY_TIMEOUT_MS 180000U
+// 暂停、结算、同步及 READY 提交共用的 30 s 总期限，各回调只取得当时剩余时间。
 #define UPGRADE_STAGE_COMMIT_TIMEOUT_MS 30000U
-// 升级执行任务的历史最小空闲栈下限；不能代替完整调用链峰值测量。
+// 升级调用时当前 PSP 到栈底的最低可用字节数；历史最低余量另由 Monitor 检查。
 #define UPGRADE_EXECUTOR_MIN_FREE_STACK_BYTES 4096U
 
 typedef enum
@@ -26,19 +28,19 @@ typedef enum
 
 typedef enum
 {
-  UPGRADE_STAGE_IDLE,
-  UPGRADE_STAGE_STAGING,
-  UPGRADE_STAGE_VERIFIED,
-  UPGRADE_STAGE_ERROR,
-  UPGRADE_STAGE_QUIESCING,
-  UPGRADE_STAGE_REBOOT_PENDING
+  UPGRADE_STAGE_IDLE, // 无活动接收会话。
+  UPGRADE_STAGE_STAGING, // 正在接收候选包，还不能安装。
+  UPGRADE_STAGE_VERIFIED, // 包已认证，READY 尚未提交。
+  UPGRADE_STAGE_ERROR, // 本次会话失败，仍需检查占用是否清理完成。
+  UPGRADE_STAGE_QUIESCING, // 业务暂停及提交处理中，结果不明时也保留此阶段。
+  UPGRADE_STAGE_REBOOT_PENDING // READY 已确认持久化，等待系统复位。
 } UpgradeStagePhase;
 
 typedef enum
 {
-  UPGRADE_COMMIT_NOT_WRITTEN,
-  UPGRADE_COMMIT_WRITTEN,
-  UPGRADE_COMMIT_UNKNOWN
+  UPGRADE_COMMIT_NOT_WRITTEN, // 明确没有提交，可以按失败路径恢复业务。
+  UPGRADE_COMMIT_WRITTEN, // 已完整提交并核对，允许后续复位。
+  UPGRADE_COMMIT_UNKNOWN // 可能已提交，仅可读取解析，禁止盲目重写或复用槽。
 } UpgradeStageCommitState;
 
 typedef struct
@@ -96,7 +98,7 @@ typedef struct
   UpgradeStageResult (*prepare)(void *context, uint32_t session_id,
                                 uint32_t total_size, UpgradeStagePrepared *prepared,
                                 uint32_t timeout_ms);
-  // 按 Flash 页拆分写入，全部持久写入才返回 OK。
+  // 同步写完本块后返回；实际适配器拆分队列请求，Flash 跨页处理由存储侧驱动完成。
   UpgradeStageResult (*write)(void *context, uint32_t session_id, uint32_t offset,
                               const uint8_t *data, uint32_t size, uint32_t timeout_ms);
   // 按包内字节偏移读取，完整填满输出缓冲才返回 OK。
@@ -128,7 +130,7 @@ typedef struct
  * 本模块接口仅用于调度器运行后的任务上下文；并发修改立即返回 BUSY。
  */
 bool UpgradeStage_Init(void);
-// 检查当前任务是否适合执行升级：排除业务/存储/监督任务，并检查历史空闲栈。
+// 检查当前任务是否适合执行升级：排除指定业务/存储/监督任务，并检查当前栈空间。
 bool UpgradeStage_ExecutorAllowed(void);
 
 // 启动装配时绑定完整后端一次；复制函数表，不保留 backend 指针，context 可为 NULL。

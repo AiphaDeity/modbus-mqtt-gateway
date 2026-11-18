@@ -12,7 +12,12 @@
 
 #include "upgrade_baseline.h"
 
-// OFFSET 宏为升级元数据区内的字节偏移；物理基址由存储适配映射。
+/*
+ * OFFSET 宏为升级元数据区内的字节偏移；物理基址由存储适配映射。
+ * 普通日志副本 0/1 各占 4 KiB 扇区，与保存加密包的 A/B 槽不是同一组副本。
+ * 每份扇区 +0～127 为状态正文，+128～255 保留，+256～259 最后写独立 CMIT 提交标记。
+ * 这里的 128 B 是状态记录，和固件包中同为 128 B 的包头属于不同结构。
+ */
 #define UPGRADE_STATE_RECORD_SIZE 128U
 #define UPGRADE_STATE_COMMIT_OFFSET 256U
 #define UPGRADE_STATE_COMMIT_SIZE 4U
@@ -52,11 +57,11 @@ typedef enum
 
 typedef enum
 {
-  UPGRADE_STATE_CONFIRMED = 1,
-  UPGRADE_STATE_READY,
-  UPGRADE_STATE_INSTALLING,
-  UPGRADE_STATE_TRIAL,
-  UPGRADE_STATE_RESTORING
+  UPGRADE_STATE_CONFIRMED = 1, // 当前受保护包已确认，可作为恢复源。
+  UPGRADE_STATE_READY, // 候选包认证及暂停结算完成，尚未擦除片内 App。
+  UPGRADE_STATE_INSTALLING, // 安装意图已持久化，复位后可从头重装候选。
+  UPGRADE_STATE_TRIAL, // 候选已安装并消耗放行机会，等待 App 健康确认。
+  UPGRADE_STATE_RESTORING // 正在从已确认旧包恢复片内 App。
 } UpgradeStatePhase;
 
 // slot为0/无包、1/A、2/B；size为完整加密包B数；digest为明文SHA-256。
@@ -70,10 +75,10 @@ typedef struct
 // 语义视图，不是Flash存盘结构，不能直接memcpy后落盘。
 typedef struct
 {
-  uint32_t sequence;
+  uint32_t sequence; // 每次日志提交递增的记录序号，非固件版本；加载时用于选择较新副本。
   UpgradeStatePhase phase;
-  UpgradeStatePackage confirmed;
-  UpgradeStatePackage candidate;
+  UpgradeStatePackage confirmed; // 安装/试运行期间保护旧包；确认候选后更新为新的已确认包。
+  UpgradeStatePackage candidate; // 新包；确认成功后才提升到 confirmed。
   uint64_t tx_id;             // 稳定事务号，与每次提交递增的sequence不同。
   uint32_t trial_attempts;    // 已提交的放行机会，跳转前递增。
   UpgradeStateOperation operation;
@@ -128,6 +133,7 @@ bool UpgradeRecovery_Decode(const uint8_t *data, UpgradeRecoveryRecord *state);
 /*
  * 读取双副本和另页提交标记，选择最新非回绕序号；state失败清零。
  * 未完整提交的副本可忽略；任一已提交副本损坏、重复序号或读取错误均拒绝回退。
+ * 只有两份正文与标记均为 FF 才返回 EMPTY；没有有效副本但存在写入痕迹则返回 CORRUPT。
  * selected可为NULL，成功为副本0/1，失败置0；它不是可写槽号。
  */
 UpgradeStateResult UpgradeState_Load(UpgradeStateRead read, void *context,

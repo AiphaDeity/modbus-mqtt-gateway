@@ -178,6 +178,7 @@ static UpgradeStorageResult upg_begin(const UpgradeStorageRequest *req, UpgradeS
     UpgradeStateProtection view;
     UpgradeStorageResult st = upg_load_expected(req, &view);
     if (st != UPGRADE_STORAGE_OK) return st;
+    // 上层选槽后，持久状态可能已有变化；擦写前重新确认该槽仍可写且没有独立恢复屏障。
     if (view.normal_result != UPGRADE_STATE_OK || view.recovery_result != UPGRADE_STATE_EMPTY ||
         view.normal.phase != UPGRADE_STATE_CONFIRMED ||
         view.normal.sequence == UINT32_MAX ||
@@ -193,6 +194,7 @@ static UpgradeStorageResult upg_begin(const UpgradeStorageRequest *req, UpgradeS
     s_tx.baseline = view.normal;
     s_reserved_tx = 0U;
 
+    // 租约先绑定到已核准的候选槽，后续块不能重新挑槽；擦槽失败也保留失败租约供结算。
     uint32_t base = upg_slot_base(req->slot);
     for (uint32_t offset = 0U; offset < FLASH_PART_FW_A_END - FLASH_PART_FW_A_BASE;
          offset += UPG_BLOCK_SIZE) {
@@ -211,7 +213,10 @@ static bool upg_matches(const UpgradeStorageRequest *req)
     return s_tx.active && req->session == s_tx.session && req->tx_id == s_tx.tx_id;
 }
 
-/* 接收不透明字节，包括1B首块；写入及完整读回成功才推进written。 */
+/*
+ * 执行 CHUNK 请求：按租约和连续偏移写候选槽，将 .gwp 作为不透明字节处理，不验签或解密。
+ * 写入和完整读回比较都成功才推进 written；介质读写或比较失败会锁存故障，拒绝后续块追加。
+ */
 static UpgradeStorageResult upg_chunk(const UpgradeStorageRequest *req)
 {
     if (!upg_matches(req)) return UPGRADE_STORAGE_CONFLICT;
@@ -220,6 +225,7 @@ static UpgradeStorageResult upg_chunk(const UpgradeStorageRequest *req)
         req->offset != s_tx.written || req->offset > s_tx.total ||
         req->len > s_tx.total - req->offset) return UPGRADE_STORAGE_INVALID;
 
+    // 先核对会话和边界，再将包内偏移换算为 Begin 已锁定槽的实际 Flash 地址。
     uint8_t check[UPGRADE_STORAGE_CHUNK_SIZE];
     uint32_t address = upg_slot_base(s_tx.slot) + req->offset;
     if (!upg_io(spi_flash_w25q128_write_until(address, req->data, req->len, s_deadline)) ||
@@ -227,6 +233,7 @@ static UpgradeStorageResult upg_chunk(const UpgradeStorageRequest *req)
         s_tx.failed = true;
         return s_io_result;
     }
+    // 本层比较单条 RPC 的实际读回；返回后 Stage 还会对原上层块再次独立读回比较。
     if (memcmp(check, req->data, req->len) != 0) {
         s_tx.failed = true;
         return UPGRADE_STORAGE_CORRUPT;
@@ -264,11 +271,16 @@ static UpgradeStorageResult upg_read_package(const UpgradeStorageRequest *req,
     return UPGRADE_STORAGE_OK;
 }
 
-/* 只接受本租约对应的READY/INSTALL；写到旧副本，另页提交，最后重新Load。 */
+/*
+ * 执行 COMMIT_READY 请求：只接受本租约对应的完整 READY/INSTALL 描述，保留已确认包描述。
+ * 包认证由上层负责，本层核对会话、完整接收量和持久基线，不在此安装片内 App。
+ * 保留当前有效日志，在另一扇区写正文和独立提交标记，再重新加载核对；失败不得盲目重发。
+ */
 static UpgradeStorageResult upg_commit(const UpgradeStorageRequest *req)
 {
     if (!upg_matches(req) || req->slot != s_tx.slot || s_tx.failed)
         return UPGRADE_STORAGE_CONFLICT;
+    // 1. 完整包已写入才可提交；请求必须是本租约的下一条 READY，且仍引用原已确认包。
     UpgradeStateRecord next;
     if (req->len != UPGRADE_STATE_RECORD_SIZE || s_tx.written != s_tx.total ||
         !UpgradeState_Decode(req->data, &next) || next.phase != UPGRADE_STATE_READY ||
@@ -284,6 +296,7 @@ static UpgradeStorageResult upg_commit(const UpgradeStorageRequest *req)
     UpgradeStorageResult st = upg_state_result(
         UpgradeState_ReadProtection(upg_read_metadata, NULL, &view));
     if (st != UPGRADE_STORAGE_OK) return st;
+    // 2. 同一 READY 已完整落盘时只确认已有结果；否则须复核原基线，不能用过期快照覆盖新状态。
     if (view.recovery_result == UPGRADE_STATE_EMPTY && upg_same_record(&view.normal, &next))
         return UPGRADE_STORAGE_OK;
     if (s_tx.commit_attempted) return UPGRADE_STORAGE_CONFLICT;
@@ -297,14 +310,17 @@ static UpgradeStorageResult upg_commit(const UpgradeStorageRequest *req)
     st = upg_state_result(UpgradeState_Load(upg_read_metadata, NULL, &old, &selected));
     if (st != UPGRADE_STORAGE_OK) return st;
     if (!upg_same_record(&old, &s_tx.baseline)) return UPGRADE_STORAGE_CONFLICT;
+    // 3. 切换的是日志副本 0/1，不是加密包槽；当前有效副本和受保护旧包均保持不动。
     uint32_t address = FLASH_PART_UPGLOG_BASE + (selected ^ 1U) * UPGRADE_STATE_SECTOR_SIZE;
     const uint8_t marker[UPGRADE_STATE_COMMIT_SIZE] = UPGRADE_STATE_NORMAL_COMMIT;
+    // 4. 先锁存一次提交尝试，再擦目标、写正文、最后写 CMIT；后续错误可能发生在已提交之后。
     s_tx.commit_attempted = true;
     if (!upg_io(spi_flash_w25q128_erase_until(address, false, s_deadline)) ||
         !upg_io(spi_flash_w25q128_write_until(address, req->data, req->len, s_deadline)) ||
         !upg_io(spi_flash_w25q128_write_until(address + UPGRADE_STATE_COMMIT_OFFSET,
                                                marker, sizeof(marker), s_deadline)))
         return s_io_result;
+    // 5. 重新经过提交标记、CRC 和序号选择，再比较完整身份；只有实际读回一致才应答成功。
     st = upg_state_result(UpgradeState_Load(upg_read_metadata, NULL, &old, &selected));
     if (st != UPGRADE_STORAGE_OK) return st;
     return upg_same_record(&old, &next) ? UPGRADE_STORAGE_OK : UPGRADE_STORAGE_CORRUPT;
@@ -318,6 +334,7 @@ static UpgradeStorageResult upg_abort(const UpgradeStorageRequest *req)
     if (req->tx_id != s_tx.tx_id || (req->session != 0U && req->session != s_tx.session))
         return UPGRADE_STORAGE_CONFLICT;
     if (s_tx.commit_attempted) {
+        // 提交尝试后取消也须先证明仍是原完整基线；超时或应答失败本身不能解除候选保护。
         UpgradeStateProtection view;
         UpgradeStorageResult st = upg_state_result(
             UpgradeState_ReadProtection(upg_read_metadata, NULL, &view));
@@ -336,7 +353,11 @@ void storage_upgrade_init(bool flash_ready)
     s_ready = flash_ready;
 }
 
-/* 处理一个公共协议请求，未知类型/到期请求不做I/O。 */
+/*
+ * 由升级队列处理函数在 Storage_Task 内调用，先检查所有者、期限和类型，再分发实际介质操作。
+ * BEGIN 准备候选槽，CHUNK 写入并读回，COMMIT_READY 写安装意图；未知或到期请求不做 I/O。
+ * rsp 带回原请求身份、执行结果及累计 written，客户端须匹配完整应答后才能推进。
+ */
 void storage_upgrade_handle(const UpgradeStorageRequest *req, UpgradeStorageResponse *rsp)
 {
     memset(rsp, 0, sizeof(*rsp));

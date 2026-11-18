@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "gateway_id": "mb2mqtt_001",
+  "gateway_id": "gateway-demo",
   "firmware_version": "0.1.0",
   "online": true,
   "time_valid": true,

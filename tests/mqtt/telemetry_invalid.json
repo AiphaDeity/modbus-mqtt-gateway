@@ -5,11 +5,11 @@
     "reason": "采样记录必须包含 value；采集失败时应显式写 null，缺字段属于格式错误，平台应拒绝",
     "message": {
       "schema_version": 1,
-      "gateway_id": "mb2mqtt_001",
+      "gateway_id": "gateway-demo",
       "batch_id": "batch_0002",
       "records": [
         {
-          "record_id": "mb2mqtt_001:seq:2001",
+          "record_id": "gateway-demo:seq:2001",
           "seq": "2001",
           "device_id": "dev01",
           "point_id": "temperature",
@@ -28,11 +28,11 @@
     "reason": "quality 必须是规定的 5 个枚举之一（GOOD/TIMEOUT/CRC_ERROR/EXCEPTION/DECODE_ERROR），小写 good 不匹配",
     "message": {
       "schema_version": 1,
-      "gateway_id": "mb2mqtt_001",
+      "gateway_id": "gateway-demo",
       "batch_id": "batch_0003",
       "records": [
         {
-          "record_id": "mb2mqtt_001:seq:2002",
+          "record_id": "gateway-demo:seq:2002",
           "seq": "2002",
           "device_id": "dev01",
           "point_id": "temperature",
@@ -52,11 +52,11 @@
     "reason": "seq 以十进制字符串传输，写数字 2003 类型不符",
     "message": {
       "schema_version": 1,
-      "gateway_id": "mb2mqtt_001",
+      "gateway_id": "gateway-demo",
       "batch_id": "batch_0004",
       "records": [
         {
-          "record_id": "mb2mqtt_001:seq:2003",
+          "record_id": "gateway-demo:seq:2003",
           "seq": 2003,
           "device_id": "dev01",
           "point_id": "temperature",
@@ -73,10 +73,10 @@
   {
     "case": "record_id 前缀与网关不符",
     "expect": "REJECT",
-    "reason": "record_id 必须以本机 gateway_id 开头（mb2mqtt_001:seq:xxxx），写别的网关前缀属于伪造或串号，平台去重会出问题",
+    "reason": "record_id 必须以本机 gateway_id 开头（gateway-demo:seq:xxxx），写别的网关前缀属于伪造或串号，平台去重会出问题",
     "message": {
       "schema_version": 1,
-      "gateway_id": "mb2mqtt_001",
+      "gateway_id": "gateway-demo",
       "batch_id": "batch_0005",
       "records": [
         {
@@ -100,11 +100,11 @@
     "reason": "captured_at_ms 为 null（未校时）但 time_valid=true，二者矛盾；未校时必须 time_valid=false",
     "message": {
       "schema_version": 1,
-      "gateway_id": "mb2mqtt_001",
+      "gateway_id": "gateway-demo",
       "batch_id": "batch_0006",
       "records": [
         {
-          "record_id": "mb2mqtt_001:seq:2004",
+          "record_id": "gateway-demo:seq:2004",
           "seq": "2004",
           "device_id": "dev01",
           "point_id": "temperature",
@@ -124,11 +124,11 @@
     "reason": "schema_version 目前只有 1，写 2 属于未知版本，平台应拒绝而不是猜测解析",
     "message": {
       "schema_version": 2,
-      "gateway_id": "mb2mqtt_001",
+      "gateway_id": "gateway-demo",
       "batch_id": "batch_0007",
       "records": [
         {
-          "record_id": "mb2mqtt_001:seq:2005",
+          "record_id": "gateway-demo:seq:2005",
           "seq": "2005",
           "device_id": "dev01",
           "point_id": "temperature",

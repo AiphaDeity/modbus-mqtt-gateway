@@ -4,8 +4,8 @@
 STM32 MQTT Gateway Web 控制台
 
 功能：
-  1. 实时查看设备上报到百度云的遥测数据（MQTT 订阅 pc_observer）
-  2. 下发命令到设备（HTTP /pub 转发到 stm32_gw_01 的 commands topic）
+  1. 实时查看设备上报到百度云的遥测数据（MQTT 订阅 observer-demo）
+  2. 下发命令到设备（HTTP /pub 转发到 gateway-demo 的 commands topic）
   3. 历史消息回看 + 按从站分组的数据卡片
 
 启动：
@@ -15,8 +15,8 @@ STM32 MQTT Gateway Web 控制台
 浏览器打开 http://localhost:8080
 
 架构：
-  - MQTT 订阅线程：用 pc_observer 身份连百度云，订阅 $iot/pc_observer/user/#
-    （规则引擎已把 stm32_gw_01 的遥测转发给 pc_observer，不会抢板子的 MQTT 连接）
+  - MQTT 订阅线程：用 observer-demo 身份连百度云，订阅 $iot/observer-demo/user/#
+    （规则引擎已把 gateway-demo 的遥测转发给 observer-demo，不会抢板子的 MQTT 连接）
   - HTTP Server (ThreadingHTTPServer)：
       GET /            → 返回 HTML 控制台页面
       GET /api/stream  → SSE 长连接，实时推送遥测消息
@@ -24,7 +24,7 @@ STM32 MQTT Gateway Web 控制台
       GET /api/status  → MQTT 连接状态 + 统计
       POST /api/publish→ 下发命令（转发到百度云 HTTP /pub）
 
-⚠️ 三元组是真实凭据，git commit 前必须改回占位符！
+配置区仅保留示例标识和占位密钥，真实部署信息不得提交。
 """
 import sys
 import os
@@ -43,20 +43,20 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ==================== 配置 ====================
 
-# pc_observer：用于订阅遥测（规则引擎把 stm32_gw_01 的数据转发给它）
-SUB_IOTCORE_ID = "aeklwww"
-SUB_DEVICE_KEY = "pc_observer"
+# observer-demo：用于订阅遥测（规则引擎把 gateway-demo 的数据转发给它）
+SUB_IOTCORE_ID = "YOUR_IOTCORE_ID"
+SUB_DEVICE_KEY = "observer-demo"
 SUB_DEVICE_SECRET = "YOUR_DEVICE_SECRET"   # 占位符，测试时替换
 SUB_REGION = "gz"
 
-# stm32_gw_01：用于下发命令（HTTP /pub，不开 MQTT 长连接，不抢板子连接）
-PUB_DEVICE_KEY = "stm32_gw_01"
+# gateway-demo：用于下发命令（HTTP /pub，不开 MQTT 长连接，不抢板子连接）
+PUB_DEVICE_KEY = "gateway-demo"
 PUB_DEVICE_SECRET = "YOUR_DEVICE_SECRET"   # 占位符，测试时替换
 
 HOST = "{}.iot.{}.baidubce.com".format(SUB_IOTCORE_ID, SUB_REGION)
 MQTT_PORT = 1883
 
-# 订阅 topic（pc_observer 收到的转发数据）
+# 订阅 topic（observer-demo 收到的转发数据）
 # 注意：百度云 topic 权限在设备模板里配，通配符 # 需模板授权
 # telemetry: 规则引擎转发板子遥测
 # cmd_ack:   规则引擎转发板子命令回执（{"status":"ok","err":0}）
@@ -64,7 +64,7 @@ SUB_TOPICS = [
     "$iot/{}/user/telemetry".format(SUB_DEVICE_KEY),
     "$iot/{}/user/cmd_ack".format(SUB_DEVICE_KEY),
 ]
-# 下发命令 topic（stm32_gw_01 监听的下行 topic）
+# 下发命令 topic（gateway-demo 监听的下行 topic）
 PUB_TOPIC = "$iot/{}/user/commands".format(PUB_DEVICE_KEY)
 
 WEB_PORT = 8080
@@ -319,7 +319,7 @@ def store_message(topic, payload_bytes):
 # ==================== MQTT 订阅线程 ====================
 
 def mqtt_subscriber_thread():
-    """后台线程：连接百度云 MQTT，订阅 pc_observer，持续接收遥测数据"""
+    """后台线程：连接百度云 MQTT，订阅 observer-demo，持续接收遥测数据"""
     print("[MQTT] 订阅线程启动")
 
     while True:
@@ -361,7 +361,7 @@ def mqtt_subscriber_thread():
                 time.sleep(5)
                 continue
 
-            print("[MQTT] CONNECT 成功 (pc_observer)")
+            print("[MQTT] CONNECT 成功 (observer-demo)")
 
             # SUBSCRIBE（同时订阅 telemetry + cmd_ack）
             sub_pkt = build_subscribe(SUB_TOPICS, qos=0)

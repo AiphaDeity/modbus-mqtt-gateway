@@ -55,13 +55,17 @@ static void upg_rsp_push(const UpgradeStorageResponse *rsp)
                (unsigned long)rsp->req_id, (long)rsp->result);
 }
 
-/* 一次只执行一个请求，避免连续下载饿死控制结果和记录服务。 */
+/*
+ * 由 Storage_Task 循环调用，在存储所有者上下文消费升级请求；wait_ticks 为队列等待 tick 数。
+ * 每次最多处理一条，将完整执行结果放回应答队列，再让存储任务继续处理其他业务。
+ */
 void storage_upgrade_q_process(uint32_t wait_ticks)
 {
     if (s_req_q == NULL || s_rsp_q == NULL) return;
     UpgradeStorageRequest req;
     if (osMessageQueueGet(s_req_q, &req, NULL, wait_ticks) != osOK) return;
     UpgradeStorageResponse rsp;
+    // 出队的是独立消息副本；handle 返回后才产生应答，入队本身不会执行 Flash 操作。
     storage_upgrade_handle(&req, &rsp);
     upg_rsp_push(&rsp);
 }

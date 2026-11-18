@@ -13,74 +13,27 @@
             }
         },
         {
-            "name": "Debug",
+            "name": "BootSizeCheck",
             "inherits": "default",
-            "cacheVariables": {
-                "CMAKE_BUILD_TYPE": "Debug"
-            }
-        },
-        {
-            "name": "Release",
-            "inherits": "default",
-            "cacheVariables": {
-                "CMAKE_BUILD_TYPE": "Release"
-            }
-        },
-        {
-            "name": "BootDebug",
-            "inherits": "Debug",
             "toolchainFile": "${sourceDir}/firmware/bootloader/cmake/gcc-arm-none-eabi.cmake",
             "cacheVariables": {
-                "GATEWAY_FIRMWARE": "bootloader"
-            }
-        },
-        {
-            "name": "BootSizeCheck",
-            "inherits": "BootDebug",
-            "cacheVariables": {
+                "GATEWAY_FIRMWARE": "bootloader",
                 "CMAKE_BUILD_TYPE": "MinSizeRel",
                 "CMAKE_C_FLAGS_MINSIZEREL": "-Os -g3"
             }
         },
         {
             "name": "AppDebug",
-            "inherits": "Debug",
+            "inherits": "default",
             "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
                 "GATEWAY_FIRMWARE": "app",
                 "GATEWAY_APP_LINKER_SCRIPT": "${sourceDir}/firmware/app/STM32F407xx_APP.ld",
                 "GATEWAY_APP_VECTOR_OFFSET": "0x00010000"
             }
-        },
-        {
-            "name": "AppFlashDebug",
-            "inherits": "Debug",
-            "cacheVariables": {
-                "GATEWAY_FIRMWARE": "app",
-                "GATEWAY_APP_LINKER_SCRIPT": "${sourceDir}/firmware/app/STM32F407xx_FLASH.ld",
-                "GATEWAY_APP_VECTOR_OFFSET": "0x00000000"
-            }
-        },
-        {
-            "name": "M3Test",
-            "inherits": "Debug",
-            "cacheVariables": {
-                "GATEWAY_ENABLE_M2": "OFF"
-            }
         }
     ],
     "buildPresets": [
-        {
-            "name": "Debug",
-            "configurePreset": "Debug"
-        },
-        {
-            "name": "Release",
-            "configurePreset": "Release"
-        },
-        {
-            "name": "BootDebug",
-            "configurePreset": "BootDebug"
-        },
         {
             "name": "BootSizeCheck",
             "configurePreset": "BootSizeCheck"
@@ -88,14 +41,6 @@
         {
             "name": "AppDebug",
             "configurePreset": "AppDebug"
-        },
-        {
-            "name": "AppFlashDebug",
-            "configurePreset": "AppFlashDebug"
-        },
-        {
-            "name": "M3Test",
-            "configurePreset": "M3Test"
         }
     ]
 }

@@ -5,9 +5,9 @@
 
 typedef enum
 {
-  APP_UPGRADE_WAIT,
-  APP_UPGRADE_CONFIRM_RESET,
-  APP_UPGRADE_ROLLBACK_RESET
+  APP_UPGRADE_WAIT, // 当前不请求复位，继续观察健康状态。
+  APP_UPGRADE_CONFIRM_RESET, // 请求写健康确认邮箱，再由 Monitor 复位交给 Boot。
+  APP_UPGRADE_ROLLBACK_RESET // 不写确认邮箱，复位后由 Boot 按持久状态决定重试或回退。
 } AppUpgradeAction;
 
 typedef enum
@@ -18,7 +18,8 @@ typedef enum
   APP_UPGRADE_RESULT_ROLLED_BACK
 } AppUpgradeResult;
 
-// 自检完成后连续健康1s；含90s存储恢复，总预算120s，稳定窗口不叠加到期限外。
+// 从 App_UpgradeInit 记录的起点起最多观察 120 s；自检满足后连续健康 1 s 即可请求确认。
+// 无须等满 120 s，健康中断重算 1 s 窗口，但不重置总期限。
 #define APP_UPGRADE_STABLE_MS 1000U
 #define APP_UPGRADE_DEADLINE_MS 120000U
 
@@ -50,7 +51,7 @@ AppUpgradeResult App_UpgradeGetResult(void);
  * 返回RESET后CanCommit仍为false，由监督任务写请求、执行屏障并软件复位。
  */
 AppUpgradeAction App_UpgradePoll(uint32_t now_ms, bool platform_healthy, bool product_healthy);
-// 确认条件成立后写入匹配本次试运行的邮箱消息；成功后调用方须执行屏障并复位。
+// 确认条件成立后只写本次试运行的邮箱意图，不改 Flash 或本轮 trial 身份；调用方须屏障并复位。
 bool App_UpgradeWriteConfirmation(volatile uint32_t *mailbox);
 
 #endif

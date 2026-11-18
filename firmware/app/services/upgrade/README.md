@@ -73,7 +73,7 @@ NetworkUpgrade_Init通过NetworkUpgrade_BindAuthorization默认绑定真实P-256
   --signing-password-env GATEWAY_PACKAGE_SIGNING_PASSWORD `
   --gateway-id '实际网关ID' `
   --task-id 'ota-v123-001' `
-  --url 'https://modbus-mqtt-firmware.gz.bcebos.com/gateway-v123.gwp' `
+  --url 'https://firmware.example.invalid/gateway-v123.gwp' `
   --valid-for 900 `
   --output (Join-Path $gwReleaseDir 'ota-v123-001.json')
 # 3. 出错时停止；外层finally仍清除临时口令，不把口令交给M2。
@@ -86,7 +86,7 @@ if ($LASTEXITCODE -ne 0) { throw '签名通知生成失败。' }
 | 主题 | 现有commands；百度模式为`$iot/{DeviceKey}/user/commands`；UTF-8原始字节、retain=false |
 | 原文 | 固定字段顺序type/task_id/gateway_id/version/size/sha256/image_sha256/url/token/issued_at/expires_at/signature；无外部空白或转义，不重新排字段、格式化或再序列化 |
 | 签名 | 可信编号1的P-256公钥；SHA256输入为ASCII `GWOTA-NOTICE-V1`、一个LF和删除signature字段后的完整紧凑JSON；签名64 B原始r||s编码为128个hex字符；V1只是通知域，包封装和持久兼容号仍为2 |
-| 来源 | 仅`https://modbus-mqtt-firmware.gz.bcebos.com/`的非空文件路径；URL≤127 B，不含空白或fragment；下载仍做TLS主机名和证书检查 |
+| 来源 | 仅`https://firmware.example.invalid/`的非空文件路径；URL≤127 B，不含空白或fragment；下载仍做TLS主机名和证书检查 |
 | 时间 | UTC Unix秒，默认900 s、上限3600 s；issued_at不得晚于设备UTC，expires_at必须在未来；PC与RTC须正确校时 |
 | 重复 | 同一次启动只接受递增issued_at；忙时拒绝。合法通知在设备重启后仍可在有效期内重新尝试，不等于跨重启持久任务去重；RAM会话不续传 |
 | 输出 | 原包与签名私钥须匹配，生成前真实验原包签名，生成后真实验通知签名。可选`--token-env`从环境变量取下载认证头，不在命令行传明文token |

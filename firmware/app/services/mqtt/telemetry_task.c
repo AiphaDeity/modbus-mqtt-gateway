@@ -47,7 +47,7 @@
 static volatile bool s_pause_requested;
 static bool s_pause_acknowledged;
 
-/* 请求方只能撤销旧确认，停稳确认由Telemetry任务自身更新。 */
+// Network 的 pause 设置本次请求并清旧确认，停稳确认仍由 Telemetry 任务自己回到循环安全点后更新。
 void Telemetry_SetPaused(bool paused)
 {
     taskENTER_CRITICAL();
@@ -56,7 +56,7 @@ void Telemetry_SetPaused(bool paused)
     taskEXIT_CRITICAL();
 }
 
-/* 查询本次暂停请求对应的实际任务确认。 */
+// Network 的 settle 只查询本次请求对应的真实确认，不把已请求暂停当作已退出采集/投递。
 bool Telemetry_IsPaused(void)
 {
     taskENTER_CRITICAL();
@@ -162,6 +162,7 @@ static bool publish_one_slave(uint8_t slave_id)
         buf[n++] = '}';
         req.payload_len = (uint16_t)n;
 
+        // 采集期间可能刚进入升级静默，真正投递记录前须在临界区内再次核对暂停及统一入口。
         taskENTER_CRITICAL();
         bool allowed = !s_pause_requested && UpgradeQuiesce_AllowsMutation();
         osStatus_t st = allowed ? osMessageQueuePut(storage_m2_write_queue(), &req, 0, 0) : osErrorResource;
@@ -202,6 +203,7 @@ void Telemetry_Task(void *argument)
 
     for (;;)
     {
+        // 任务回到采集/投递之间的安全点后才确认暂停；已入队的旧记录仍由后续 Storage 阶段结算。
         taskENTER_CRITICAL();
         bool healthy = Monitor_ReportProgress(APP_MODULE_TELEMETRY, true);
         const app_config_t *config = AppConfig_Get();

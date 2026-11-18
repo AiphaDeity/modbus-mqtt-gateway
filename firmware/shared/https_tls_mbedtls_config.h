@@ -1,7 +1,7 @@
 /*
  * HTTPS下载与升级认证共用的mbedTLS配置。
  *
- * 目标服务器：百度云 BOS modbus-mqtt-firmware.gz.bcebos.com:443
+ * 目标服务器：百度云 BOS firmware.example.invalid:443
  *   TLS1.2 / ECDHE-RSA-AES128-GCM-SHA256 / 单向服务器认证 / 必须 SNI
  *   当前叶证书RSA-2048、中间CA RSA-4096；握手预算必须包含4096位验签临时分配。
  *

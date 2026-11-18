@@ -11,7 +11,10 @@
 #define COMMIT_SIZE UPGRADE_STATE_COMMIT_SIZE
 #define JOURNAL_SECTOR_SIZE UPGRADE_STATE_SECTOR_SIZE
 
-// 两个扇区各保存一条记录；其余升级日志空间保留，不跨入其他分区。
+/*
+ * 普通状态只使用两个 4 KiB 扇区：[0x380000,0x381000)、[0x381000,0x382000)。
+ * 它们保存元数据副本 0/1；固件包在独立 A/B 槽，恢复日志、屏障及事务高水位另行管理。
+ */
 static const uint32_t record_address[2] =
 {
   FLASH_PART_UPGLOG_BASE, FLASH_PART_UPGLOG_BASE + JOURNAL_SECTOR_SIZE
@@ -85,9 +88,13 @@ Boot_UpgradeResult Boot_UpgradeLoad(Boot_UpgradeState *state)
   return LoadRecord(state, &selected);
 }
 
-// 校验状态转换，写入另一副本并最后提交。
+/*
+ * 将安装、试运行或确认进展持久写入外部 Flash 双副本日志，不只是修改 RAM 中的 phase。
+ * 先校验转换，再更新另一副本并提交、读回；失败由调用方停止后续擦写或交接，不在此自动重试。
+ */
 Boot_UpgradeResult Boot_UpgradeSave(const Boot_UpgradeState *state)
 {
+  // 1. 检查新状态本身合法，再读取最近完整提交的旧记录作为转换依据。
   if ((state == NULL) || !UpgradeState_RecordValid(state))
   {
     return BOOT_UPGRADE_INVALID;
@@ -99,6 +106,7 @@ Boot_UpgradeResult Boot_UpgradeSave(const Boot_UpgradeState *state)
   {
     return result;
   }
+  // 2. 区分首次建档与后续转换，拒绝非法阶段变化或序号耗尽。
   if (((result == BOOT_UPGRADE_EMPTY)
        && (state->phase != BOOT_UPGRADE_CONFIRMED) && (state->phase != BOOT_UPGRADE_READY))
       || ((result == BOOT_UPGRADE_OK) && !UpgradeState_TransitionValid(&old, state))
@@ -106,20 +114,25 @@ Boot_UpgradeResult Boot_UpgradeSave(const Boot_UpgradeState *state)
   {
     return BOOT_UPGRADE_INVALID;
   }
+  // 3. 首次写副本 0；以后 selected^1 更新另一份，保留当前有效副本，不与包槽 A/B 联动。
   uint32_t target = (result == BOOT_UPGRADE_EMPTY) ? 0U : (selected ^ 1U);
   uint8_t data[RECORD_SIZE];
+  // 4. 新 sequence 编入待写字节，不回写 const 入参；后续交接须重新 Load 取得保存后的身份。
   if (!UpgradeState_Encode(state, old.sequence + 1U, data))
   {
     return BOOT_UPGRADE_INVALID;
   }
-  // 先擦无效/旧副本，再写数据，最后另页写提交标记，原有效副本保持不动。
+  // 5. 先擦目标扇区，再写 128 B 正文，最后在偏移 256 B 处写 4 B CMIT；原有效副本保持不动。
+  // 正文或标记中途掉电且新标记不完整时，Load 会忽略该副本；正文写完本身不代表已经提交。
   if ((Boot_FlashJournalErase(record_address[target]) != HAL_OK)
       || (Boot_FlashJournalProgram(record_address[target], data, RECORD_SIZE) != HAL_OK)
       || (Boot_FlashJournalProgram(record_address[target] + COMMIT_OFFSET,
                                    commit_marker, COMMIT_SIZE) != HAL_OK))
   {
+    // 返回错误不等于没有写入；调用方停止后续推进，重新加载持久状态后才能决定下一步。
     return BOOT_UPGRADE_IO_ERROR;
   }
+  // 6. HAL 写成功后仍须重新 Load，核对目标副本、新序号及全部身份字段；不能只比较 phase。
   Boot_UpgradeState check;
   uint32_t check_selected = 0U;
   result = LoadRecord(&check, &check_selected);

@@ -1,10 +1,10 @@
 {
   "schema_version": 1,
-  "gateway_id": "mb2mqtt_001",
+  "gateway_id": "gateway-demo",
   "batch_id": "batch_0001",
   "records": [
     {
-      "record_id": "mb2mqtt_001:seq:1001",
+      "record_id": "gateway-demo:seq:1001",
       "seq": "1001",
       "device_id": "dev01",
       "point_id": "temperature",

@@ -25,11 +25,11 @@ typedef enum
 
 typedef struct
 {
-  UpgradeMessageKind kind;
-  uint32_t sequence;
-  uint8_t digest[32];
-  uint64_t tx_id;
-  uint32_t trial_attempts;
+  UpgradeMessageKind kind; // 正常启动、试运行或确认意图，普通升级与恢复分别区分。
+  uint32_t sequence; // 本次启动对应的持久记录序号，确认时须逐项匹配。
+  uint8_t digest[32]; // 明文 App 的 SHA-256，不是加密包传输摘要。
+  uint64_t tx_id; // 持久预留的事务号，防止旧确认被套用到新升级。
+  uint32_t trial_attempts; // Boot 本次放行前已持久消耗的试运行机会数。
 } UpgradeMessage;
 
 // 读取并校验消息，失败时清零输出。

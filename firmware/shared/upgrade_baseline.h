@@ -11,6 +11,7 @@
 #endif
 
 #define UPGRADE_PERSISTENCE_VERSION GATEWAY_UPGRADE_PERSISTENCE_VERSION
+// 最大试运行放行次数，包含安装后的首次；每次放行前持久计数，不是首次之外再重试两次。
 #define UPGRADE_TRIAL_LIMIT 2U
 
 #endif

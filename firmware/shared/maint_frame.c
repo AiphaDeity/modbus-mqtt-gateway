@@ -38,7 +38,10 @@ static uint32_t maint_crc32(const uint8_t *data, uint16_t size)
     return ~crc;
 }
 
-/** @brief 解析一帧；错误仅消费一个候选magic字节，保留后续重新同步机会。 */
+/*
+ * 从连续输入中解码首帧，只验证维护帧结构与 CRC，不执行命令或判定升级权限。
+ * MORE 时保留半帧；错误时报告可丢弃前缀，成功 payload 借用输入缓冲，须同步处理后再复用。
+ */
 maint_frame_result_t maint_frame_decode(const uint8_t *data, uint16_t size,
                                         maint_frame_t *frame, uint16_t *consumed)
 {
@@ -47,6 +50,7 @@ maint_frame_result_t maint_frame_decode(const uint8_t *data, uint16_t size,
     memset(frame, 0, sizeof(*frame));
     if (data == NULL) return MAINT_FRAME_FORMAT;
     if (size == 0U) return MAINT_FRAME_MORE;
+    // 1. 寻找 A5 5A 帧头，丢掉明确无关的前缀，保留可能尚未收齐的下一帧。
     uint16_t prefix = 0U;
     while (prefix < size && (data[prefix] != 0xA5U ||
            (prefix + 1U < size && data[prefix + 1U] != 0x5AU))) prefix++;
@@ -55,6 +59,7 @@ maint_frame_result_t maint_frame_decode(const uint8_t *data, uint16_t size,
         *consumed = prefix;
         return MAINT_FRAME_FORMAT;
     }
+    // 2. 核对版本、标志和声明长度；数据未收齐时不消费候选帧。
     if (size < 3U) return MAINT_FRAME_MORE;
     *consumed = 1U;
     if (data[2] != MAINT_FRAME_VERSION) return MAINT_FRAME_VERSION_ERROR;
@@ -72,8 +77,10 @@ maint_frame_result_t maint_frame_decode(const uint8_t *data, uint16_t size,
         *consumed = 0U;
         return MAINT_FRAME_MORE;
     }
+    // 3. 完整帧到齐才比较传输 CRC，不能用它替代恢复包的签名/GCM 认证。
     if (maint_read32(data + MAINT_FRAME_HEADER_SIZE + payload_len) !=
         maint_crc32(data + 2U, (uint16_t)(9U + payload_len))) return MAINT_FRAME_INTEGRITY;
+    // 4. 输出操作码、请求号及载荷视图，具体 INFO/BEGIN/CHUNK/FINISH 由 Boot 的 Handle 分发。
     frame->opcode = data[3];
     frame->flags = data[4];
     frame->request_id = maint_read32(data + 5U);

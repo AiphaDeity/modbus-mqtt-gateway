@@ -1,3 +1,7 @@
+/*
+ * Boot 和 App 共用的升级记录格式及保护规则；本文件通过回调读取，不直接驱动 Flash。
+ * 普通记录、恢复记录各有双副本，正文 CRC 和独立提交标记共同决定记录是否完整。
+ */
 #include "upgrade_state.h"
 
 #include <string.h>
@@ -316,7 +320,10 @@ bool UpgradeRecovery_TransitionValid(const UpgradeRecoveryRecord *old, const Upg
   }
 }
 
-// 只生成记录本体；调用方负责分配新序号，最后另页提交。
+/*
+ * 将普通状态编码成固定 128 B 小端正文，不直接复制 RAM 结构，也不写提交标记。
+ * 调用方提供新的日志序号；CRC 覆盖前 124 B 并写入末 4 B，正文写完仍须另页提交。
+ */
 bool UpgradeState_Encode(const UpgradeStateRecord *state, uint32_t sequence, uint8_t *data)
 {
   if (data == NULL)
@@ -332,6 +339,7 @@ bool UpgradeState_Encode(const UpgradeStateRecord *state, uint32_t sequence, uin
   Write32(data + 8U, UPGRADE_PERSISTENCE_VERSION);
   Write32(data + 12U, sequence);
   Write32(data + 16U, (uint32_t)state->phase);
+  // 记录存的是包的位置和镜像身份，不包含固件本体；已确认包与候选包各占 40 B。
   EncodePackage(data + 20U, &state->confirmed);
   EncodePackage(data + 60U, &state->candidate);
   Write64(data + 100U, state->tx_id);
@@ -446,7 +454,10 @@ static bool UnsupportedRecord(const uint8_t *data)
       && (Read32(data + 8U) != UPGRADE_PERSISTENCE_VERSION);
 }
 
-// 未提交副本仅可忽略；重复序号不能凭副本位置或内容猜测谁更新。
+/*
+ * 各副本完成提交和格式检查后，按非回绕 sequence 选最新有效记录，不按固件版本选。
+ * 没有有效副本时，仅两份均空白才是 EMPTY；序号相同不能凭位置或内容猜测谁更新。
+ */
 static UpgradeStateResult SelectCopy(const bool *valid, const bool *blank,
                                       uint32_t first_sequence, uint32_t second_sequence,
                                       uint32_t *selected)
@@ -463,7 +474,11 @@ static UpgradeStateResult SelectCopy(const bool *valid, const bool *blank,
   return UPGRADE_STATE_OK;
 }
 
-// 读取普通日志双副本，选择最新完整提交的有效记录。
+/*
+ * 逐份读取普通日志正文和独立标记，先判提交，再检查格式/CRC，最后按序号选择。
+ * 未提交副本可忽略；已提交副本损坏时不能静默回退，因为该记录之后可能已擦写片内 App。
+ * 本函数只提供持久状态，包和实际片内镜像的认证仍由 Boot 安装状态机完成。
+ */
 UpgradeStateResult UpgradeState_Load(UpgradeStateRead read, void *context,
                                     UpgradeStateRecord *state, uint32_t *selected)
 {
@@ -488,6 +503,7 @@ UpgradeStateResult UpgradeState_Load(UpgradeStateRead read, void *context,
   for (uint32_t i = 0U; i < 2U; i++)
   {
     uint32_t offset = UPGRADE_STATE_NORMAL_OFFSET + i * UPGRADE_STATE_SECTOR_SIZE;
+    // 1. 读取失败直接返回 I/O 错误，不能把未读到的数据当成空白或仅采用另一副本。
     if (!ReadCopy(read, context, offset, data, marker))
     {
       return UPGRADE_STATE_IO_ERROR;
@@ -495,14 +511,17 @@ UpgradeStateResult UpgradeState_Load(UpgradeStateRead read, void *context,
     blank[i] = AllValue(data, sizeof(data), 0xFFU) && AllValue(marker, sizeof(marker), 0xFFU);
     if (memcmp(marker, UPGRADE_STATE_NORMAL_COMMIT, sizeof(marker)) != 0)
     {
+      // 2. 正文即使已写完，没有完整 CMIT 仍不参加选择；有效旧副本因此可继续保留。
       continue;
     }
+    // 3. 完整 CMIT 的记录必须通过解码；损坏或不支持的格式均报错，不撤销已发生的状态推进。
     if (!UpgradeState_Decode(data, &decoded[i]))
     {
       return UnsupportedRecord(data) ? UPGRADE_STATE_UNSUPPORTED : UPGRADE_STATE_CORRUPT;
     }
     valid[i] = true;
   }
+  // 4. 仅在上述检查全部完成后选择副本；同序号、无有效记录但非全空白等情况仍拒绝。
   uint32_t index = 0U;
   UpgradeStateResult result = SelectCopy(valid, blank, decoded[0].sequence, decoded[1].sequence, &index);
   if (result == UPGRADE_STATE_OK)
@@ -595,6 +614,7 @@ UpgradeStateResult UpgradeRecovery_Load(UpgradeStateRead read, void *context,
   {
     return UPGRADE_STATE_IO_ERROR;
   }
+  // 仅屏障为空白才表示没有活动恢复事务；屏障有效但记录缺失属于损坏。
   if (barrier == 0xFFU)
   {
     return UPGRADE_STATE_EMPTY;
@@ -654,6 +674,7 @@ UpgradeStateResult UpgradeState_ReadProtection(UpgradeStateRead read, void *cont
       && (protection->normal.phase == UPGRADE_STATE_CONFIRMED)
       && (protection->recovery_result == UPGRADE_STATE_EMPTY))
   {
+    // 只有普通 CONFIRMED 且无恢复屏障时，才开放未被记录引用的槽。
     protection->writable_slots = UPGRADE_STATE_ALL_SLOTS & ~protection->referenced_slots;
   }
   return ((protection->normal_result == UPGRADE_STATE_EMPTY)

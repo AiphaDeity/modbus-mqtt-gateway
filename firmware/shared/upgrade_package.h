@@ -7,6 +7,13 @@
 
 #include "upgrade_baseline.h"
 
+/*
+ * 包布局：M(128 B 包头) + S(64 B ECDSA 签名) + C(N B 密文) + T(16 B GCM 标签)，总长 N+208 B。
+ * M 随包公开且作为 GCM 的 AAD；其中 nonce 为 12 B，不包含签名私钥或 AES 密钥。
+ * H_image = SHA256(App 明文)，存于 M[60..91]，用于明文及片内实际镜像核对。
+ * H_sign = SHA256(M+C+T)，供 ECDSA 签名/验签；S 为大端 r[32]+s[32]，不参与自身的签名摘要。
+ * H_package = SHA256(M+S+C+T)，由接收 Stage 核对整包传输，不能与前两种摘要混用。
+ */
 #define UPGRADE_PACKAGE_MANIFEST_SIZE 128U
 #define UPGRADE_PACKAGE_OVERHEAD 208U
 #define UPGRADE_PACKAGE_APP_ADDRESS 0x08010000U
@@ -77,7 +84,7 @@ typedef struct
 {
   uint32_t firmware_size;
   uint16_t capabilities;
-  uint8_t digest[32];
+  uint8_t digest[32]; // 已认证的明文镜像摘要 H_image，不是整包传输摘要。
 } UpgradePackageImage;
 
 // 纯格式检查，失败输出清零；成功尚未认证，不能据此取得安装资格。

@@ -10,7 +10,7 @@
 #include <stdio.h>
 
 static bool watchdog_started;
-static bool watchdog_failed;
+static bool watchdog_failed; // 一旦锁存，本次 Boot 不再恢复喂狗，由主入口处理复位。
 static uint32_t last_refresh_ms;
 
 // 启用 DWT 周期计数，不清除已累计周期。
@@ -25,22 +25,24 @@ bool Boot_WatchdogEnableCycleCounter(void)
   return (DWT->CTRL & DWT_CTRL_CYCCNTENA_Msk) != 0U;
 }
 
-// 启动 Boot 看门狗并记录初始时基，失败时锁存故障。
+/*
+ * Boot main 建立日志和存储通道后调用，启用后续准备、安装及维护操作的 IWDG 监督。
+ * 成功记录开始状态，后续操作通过 Check/Progress 报告期限与进展，不能无条件喂狗。
+ */
 bool Boot_WatchdogStart(void)
 {
-  // 已经锁存失败就返回 false
+  // 1. 已失败的本次启动不重新放行；已有正常启动记录则直接返回，不重复配置。
   if (watchdog_failed)
   {
     return false;
   }
-  // 已经启动就返回 true
   if (watchdog_started)
   {
     return true;
   }
 
 #if defined(DEBUG)
-  // 调试器暂停 CPU 时，冻结 IWDG 计数
+  // 2. 共用 Watchdog_Start 配置硬件 IWDG；DEBUG 允许调试暂停时冻结计数。
   bool ok = Watchdog_Start(true);
 #else
   bool ok = Watchdog_Start(false);
@@ -51,12 +53,13 @@ bool Boot_WatchdogStart(void)
     return false;
   }
 
+  // 3. 硬件启用成功才发布已启动状态，保存 HAL 时刻供后续检查点控制刷新。
   watchdog_started = true;
   last_refresh_ms = HAL_GetTick();
   return true;
 }
 
-// 检查操作期限，失败后锁存本次监督故障。
+// 只检查并锁存软件期限故障，不刷新 IWDG；started_ms/timeout_ms 由具体操作提供，单位 ms。
 bool Boot_WatchdogCheck(uint32_t started_ms, uint32_t timeout_ms)
 {
   if (watchdog_failed)
@@ -64,10 +67,12 @@ bool Boot_WatchdogCheck(uint32_t started_ms, uint32_t timeout_ms)
     return false;
   }
 
+  // 起点由具体操作保存，不因调用本检查函数而更新；无符号差值允许毫秒计数回绕。
   uint32_t elapsed_ms = (uint32_t)(HAL_GetTick() - started_ms);
   if ((timeout_ms == 0U) || (timeout_ms > 0x7FFFFFFFU)
       || (elapsed_ms >= timeout_ms))
   {
+    // 参数非法或到期就锁存；本次 Boot 后续的 Check/Progress 均不能把故障清回正常。
     watchdog_failed = true;
     printf("WDG DEADLINE elapsed_ms=%lu limit_ms=%lu\r\n",
            (unsigned long)elapsed_ms, (unsigned long)timeout_ms);
@@ -77,10 +82,13 @@ bool Boot_WatchdogCheck(uint32_t started_ms, uint32_t timeout_ms)
   return true;
 }
 
-// 检查期限并在时基前进时刷新看门狗。
+/*
+ * 调用方完成真实工作后报告检查点，例如读出一块并更新摘要，或完成一次擦写及读回。
+ * 先检查原固定总期限，再按 HAL 时基变化决定刷新；本函数不会自行判断业务是否真正前进。
+ */
 bool Boot_WatchdogProgress(uint32_t started_ms, uint32_t timeout_ms)
 {
-  // 	检查是否超时、是否已经锁存故障
+  // 先检查本操作总期限；失败后不能通过后面的刷新把故障掩盖掉。
   if (!Boot_WatchdogCheck(started_ms, timeout_ms))
   {
     return false;
@@ -89,7 +97,7 @@ bool Boot_WatchdogProgress(uint32_t started_ms, uint32_t timeout_ms)
   return Boot_WatchdogIdleProgress();
 }
 
-// 	检查允许后，在时基前进时喂狗
+// 在监督允许且时基已前进时刷新 IWDG，避免卡在同一时刻的重复调用被算作进展。
 bool Boot_WatchdogIdleProgress(void)
 {
   if (watchdog_failed)
@@ -98,6 +106,7 @@ bool Boot_WatchdogIdleProgress(void)
   }
 
   uint32_t now_ms = HAL_GetTick();
+  // 时基变化只防止同一时刻重复刷新，不是业务进展证明；本函数也不会更新外层操作的起点。
   if (watchdog_started && (now_ms != last_refresh_ms))
   {
     Watchdog_Refresh();
@@ -156,10 +165,12 @@ static bool SelectPackage(Boot_UpgradePackage *package)
 bool Boot_WatchdogPrepareApp(const uint8_t *public_key,
                              const uint8_t *aes_key)
 {
+  // 1. 先确认本次 Boot 的 IWDG 监督仍有效，已失败的启动不能继续交给 App。
   if (!watchdog_started || watchdog_failed || !Watchdog_IsSoftwareMode())
   {
     return false;
   }
+  // 2. 从最终持久状态选择实际启动包：已确认状态选旧源，试运行状态选本次候选。
   Boot_UpgradePackage expected;
   if (!SelectPackage(&expected)
       || ((expected.slot != 1U) && (expected.slot != 2U)))
@@ -173,6 +184,7 @@ bool Boot_WatchdogPrepareApp(const uint8_t *public_key,
   source.size = expected.size;
   Boot_UpgradePackage actual;
   uint16_t capabilities = 0U;
+  // 3. 重新认证源包，核对 IWDG 交接声明、包身份及片内实际内容，任一失败都拒绝交接。
   if (!Boot_InstallVerifySource(&source, public_key, aes_key, &actual, &capabilities)
       || (capabilities != BOOT_PACKAGE_CAP_IWDG_HANDOFF)
       || (actual.slot != expected.slot) || (actual.size != expected.size)
@@ -181,6 +193,7 @@ bool Boot_WatchdogPrepareApp(const uint8_t *public_key,
   {
     return false;
   }
-  // main已提前启狗，此处只完成最终放行，不补启或重新配置IWDG。
+  // 4. 成功返回 main，由它调用 Boot_JumpToApp；此处不重新启狗，也不执行跳转。
+  // IWDG 在清理外设、切换向量和 App 启动代码期间继续计数，直到 App main 早期接管。
   return !watchdog_failed;
 }

@@ -31,7 +31,10 @@ typedef UpgradeRecoveryRecord Boot_RecoveryState;
  * EMPTY只表示启动屏障为空白；屏障已写而无有效记录必须留恢复，不回退普通启动。
  */
 Boot_UpgradeResult Boot_RecoveryLoad(Boot_RecoveryState *state);
-// 保存合法状态转换并读回提交结果；失败仍可能已落盘，须重新加载后决策。
+/*
+ * 保存合法恢复转换并读回核对；返回失败仍可能已提交，不自动重发写操作。
+ * const 入参不更新新序号，需要最新身份或决定后续处理前，须重新调用 Boot_RecoveryLoad。
+ */
 Boot_UpgradeResult Boot_RecoverySave(const Boot_RecoveryState *state);
 
 /*
@@ -50,9 +53,14 @@ Boot_InstallResult Boot_RecoveryRun(const uint8_t *public_key, const uint8_t *ae
 bool Boot_RecoveryNormalWritesAllowed(void);
 bool Boot_RecoveryWriteAllowed(uint32_t address, uint32_t size);
 
-// Boot主线程同步处理维护帧；keys调用期间有效，NULL时仅允许查询和首次初始化。
+/*
+ * Boot 主线程同步处理维护帧，独占 USART2；使用 Boot 自己的 SPI3 和包认证接口，不依赖 App。
+ * 当前维护口 PD5/TX、PD6/RX，115200/8N1；USART1 单独输出日志，维护串口由电脑工具独占。
+ * keys 调用期间有效，NULL 时仍可查询，但不能建立新的恢复收包会话。
+ * BOOT_RECEIVE_PACKAGE 表示已认证并持久 READY，main 才能安装；其他返回值不表示恢复完成。
+ */
 BootReceiveResult Boot_RecoveryReceive(const uint8_t *public_key, const uint8_t *aes_key);
-// 回应最近FINISH的安装结果；调用前必须已收到BOOT_RECEIVE_PACKAGE。
+// 回应最近 FINISH 的第二条安装阶段结果；须先收到 PACKAGE 并运行安装器，TRIAL 不代表健康确认。
 void Boot_RecoveryReplyResult(Boot_InstallResult result);
 
 #endif

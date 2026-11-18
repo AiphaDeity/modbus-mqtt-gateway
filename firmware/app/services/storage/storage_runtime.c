@@ -133,7 +133,10 @@ static void runtime_fault(void)
     Monitor_ReportFatal(APP_MODULE_STORAGE);
 }
 
-/* 每次已完成I/O才报告进展；超期报告不能恢复看门狗资格。 */
+/*
+ * 仅存储所有者在一次实际 I/O 完成后报告进展，再为下一段工作声明最多 6 s 的等待。
+ * 报告不改变当前操作的 s_deadline；迟到或无法登记下一段等待时，锁存存储与监督故障。
+ */
 void storage_runtime_checkpoint(void)
 {
     if (!storage_runtime_is_owner()) return;
@@ -234,7 +237,10 @@ static DRESULT runtime_disk_write(BYTE lun, const BYTE *data, DWORD sector, UINT
     return RES_OK;
 }
 
-/* 只读检查所有已接纳对象，部分配置/控制回收和未消费请求都阻止安装。 */
+/*
+ * Storage 的结算条件：M2 已接纳请求收尾，配置事务、控制日志作业和 TF 文件租约均退出。
+ * 这里只读检查对象状态，不清队列或强制关文件；实际刷新由后续 STORAGE_SYNC 请求完成。
+ */
 static bool runtime_settled(void)
 {
     return storage_m2_settled() && !storage_config_tx_active() &&
@@ -283,7 +289,10 @@ static UpgradeStageResult runtime_exchange(uint32_t action, uint32_t timeout_ms,
     return result;
 }
 
-/* 先关闭新变更，再等待已经进入的完整业务操作退出。 */
+/*
+ * Storage 的 pause 回调先关闭新业务入口，再获取原业务锁，等待已进入的完整操作退出。
+ * 请求发出即可能产生暂停效果，后续等待失败也保留暂停；Storage_Task 仍须继续处理服务队列。
+ */
 static UpgradeStageResult runtime_pause(void *context, uint32_t timeout_ms)
 {
     (void)context;
@@ -300,7 +309,10 @@ static UpgradeStageResult runtime_pause(void *context, uint32_t timeout_ms)
     return ready ? UPGRADE_STAGE_OK : UPGRADE_STAGE_NOT_READY;
 }
 
-/* 结算和同步必须由存储所有者执行。 */
+/*
+ * 升级任务通过 STORAGE_SETTLE 请求存储所有者检查已接纳对象，自己不访问文件或 Flash。
+ * BUSY 表示尚未结算，可在原期限的剩余时间内再查询；其他错误直接返回，不清状态伪造成功。
+ */
 static UpgradeStageResult runtime_settle(void *context, uint32_t timeout_ms)
 {
     (void)context;
@@ -309,20 +321,24 @@ static UpgradeStageResult runtime_settle(void *context, uint32_t timeout_ms)
         uint32_t elapsed = (uint32_t)(HAL_GetTick() - started_ms);
         if (elapsed >= timeout_ms) return UPGRADE_STAGE_TIMEOUT;
         uint32_t remaining = timeout_ms - elapsed;
+        // 每次查询只带剩余预算，不能把一次 BUSY 变成重新开始完整超时。
         UpgradeStageResult result = runtime_exchange(STORAGE_SETTLE, remaining, NULL, NULL);
         if (result != UPGRADE_STAGE_BUSY) return result;
         if (osDelay(1U) != osOK) return UPGRADE_STAGE_INTERNAL;
     }
 }
 
-/* 请求存储所有者刷新已有文件和环状态，失败不声明落盘完成。 */
+// sync 回调只投递并等待 STORAGE_SYNC；真实 f_sync 和环状态提交由 Storage_Task 执行并返回结果。
 static UpgradeStageResult runtime_sync(void *context, uint32_t timeout_ms)
 {
     (void)context;
     return runtime_exchange(STORAGE_SYNC, timeout_ms, NULL, NULL);
 }
 
-/* 超时同步还未结束时不开放业务，后续显式恢复可再次检查。 */
+/*
+ * 恢复前确认没有待完成 RPC 并取得业务锁，满足后才撤销存储本地暂停。
+ * 未结算的超时请求仍阻止恢复；统一变更门控由协调器在全部模块恢复后最后开放。
+ */
 static UpgradeStageResult runtime_resume(void *context, uint32_t timeout_ms)
 {
     (void)context;
@@ -392,6 +408,8 @@ bool storage_runtime_start(void)
 {
     s_owner = osThreadGetId();
     s_bootstrap = true;
+    // 正常进展间隔为 2 s，单次等待上限为 30 s；此时恢复未完成，所以先报告自检未通过。
+    // 30 s 只是允许的上限，不会自动把每次等待都延长到 30 s。
     if (!Monitor_RegisterHealth(APP_MODULE_STORAGE, 2000U, 30000U) ||
         !Monitor_ReportProgress(APP_MODULE_STORAGE, false)) return false;
     if (disk.drv[0] != NULL) {
@@ -407,11 +425,15 @@ bool storage_runtime_start(void)
     };
     /* 256分频扫描1MiB控制日志约需52s；恢复总限90s，每次I/O仍须报告进展。 */
     s_deadline = HAL_GetTick() + 90000U;
+    // 恢复阶段首次实际声明的是 6 s 等待，后续由已完成 I/O 的检查点继续报告真实进展。
     return UpgradeQuiesce_Bind(UPGRADE_QUIESCE_STORAGE, &participant) == UPGRADE_STAGE_OK &&
            Monitor_BeginWait(APP_MODULE_STORAGE, 6000U);
 }
 
-/* 固定本阶段总期限；后续进展只影响监督，不延长该期限。 */
+/*
+ * 以 timeout_ms 设置当前存储操作的总期限，进展报告不会延长该期限。
+ * Monitor 另外保留 1000 ms 返回处理裕量；它不扩大实际 I/O 可以使用的剩余预算。
+ */
 bool storage_runtime_wait(uint32_t timeout_ms)
 {
     if (!storage_runtime_is_owner() || s_faulted || timeout_ms == 0U || timeout_ms > 25000U) return false;
@@ -430,7 +452,7 @@ void storage_runtime_finish(bool ready, bool healthy)
     storage_runtime_report();
 }
 
-/* 一轮实际工作结束后退出等待，致命超期不能靠新报告恢复。 */
+// 一轮实际工作结束后报告当前自检并退出等待，不直接喂狗；致命超期不能靠新报告恢复。
 void storage_runtime_report(void)
 {
     if (!Monitor_ReportProgress(APP_MODULE_STORAGE, s_healthy)) {
@@ -438,10 +460,13 @@ void storage_runtime_report(void)
     }
 }
 
-/* Storage_Task在业务门控之外处理，暂停期间仍能结算和回复客户端。 */
+/*
+ * Storage_Task 在业务门控之外处理运行请求：暂停期间仍收尾旧 M2 请求、核对结算并执行同步。
+ * 由 runtime_settle/runtime_sync 投递的值拷贝请求在此执行并应答，客户端超时不能代替实际完成。
+ */
 void storage_runtime_process(void)
 {
-    /* 只放行存储所有者收尾旧队列，不重新开放生产者或周期业务。 */
+    // 1. 仅临时放行存储所有者处理已入队的 M2 旧业务，不重新开放上游生产者或周期维护。
     HAL_StatusTypeDef m2_result = HAL_OK;
     if (s_paused && s_ready && s_healthy && !s_faulted) {
         s_draining = true;
@@ -478,10 +503,12 @@ void storage_runtime_process(void)
             } else if (m2_result == HAL_ERROR || m2_result == HAL_TIMEOUT) {
                 rsp.result = m2_result == HAL_TIMEOUT ? UPGRADE_STAGE_TIMEOUT : UPGRADE_STAGE_STORAGE;
             } else if (!runtime_settled()) {
+                // 2. 配置、控制、文件租约或 M2 旧请求仍未退出，返回 BUSY 等原任务继续处理。
                 rsp.result = UPGRADE_STAGE_BUSY;
             } else if (req.action == STORAGE_SETTLE) {
                 rsp.result = UPGRADE_STAGE_OK;
             } else if (req.action == STORAGE_SYNC) {
+                // 3. 已结算后只为现有对象同步临时放行介质写，期间不接纳新的业务变更。
                 s_syncing = true;
                 HAL_StatusTypeDef st = storage_record_sync();
                 s_syncing = false;
@@ -492,6 +519,7 @@ void storage_runtime_process(void)
             }
         }
     }
+    // 4. 实际处理结束才释放对应 pending；客户端须核对请求号和结果，超时不会撤销正在执行的操作。
     if (s_pending == req.id) s_pending = 0U;
     if (osMessageQueuePut(s_responses, &rsp, 0U, 0U) != osOK) {
         storage_run_rsp_t stale;

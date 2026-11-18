@@ -6,14 +6,15 @@
 
 #include <string.h>
 
+// 保存 Boot 交接身份；邮箱读后即清，后续核对和确认使用这份启动快照。
 static UpgradeMessage boot_message;
 static bool initialized;
 static bool message_valid;
 static bool trial;
-static bool stable;
+static bool stable; // 是否已开始累计本轮连续健康时间，健康中断后重新计时。
 static uint32_t started_ms;
 static uint32_t stable_since_ms;
-static AppUpgradeAction pending_action;
+static AppUpgradeAction pending_action; // 一旦决定确认或回退，就保持到监督任务执行复位。
 static AppUpgradeResult boot_result;
 static uint32_t result_polled_ms;
 static bool result_resolved;
@@ -28,16 +29,20 @@ void App_UpgradeInit(volatile uint32_t *mailbox, bool boot_managed, uint32_t now
   started_ms = now_ms;
   if (!boot_managed)
   {
+    // 独立调试没有 Boot 邮箱；这里只允许普通业务启动，不伪造可信升级身份。
     message_valid = true;
   }
   else
   {
+    // 先复制到 App 自己的启动快照，再检查 NORMAL、普通 TRIAL 或独立恢复 TRIAL 身份。
     bool received = UpgradeMailbox_Read(mailbox, &boot_message);
     bool trial_message = (boot_message.kind == UPGRADE_MESSAGE_TRIAL)
                       || (boot_message.kind == UPGRADE_MESSAGE_RECOVERY_TRIAL);
     message_valid = received && ((boot_message.kind == UPGRADE_MESSAGE_NORMAL)
                                  || (trial_message && (boot_message.sequence != 0U)));
     trial = message_valid && trial_message;
+    // 这里只识别本次启动，尚未确认新版本；连续健康后由 Monitor 推进确认并复位交给 Boot。
+    // 消费本次交接，避免旧消息在后续软件复位时被再次当作新确认。
     UpgradeMailbox_Clear(mailbox);
   }
   // initialized/message_valid/trial此后不改变，业务任务只读，无跨任务复合状态更新。
@@ -95,6 +100,7 @@ static AppUpgradeResult ClassifyResult(const UpgradeMessage *identity,
 {
   if (identity->kind == UPGRADE_MESSAGE_RECOVERY_TRIAL)
   {
+    // 恢复试运行使用独立恢复记录，不能套用普通候选槽的结果判定。
     const UpgradeRecoveryRecord *record = &state->recovery;
     bool normal_valid = (state->normal_result == UPGRADE_STATE_EMPTY)
                      || ((state->normal_result == UPGRADE_STATE_OK)
@@ -144,6 +150,7 @@ void App_UpgradePollResult(uint32_t now_ms)
     result_resolved = true;
     return;
   }
+  // 由升级任务经存储接口查询持久记录；MQTT 只读取已发布结果，不直接访问 Flash。
   UpgradeStateProtection state;
   if (UpgradeStage_ReadBootState(&state, 3000U) != UPGRADE_STAGE_OK)
   {
@@ -165,9 +172,14 @@ AppUpgradeResult App_UpgradeGetResult(void)
   return result;
 }
 
-// 根据总期限和连续健康时间决定等待、确认或回退复位。
+/*
+ * Monitor 每轮把平台及产品健康结果传入，决定本次试运行是否需要确认或结束。
+ * 本函数不写 Flash、不直接复位；返回动作交给 Monitor 的 ResetForUpgrade 执行。
+ * 稳定窗口和总期限均基于本次启动的单调时间，不能用打印启动日志或建任务成功代替健康条件。
+ */
 AppUpgradeAction App_UpgradePoll(uint32_t now_ms, bool platform_healthy, bool product_healthy)
 {
+  // 1. 复位动作一旦产生就保持，等待 Monitor 执行，不在后续轮询中撤销或重新累计。
   if (pending_action != APP_UPGRADE_WAIT)
   {
     return pending_action;
@@ -176,6 +188,7 @@ AppUpgradeAction App_UpgradePoll(uint32_t now_ms, bool platform_healthy, bool pr
   {
     return APP_UPGRADE_WAIT;
   }
+  // 2. 无效交接不能发健康确认；有效 NORMAL 启动则无需再次走试运行确认。
   if (!message_valid)
   {
     pending_action = APP_UPGRADE_ROLLBACK_RESET;
@@ -183,37 +196,47 @@ AppUpgradeAction App_UpgradePoll(uint32_t now_ms, bool platform_healthy, bool pr
   }
   if (!trial)
   {
+    // 正常已确认启动无需再次生成确认请求，继续由 Monitor 监督业务即可。
     return APP_UPGRADE_WAIT;
   }
   if ((uint32_t)(now_ms - started_ms) >= APP_UPGRADE_DEADLINE_MS)
   {
+    // 3. 总试运行期限不会因模块重新报告健康而延长，只请求不带确认的复位。
+    // 下一次是否重试或恢复旧包，仍由 Boot 根据次数和实际镜像决定。
     pending_action = APP_UPGRADE_ROLLBACK_RESET;
     return pending_action;
   }
   if (!platform_healthy || !product_healthy)
   {
+    // 4. 健康中断只清连续窗口；是否停止喂狗由 Monitor 的平台监督另外决定。
     stable = false;
     return APP_UPGRADE_WAIT;
   }
   if (!stable)
   {
+    // 5. 第一次同时满足平台和产品条件时开始 1 s 窗口，不能立即把新版本标为已确认。
     stable = true;
     stable_since_ms = now_ms;
   }
   if ((uint32_t)(now_ms - stable_since_ms) >= APP_UPGRADE_STABLE_MS)
   {
+    // 连续健康窗口满足后只提出确认动作；最终写邮箱前仍须原子复查，Boot 复位后才持久确认。
     pending_action = APP_UPGRADE_CONFIRM_RESET;
   }
   return pending_action;
 }
 
-// 将当前试运行身份写成健康确认消息，供复位后 Boot 验证。
+/*
+ * Monitor 最终复查通过后，将启动快照改成匹配本轮的普通或恢复确认消息，再写入保留邮箱。
+ * 不直接把 candidate 改成 confirmed；Boot 在软件复位后匹配身份、重验镜像并保存持久结果。
+ */
 bool App_UpgradeWriteConfirmation(volatile uint32_t *mailbox)
 {
   if ((mailbox == 0) || (pending_action != APP_UPGRADE_CONFIRM_RESET) || !trial)
   {
     return false;
   }
+  // 保留事务号、序号、次数和摘要，只把交接消息改为对应的确认消息。
   UpgradeMessage request = boot_message;
   request.kind = (boot_message.kind == UPGRADE_MESSAGE_RECOVERY_TRIAL)
                ? UPGRADE_MESSAGE_RECOVERY_CONFIRM : UPGRADE_MESSAGE_CONFIRM;

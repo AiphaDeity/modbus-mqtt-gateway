@@ -55,7 +55,7 @@ extern "C" {
 #define NW_UPG_TOKEN_MAX      128     /* 认证 token 最多127 B */
 #define NW_UPG_NOTICE_MAX 1024U
 #define NW_UPG_NOTICE_MAX_VALIDITY_S 3600U
-#define NW_UPG_BOS_PREFIX "https://modbus-mqtt-firmware.gz.bcebos.com/"
+#define NW_UPG_BOS_PREFIX "https://firmware.example.invalid/"
 #define NW_UPG_SHA256_HEX_LEN 64      /* SHA256 hex 字符串长度（32B → 64 hex char） */
 
 /* ===== 对外接口 ===== */

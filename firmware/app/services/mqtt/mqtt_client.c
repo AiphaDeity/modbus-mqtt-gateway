@@ -64,20 +64,20 @@
 /* ★百度云 IoT Core 三元组 —— 在百度智能云「IoT Core → 设备详情」里复制粘贴到这里。
  *   IoTCoreId / DeviceKey / DeviceSecret 在设备详情页「连接信息」里可见。
  *   broker 域名 = {IoTCoreId}.iot.{region}.baidubce.com，端口 1883（TCP 明文，免 TLS） */
-#define BAIDU_IOTCORE_ID    "aeklwww"
-#define BAIDU_DEVICE_KEY    "stm32_gw_01"
+#define BAIDU_IOTCORE_ID    "YOUR_IOTCORE_ID"
+#define BAIDU_DEVICE_KEY    "gateway-demo"
 #define BAIDU_DEVICE_SECRET "YOUR_DEVICE_SECRET"  /* 占位符，测试时替换为真实密钥 */
 #define BAIDU_REGION        "gz"        /* 广州地域，创建实例时选的 */
 #endif
 
 /* ===== 默认配置（AppConfig 未就绪时回退用，仅本地模式生效） ===== */
 
-#define MQTT_DEF_BROKER_IP0   192     // 默认broker IP第一段，拼起来192.168.2.45，本地模式回退用
-#define MQTT_DEF_BROKER_IP1   168     // 默认broker IP第二段
+#define MQTT_DEF_BROKER_IP0   192     // 默认broker IP第一段，拼起来192.0.2.1，本地模式回退用
+#define MQTT_DEF_BROKER_IP1   0     // 默认broker IP第二段
 #define MQTT_DEF_BROKER_IP2   2       // 默认broker IP第三段
-#define MQTT_DEF_BROKER_IP3   45      // 默认broker IP第四段
+#define MQTT_DEF_BROKER_IP3   1      // 默认broker IP第四段
 #define MQTT_DEF_BROKER_PORT  1883    // 默认MQTT端口1883，明文TCP不加密
-#define MQTT_DEF_CLIENT_ID    "mb2mqtt_001"  // 默认客户端ID，本地mosquitto模式用，百度云用设备key
+#define MQTT_DEF_CLIENT_ID    "gateway-demo"  // 默认客户端ID，本地mosquitto模式用，百度云用设备key
 #define MQTT_DEF_KEEPALIVE    30      // 心跳间隔30秒，超过30秒没发心跳broker判定掉线
 #define MQTT_SUBACK_TIMEOUT_MS 2000   // 等SUBACK订阅确认超时2秒
 #define MQTT_CONNACK_TIMEOUT_MS 5000  // 等CONNACK连接确认超时5秒，给云端多留处理时间
@@ -347,7 +347,7 @@ static void mqtt_config_load(void)  // 加载MQTT运行时配置：broker地址�
         return;  // 配置加载完直接返回
     }
     /* 配置无效，回退默认值 */
-    strncpy(g_cfg.broker_host, "192.168.2.45", sizeof(g_cfg.broker_host)-1);  // 回退默认broker地址192.168.2.45
+    strncpy(g_cfg.broker_host, "192.0.2.1", sizeof(g_cfg.broker_host)-1);  // 回退默认broker地址192.0.2.1
     g_cfg.broker_host[sizeof(g_cfg.broker_host)-1] = '\0';  // 强制结尾符
     g_cfg.broker_port  = MQTT_DEF_BROKER_PORT;  // 回退默认端口1883
     strncpy(g_cfg.client_id, MQTT_DEF_CLIENT_ID, sizeof(g_cfg.client_id)-1);  // 回退默认客户端ID
@@ -368,8 +368,8 @@ static void mqtt_config_load(void)  // 加载MQTT运行时配置：broker地址�
  */
 static void baidu_build_auth(void)  // 百度云认证：生成用户名和密码，每次连接前重算
 {
-    const char *iotcore_id = BAIDU_IOTCORE_ID;  // IoT实例ID，宏里是aeklwww
-    const char *dk = BAIDU_DEVICE_KEY;  // 设备key，宏里是stm32_gw_01
+    const char *iotcore_id = BAIDU_IOTCORE_ID;  // IoT实例ID，宏里是YOUR_IOTCORE_ID
+    const char *dk = BAIDU_DEVICE_KEY;  // 设备key，宏里是gateway-demo
     const char *ds = BAIDU_DEVICE_SECRET;  // 设备密钥，宏里是占位符
 
     /* 当前MQTT认证使用0时间戳；不能作为HTTPS证书校验的时间来源。 */
@@ -1115,14 +1115,17 @@ static bool mqtt_take_fetch_response(void)  // 从队列取一批补传记录，
     return true;  // 取批成功返回真
 }
 
-/* 本任务在业务处理之间确认暂停，退避期间也接收已发出的补传应答。 */
-static void mqtt_pause_checkpoint(void)  // 暂停检查点：确认是否已真正暂停
+/*
+ * MQTT 任务在业务处理之间确认本次暂停，先尝试收取已发出的存储取批应答，避免遗留在途请求。
+ * 只有任务自身仍健康且 fetch 已结束才更新确认；协调器等待本确认，不能替任务报告停稳。
+ */
+static void mqtt_pause_checkpoint(void)
 {
-    if (g_pause_requested)  // 有暂停请求
-        (void)mqtt_take_fetch_response();  // 收一下在途应答，避免卡住
-    taskENTER_CRITICAL();  // 关中断，保护共享标志
-    g_pause_acknowledged = g_pause_requested && !g_fetch_in_flight && mqtt_health_progress();  // 暂停请求+无在途+健康才算确认暂停
-    taskEXIT_CRITICAL();  // 开中断
+    if (g_pause_requested)
+        (void)mqtt_take_fetch_response();
+    taskENTER_CRITICAL();
+    g_pause_acknowledged = g_pause_requested && !g_fetch_in_flight && mqtt_health_progress();
+    taskEXIT_CRITICAL();
 }
 
 /* 保活、命令拒绝回执及升级状态可继续发送；业务发送复查最终准入。 */
@@ -1133,25 +1136,28 @@ static bool mqtt_allows_publish(const char *topic)  // 判断当前能否发这�
            (!g_pause_requested && UpgradeQuiesce_AllowsMutation());  // 其他主题需未暂停且允许修改
 }
 
-/* 设置请求时清除旧确认，防止取消后再次暂停复用旧状态。 */
-void MqttClient_SetPaused(bool paused)  // 外部设置暂停状态
+// 仅设置暂停请求并清除旧确认；Network 的 pause 返回后仍须等待 MQTT 任务自己到达安全点。
+void MqttClient_SetPaused(bool paused)
 {
-    taskENTER_CRITICAL();  // 关中断
-    g_pause_requested = paused;  // 更新暂停请求
-    g_pause_acknowledged = false;  // 清确认标志
-    taskEXIT_CRITICAL();  // 开中断
+    taskENTER_CRITICAL();
+    g_pause_requested = paused;
+    g_pause_acknowledged = false;
+    taskEXIT_CRITICAL();
 }
 
-/* 只观察任务确认及既有发送锁，不代报MQTT任务健康。 */
-bool MqttClient_IsPaused(void)  // 查询是否已真正暂停
+/*
+ * Network 的 settle 查询任务确认后，再非阻塞检查当前发送锁可用；不代报 MQTT 健康。
+ * 业务发布已关闭，保活和允许的状态/回执发送仍可运行，本检查不要求断开连接。
+ */
+bool MqttClient_IsPaused(void)
 {
-    taskENTER_CRITICAL();  // 关中断
-    bool paused = g_pause_requested && g_pause_acknowledged;  // 请求暂停且任务已确认
-    taskEXIT_CRITICAL();  // 开中断
-    if (!paused || g_tx_mutex == NULL || osMutexAcquire(g_tx_mutex, 0U) != osOK)  // 没暂停或锁不可用
-        return false;  // 返回假
-    osMutexRelease(g_tx_mutex);  // 能拿到锁说明空闲，释放
-    return true;  // 返回真
+    taskENTER_CRITICAL();
+    bool paused = g_pause_requested && g_pause_acknowledged;
+    taskEXIT_CRITICAL();
+    if (!paused || g_tx_mutex == NULL || osMutexAcquire(g_tx_mutex, 0U) != osOK)
+        return false;
+    osMutexRelease(g_tx_mutex);
+    return true;
 }
 
 // 仅回收明确确认的批次前缀；乱序确认留在原批次，不能跨过未确认项。

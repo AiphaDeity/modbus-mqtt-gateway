@@ -80,6 +80,7 @@ bool UpgradeTrust_ReadPlatform(UpgradeTrustKeys *keys)
     return false;
   }
   memset(keys, 0, sizeof(*keys));
+  // App 和 Boot 都读取同一份预留记录；本函数只读，既不首次写入也不修复损坏资料。
   const uint8_t *record = (const uint8_t *)TRUST_FLASH_ADDRESS;
   if ((memcmp(record, trust_magic, sizeof(trust_magic)) != 0)
       || (Read32(record + 8U) != TRUST_RECORD_SIZE)
@@ -96,6 +97,7 @@ bool UpgradeTrust_ReadPlatform(UpgradeTrustKeys *keys)
   {
     return false;
   }
+  // 格式、CRC 和密钥有效性全部检查通过后，才交出记录中的只读指针。
   keys->signing_key_id = 1U;
   keys->public_key = record + TRUST_PUBLIC_KEY_OFFSET;
   keys->decrypt_key_id = 1U;

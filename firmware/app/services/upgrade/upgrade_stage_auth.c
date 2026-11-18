@@ -1,3 +1,7 @@
+/*
+ * 将 Stage 存储回调适配给公共包认证器；所有读取共用本次认证的起点和超时。
+ * 本层只认证数据，不提交安装状态，也不输出密钥或固件明文。
+ */
 #include "upgrade_stage_auth.h"
 
 #include "upgrade_package.h"
@@ -81,6 +85,7 @@ static bool ReadPackage(void *context, size_t offset, uint8_t *data, size_t size
 UpgradeStageResult UpgradeStage_AuthenticateNotice(const UpgradeStageBackend *adapter, void *context,
                                                   const uint8_t *digest, const uint8_t *signature)
 {
+  // 通知验签使用已置备编号 1 的公钥；通用映射接口同时返回 AES 指针，此处不使用 AES 运算。
   const uint8_t *public_key = NULL;
   const uint8_t *aes_key = NULL;
   UpgradeStageResult result = adapter->keys(context, 1U, 1U, &public_key, &aes_key);
@@ -106,7 +111,11 @@ UpgradeStageResult UpgradeStage_AuthenticateNotice(const UpgradeStageBackend *ad
   return operation.error == UPGRADE_PACKAGE_ERROR_INTERNAL ? UPGRADE_STAGE_INTERNAL : UPGRADE_STAGE_AUTH;
 }
 
-// 解析密钥编号并调用公共认证，映射首个失败原因。
+/*
+ * UpgradeStage_Finish 在传输摘要通过后调用，适配存储读取和平台监督给公共包认证器。
+ * 先检查包头格式，再按编号查询预置可信密钥；包内只有编号，不能提供替代公钥或 AES 密钥。
+ * 只读核验并输出可信镜像身份，不提交 READY 或安装；失败优先保留存储、超时及认证首因。
+ */
 UpgradeStageResult UpgradeStage_Authenticate(const UpgradeStageBackend *backend, void *context,
                                             uint32_t session_id, uint32_t total_size,
                                             uint32_t finish_started_ms, UpgradePackageImage *image)
@@ -124,6 +133,7 @@ UpgradeStageResult UpgradeStage_Authenticate(const UpgradeStageBackend *backend,
   UpgradePackagePlatform platform = {&auth, NowMs, Checkpoint, NULL};
   UpgradePackageOperation operation = {&platform, finish_started_ms,
                                        UPGRADE_STAGE_VERIFY_TIMEOUT_MS, UPGRADE_PACKAGE_ERROR_NONE};
+  // 1. 在 Finish 原固定期限内读取 M 并做格式准入；此时尚不能信任包头中的镜像摘要。
   uint8_t manifest[UPGRADE_PACKAGE_MANIFEST_SIZE];
   uint32_t firmware_size = 0U;
   if (!ReadPackage(&auth, 0U, manifest, sizeof(manifest)))
@@ -138,6 +148,7 @@ UpgradeStageResult UpgradeStage_Authenticate(const UpgradeStageBackend *backend,
   {
     return UPGRADE_STAGE_TIMEOUT;
   }
+  // 2. 编号只索引已置备映射，实际密钥由 backend.keys 提供，不从源包正文读取。
   const uint8_t *public_key = NULL;
   const uint8_t *aes_key = NULL;
   UpgradeStageResult result = backend->keys(context,
@@ -156,6 +167,7 @@ UpgradeStageResult UpgradeStage_Authenticate(const UpgradeStageBackend *backend,
   {
     return UPGRADE_STAGE_NOT_READY;
   }
+  // 3. 公共层重新读实际源包，完成签名、GCM、明文摘要和向量检查，成功后才输出可信 image。
   if (UpgradePackage_VerifyImage(&operation, ReadPackage, &auth, total_size,
                                   public_key, aes_key, image))
   {
@@ -165,6 +177,7 @@ UpgradeStageResult UpgradeStage_Authenticate(const UpgradeStageBackend *backend,
   {
     return auth.io_result;
   }
+  // 底层存储失败优先保留；密码认证错误再按首个原因映射给上层。
   switch (operation.error)
   {
     case UPGRADE_PACKAGE_ERROR_TIMEOUT:

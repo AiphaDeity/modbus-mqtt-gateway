@@ -9,6 +9,7 @@
 
 #include <string.h>
 
+// Boot 单独拥有 SPI3；包槽、普通日志、恢复日志分别使用受范围和角色检查的写接口。
 #define BOOT_FLASH_READ_MAX 256U
 #define BOOT_FLASH_SECTOR_SIZE 4096U
 // 兼容当前支持的最慢 256 分频：256 字节约需 12.5ms，留出软件开销。
@@ -44,6 +45,7 @@ static HAL_StatusTypeDef Boot_FlashWriteEnable(void)
   }
   uint8_t value = 0U;
   status = Boot_FlashReadStatus(&value);
+  // SR1 bit0 为忙，bit1 为 WEL；必须同时满足空闲且写使能有效。
   if ((status == HAL_OK) && ((value & 0x03U) != 0x02U))
   {
     return HAL_ERROR;
@@ -112,6 +114,7 @@ static HAL_StatusTypeDef Boot_FlashModify(uint8_t instruction, uint32_t address,
   {
     return HAL_ERROR;
   }
+  // 先等空闲再写使能；每次擦除或页编程都重新使能，不沿用上一次 WEL 状态。
   HAL_StatusTypeDef status = Boot_FlashWaitReady(1000U);
   if (status != HAL_OK)
   {
@@ -157,6 +160,7 @@ static HAL_StatusTypeDef Boot_FlashEraseChecked(uint32_t address)
   {
     return status;
   }
+  // 擦除后重新读取整扇区确认全 FF，HAL 发送成功和 WIP 清零不能替代空白检查。
   uint8_t buffer[BOOT_FLASH_READ_MAX];
   for (uint32_t offset = 0U; offset < BOOT_FLASH_SECTOR_SIZE; offset += sizeof(buffer))
   {
@@ -277,7 +281,7 @@ HAL_StatusTypeDef Boot_FlashJournalProgram(uint32_t address, const uint8_t *data
   return Boot_FlashProgramChecked(address, data, size);
 }
 
-// 仅在当前恢复事务允许的包槽擦除扇区。
+// 检查独立 RECEIVING 事务的槽权限后擦除并核对单个扇区，不因来自串口就绕过保护槽检查。
 HAL_StatusTypeDef Boot_FlashRecoveryErase(uint32_t address)
 {
   if (((address % BOOT_FLASH_SECTOR_SIZE) != 0U)
@@ -289,7 +293,10 @@ HAL_StatusTypeDef Boot_FlashRecoveryErase(uint32_t address)
   return Boot_FlashEraseChecked(address);
 }
 
-// 仅在当前恢复事务允许的包槽编程数据。
+/*
+ * CHUNK 拆页后调用，先检查页边界、包槽范围和当前独立恢复写权限，再编程并完整读回比较。
+ * OK 只表示本页片段持久写入一致，接收偏移由上层推进；整包认证留到 FINISH。
+ */
 HAL_StatusTypeDef Boot_FlashRecoveryProgram(uint32_t address, const uint8_t *data, uint16_t size)
 {
   if (!Boot_FlashPageValid(address, data, size) || (Boot_FlashPackageSlot(address, size) == 0U)
